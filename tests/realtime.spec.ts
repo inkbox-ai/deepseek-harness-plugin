@@ -11,6 +11,7 @@ import {
   loadCallMeta,
   type RealtimeConnection,
   runRealtimeBridge,
+  validateOpenAIRealtimeKey,
 } from '../src/realtime.js'
 
 type Json = Record<string, unknown>
@@ -171,6 +172,24 @@ describe('OpenAI Realtime call bridge', () => {
       ok: true,
       detail: 'OpenAI Realtime accepted the session configuration.',
     })
+  })
+
+  it('keeps the provider socket open until asynchronous credential validation completes', async () => {
+    let finish: ((value: IteratorResult<Json>) => void) | undefined
+    const connection: RealtimeConnection = {
+      send: vi.fn(async () => {}),
+      close: vi.fn(async () => finish?.({ done: true, value: undefined })),
+      [Symbol.asyncIterator]: () => ({
+        next: () =>
+          new Promise<IteratorResult<Json>>((resolve) => {
+            finish = resolve
+            setTimeout(() => resolve({ done: false, value: { type: 'session.updated' } }), 5)
+          }),
+      }),
+    }
+    const result = await validateOpenAIRealtimeKey('sk-test', 'gpt-realtime-2', async () => connection)
+    expect(result.ok).toBe(true)
+    expect(connection.close).toHaveBeenCalledOnce()
   })
 
   it('bridges PCMU audio both ways, relays transcripts, executes tools, and hangs up after goodbye audio', async () => {

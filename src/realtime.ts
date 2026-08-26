@@ -215,7 +215,7 @@ export async function validateOpenAIRealtimeKey(
       { apiKey, model, voice: 'cedar' },
       { callId: 'validation', direction: 'inbound', agentHandle: 'validation' },
     )
-    return awaitRealtimeReady(connection)
+    return await awaitRealtimeReady(connection)
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) }
   } finally {
