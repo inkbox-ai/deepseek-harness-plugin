@@ -113,7 +113,7 @@ inkbox:
 Every inbound event receives a trusted, ephemeral policy for its current channel. The policy is injected for
 that event only, so a persistent contact session can move between email, SMS, iMessage, and calls without
 retaining the wrong channel's behavior. Built-in policies keep email complete and threaded, SMS concise and
-plain text, iMessage conversational, calls natural and brief, A2A work structured, and completed-call
+plain text, iMessage conversational and free of Markdown syntax, calls natural and brief, A2A work structured, and completed-call
 follow-up idempotent.
 
 `channelInstructions` adds operator guidance after the built-in safety policy. Keys can be a channel name

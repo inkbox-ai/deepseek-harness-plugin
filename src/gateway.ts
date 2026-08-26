@@ -10,6 +10,7 @@ import { connect, type InkboxWebSocket, type TunnelListener } from '@inkbox/sdk/
 import { AgentManager } from './agent-manager.js'
 import { renderChannelEvent, resolveChannelInstruction } from './channel-instructions.js'
 import type { ResolvedConfig } from './config.js'
+import { toIMessagePlainText } from './imessage.js'
 import {
   authenticateCallWebSocket,
   awaitRealtimeReady,
@@ -35,6 +36,14 @@ interface PendingHuman {
   reject(error: Error): void
   timer: ReturnType<typeof setTimeout>
 }
+
+interface TypingPulse {
+  deadline: number
+  timer?: ReturnType<typeof setTimeout>
+}
+
+export const IMESSAGE_TYPING_REFRESH_MS = 40_000
+export const IMESSAGE_TYPING_MAX_MS = 600_000
 
 const EVENT_TYPES = {
   email: ['message.received', 'message.sent', 'message.delivered', 'message.bounced', 'message.failed'],
@@ -76,6 +85,7 @@ export class Gateway {
   private readonly inflight = new Set<Promise<void>>()
   private readonly activeDeliveries = new Set<string>()
   private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly typingPulses = new Map<string, TypingPulse>()
   private readonly startedAt = new Date().toISOString()
 
   constructor(
@@ -308,6 +318,7 @@ export class Gateway {
     for (const queue of this.queues.values()) if (queue.timer !== undefined) clearTimeout(queue.timer)
     for (const timer of this.deliveryTimers.values()) clearTimeout(timer)
     this.deliveryTimers.clear()
+    this.stopAllTyping()
     for (const pending of this.pendingHuman.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Gateway stopped'))
@@ -330,6 +341,7 @@ export class Gateway {
     }
     const queue = this.queues.get(event.routeKey) ?? { buffered: [], timer: undefined, active: undefined }
     this.queues.set(event.routeKey, queue)
+    if (event.typingConversationId) this.startTyping(event.typingConversationId)
     if (queue.active !== undefined) {
       queue.active.events.push(event)
       queue.active.target = event.target
@@ -356,6 +368,7 @@ export class Gateway {
     try {
       const prompt = events.map((event) => renderChannelEvent(event, this.config)).join('\n\n')
       const response = (await this.agents.run(routeKey, prompt)).trim()
+      this.stopTypingForEvents(active.events)
       if (queue.active === active) queue.active = undefined
       const eventIds = active.events.map((event) => event.eventId)
       if (response && !isSilentResponse(response) && active.target.channel !== 'none') {
@@ -377,6 +390,7 @@ export class Gateway {
         })
       }
     } catch (error) {
+      this.stopTypingForEvents(active.events)
       this.log.error('[inkbox] inbound turn failed', error)
     } finally {
       if (queue.active === active) queue.active = undefined
@@ -405,12 +419,56 @@ export class Gateway {
         else if (target.to !== undefined) await identity.sendText({ to: target.to, text: response })
         else throw new Error('SMS reply target is missing both conversation and recipient')
         return
-      case 'imessage':
-        await identity.sendIMessage({ conversationId: target.conversationId, text: response })
+      case 'imessage': {
+        const text = toIMessagePlainText(response)
+        if (!text) return
+        await identity.sendIMessage({
+          conversationId: target.conversationId,
+          text,
+        })
         return
+      }
       case 'none':
         return
     }
+  }
+
+  private startTyping(conversationId: string): void {
+    if (this.typingPulses.has(conversationId)) return
+    const pulse: TypingPulse = { deadline: Date.now() + IMESSAGE_TYPING_MAX_MS }
+    this.typingPulses.set(conversationId, pulse)
+    this.track(this.sendTypingPulse(conversationId, pulse))
+  }
+
+  private async sendTypingPulse(conversationId: string, pulse: TypingPulse): Promise<void> {
+    if (this.closing || this.typingPulses.get(conversationId) !== pulse) return
+    if (Date.now() >= pulse.deadline) {
+      this.stopTyping(conversationId)
+      return
+    }
+    try {
+      await this.identity?.sendIMessageTyping(conversationId)
+    } catch (error) {
+      this.log.warn('[inkbox] iMessage typing pulse failed', error)
+    }
+    if (this.closing || this.typingPulses.get(conversationId) !== pulse) return
+    const delay = Math.min(IMESSAGE_TYPING_REFRESH_MS, Math.max(0, pulse.deadline - Date.now()))
+    pulse.timer = setTimeout(() => this.track(this.sendTypingPulse(conversationId, pulse)), delay)
+  }
+
+  private stopTyping(conversationId: string): void {
+    const pulse = this.typingPulses.get(conversationId)
+    if (!pulse) return
+    if (pulse.timer) clearTimeout(pulse.timer)
+    this.typingPulses.delete(conversationId)
+  }
+
+  private stopTypingForEvents(events: readonly RoutedEvent[]): void {
+    for (const event of events) if (event.typingConversationId) this.stopTyping(event.typingConversationId)
+  }
+
+  private stopAllTyping(): void {
+    for (const conversationId of this.typingPulses.keys()) this.stopTyping(conversationId)
   }
 
   private resumeDeliveries(): void {

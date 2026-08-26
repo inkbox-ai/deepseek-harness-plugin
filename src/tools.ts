@@ -4,6 +4,7 @@ import { defineTool, type ParameterPropertySpec, type ToolRunContext } from '@de
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
 import { CallOrigin, type VoicemailDetection } from '@inkbox/sdk'
+import { toIMessagePlainText } from './imessage.js'
 import type { InkboxRuntime } from './runtime.js'
 
 type Args = Record<string, unknown>
@@ -447,7 +448,13 @@ async function execute(
       return client.imessages.getTriageNumber()
     case 'inkbox_send_imessage': {
       const to = args.to as string[] | undefined
-      return identity.sendIMessage(compact({ ...args, to: to?.length === 1 ? to[0] : to }) as never)
+      return identity.sendIMessage(
+        compact({
+          ...args,
+          ...(typeof args.text === 'string' ? { text: toIMessagePlainText(args.text) } : {}),
+          to: to?.length === 1 ? to[0] : to,
+        }) as never,
+      )
     }
     case 'inkbox_list_imessage_assignments':
       return identity.listIMessageAssignments(compact(args))

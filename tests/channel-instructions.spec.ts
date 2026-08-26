@@ -35,6 +35,12 @@ describe('trusted per-event channel instructions', () => {
     expect(instruction).toContain('Use one sentence and a friendly tone.')
   })
 
+  it('always requires plain-text iMessage replies without Markdown syntax', () => {
+    const instruction = resolveChannelInstruction(event('imessage'), {})
+    expect(instruction).toContain('plain text only')
+    expect(instruction).toContain('do not use Markdown')
+  })
+
   it('prefers a contact instruction over the channel instruction', () => {
     expect(
       resolveChannelInstruction(event('email'), {

@@ -44,7 +44,7 @@ If a person you're connected to over iMessage asks you to call them (or you deci
    - **Reaching a different existing conversation:** use `inkbox_send_imessage` with `conversationId`.
    - **Starting a new conversation:** use `to` with one E.164 number for 1:1 or 2–8 distinct numbers for a group. Starting a group requires a dedicated outbound iMessage line. Shared and dedicated inbound lines are recipient-first.
 
-   Keep the tone conversational — iMessage is a chat thread, not email. A `sendStyle` (confetti, balloons, …) is available for celebratory moments; use sparingly.
+   Keep the tone conversational — iMessage is a chat thread, not email. Write plain text only: no Markdown headings, bullets, numbered lists, tables, code fences, inline code, link syntax, or emphasis markers. A `sendStyle` (confetti, balloons, …) is available for celebratory moments; use sparingly.
 
    **Attachments:** `inkbox_send_imessage` accepts `mediaUrls` for already-hosted public HTTP(S) media. Do not put `/tmp/...`, `file://...`, or another local path in `mediaUrls`.
 
@@ -56,7 +56,7 @@ If a person you're connected to over iMessage asks you to call them (or you deci
 
 Inbound 1:1 iMessages arrive prefixed `[inkbox:imessage from=+1555… conversation_id=… | contact…]`. Groups use `[inkbox:group_imessage conversation_id=… from=+1555… participants=… reply_mode=conversation_id | contact…]` followed by a response policy. Bursts use the corresponding `*_burst` marker, and attachments may add `[inkbox:imessage_attachment …]` lines. Use the marker for routing context; never echo it back.
 
-In a 1:1, the recipient automatically sees a typing indicator while you compose a reply. Group iMessage does not support typing indicators or read receipts.
+In a 1:1, the recipient sees a typing indicator while you compose a reply. Group iMessage does not support typing indicators or read receipts.
 
 ## Group response policy
 

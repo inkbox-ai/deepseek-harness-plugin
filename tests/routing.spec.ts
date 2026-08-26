@@ -76,7 +76,7 @@ describe('webhook routing', () => {
           message: {
             sender_number: '+15550002222',
             conversation_id: 'im-conv',
-            is_group: true,
+            participants: ['+15550002222', '+15550003333'],
             content: 'Group body',
           },
           contacts: [{ id: 'contact-2' }],
@@ -90,6 +90,63 @@ describe('webhook routing', () => {
       channel: 'imessage',
       target: { channel: 'imessage', conversationId: 'im-conv' },
     })
+    expect(routed?.typingConversationId).toBeUndefined()
+  })
+
+  it('starts typing only for one-to-one messages', () => {
+    const message = routeWebhook(
+      {
+        id: 'evt_im_1to1',
+        event_type: 'imessage.received',
+        data: {
+          message: {
+            sender_number: '+15550002222',
+            conversation_id: 'im-conv',
+            content: 'Hello',
+          },
+          contacts: [{ id: 'contact-2' }],
+        },
+      },
+      key,
+      false,
+    )
+    const question = routeWebhook(
+      {
+        id: 'evt_reaction_question',
+        event_type: 'imessage.reaction_received',
+        data: {
+          reaction: {
+            remote_number: '+15550002222',
+            conversation_id: 'im-conv',
+            reaction: 'question',
+            target_message_id: 'msg-1',
+          },
+          contacts: [{ id: 'contact-2' }],
+        },
+      },
+      key,
+      false,
+    )
+    const like = routeWebhook(
+      {
+        id: 'evt_reaction_like',
+        event_type: 'imessage.reaction_received',
+        data: {
+          reaction: {
+            remote_number: '+15550002222',
+            conversation_id: 'im-conv',
+            reaction: 'like',
+            target_message_id: 'msg-1',
+          },
+          contacts: [{ id: 'contact-2' }],
+        },
+      },
+      key,
+      false,
+    )
+    expect(message?.typingConversationId).toBe('im-conv')
+    expect(question?.typingConversationId).toBeUndefined()
+    expect(like?.typingConversationId).toBeUndefined()
   })
 
   it('routes iMessage reactions into the same contact session', () => {

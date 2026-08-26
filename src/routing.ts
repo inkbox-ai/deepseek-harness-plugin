@@ -16,6 +16,7 @@ export interface RoutedEvent {
   content: string
   replyText: string
   target: ReplyTarget
+  typingConversationId?: string
 }
 
 type Json = Record<string, unknown>
@@ -115,7 +116,8 @@ export function routeWebhook(
     const sender = text(message.sender_number) ?? text(message.remote_number) ?? text(reaction.remote_number)
     const conversationId = text(message.conversation_id) ?? text(reaction.conversation_id)
     if (sender === undefined || conversationId === undefined) return undefined
-    const isGroup = message.is_group === true
+    const participants = Array.isArray(message.participants) ? message.participants : []
+    const isGroup = message.is_group === true || participants.length > 1
     const routeKey = isGroup ? `group:imessage:${conversationId}` : contactRoute(data, sender, routingKey)
     const content =
       eventType === 'imessage.reaction_received'
@@ -129,6 +131,7 @@ export function routeWebhook(
       content,
       replyText: content,
       target: { channel: 'imessage', conversationId },
+      ...(!isGroup && eventType === 'imessage.received' ? { typingConversationId: conversationId } : {}),
     }
   }
 
