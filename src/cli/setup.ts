@@ -1,7 +1,7 @@
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { IncomingCallAction, Inkbox } from '@inkbox/sdk'
-import { PLUGIN_PACKAGE, PLUGIN_VERSION, PROFILE_NAME } from '../constants.js'
+import { PLUGIN_PACKAGE, PROFILE_NAME } from '../constants.js'
 import { credentialFromEnvironment, credentialNamesFromEnvironment, layeredEnvironment } from './env.js'
 import { updateYaml } from './files.js'
 import { installLauncher } from './launcher.js'
@@ -56,7 +56,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
 
     process.stdout.write('Installing the DeepSeek Harness runtime and Inkbox bundle...\n')
     await ensureRuntime(paths)
-    const pluginSpec = options.pluginSpec ?? `${PLUGIN_PACKAGE}@${PLUGIN_VERSION}`
+    const pluginSpec = options.pluginSpec ?? (await stagePluginPackage(paths))
     if (isLocalPluginSpec(pluginSpec) && (await profileHasBundle(paths))) {
       await run(paths.dshBin, ['plugin', '--profile', PROFILE_NAME, 'remove', PLUGIN_PACKAGE], {
         cwd: workspace,
@@ -159,6 +159,17 @@ async function profileHasBundle(paths: Paths): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
     throw error
   }
+}
+
+async function stagePluginPackage(paths: Paths): Promise<string> {
+  const packageDir = join(paths.dshHome, 'inkbox-packages')
+  await mkdir(packageDir, { recursive: true, mode: 0o700 })
+  const result = await run('npm', ['pack', '--silent', '--pack-destination', packageDir], {
+    cwd: paths.packageRoot,
+  })
+  const filename = result.stdout.trim().split(/\r?\n/).at(-1)
+  if (!filename?.endsWith('.tgz')) throw new Error('npm did not return the staged plugin package name')
+  return join(packageDir, filename)
 }
 
 async function ensureRuntime(paths: Paths): Promise<void> {

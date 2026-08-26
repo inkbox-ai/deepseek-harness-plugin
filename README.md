@@ -19,12 +19,13 @@ Requirements:
 Run the wizard:
 
 ```bash
-npx @inkbox/deepseek-harness-plugin@latest setup
+npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#v0.1.0 inkbox-deepseek setup
 ```
 
-The wizard installs a pinned Harness runtime in `~/.dsh/inkbox-runtime`, creates the `inkbox` profile,
-installs this bundle, stores credentials in the Harness credential file, selects or creates an identity,
-configures optional channels, and offers to install and restart a background service.
+This private-source command requires GitHub access to the repository. The wizard stages a durable package in
+`~/.dsh/inkbox-packages`, installs a pinned Harness runtime in `~/.dsh/inkbox-runtime`, creates the `inkbox`
+profile, installs this bundle, stores credentials in the Harness credential file, selects or creates an
+identity, configures optional channels, and offers to install and restart a background service.
 
 If `~/.env` contains exactly one environment-specific `INKBOX_API_KEY_*` value, setup will use it. Set
 `INKBOX_API_KEY` explicitly when more than one variant exists, choose an alias in the interactive wizard, or
