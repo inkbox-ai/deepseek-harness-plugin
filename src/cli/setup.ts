@@ -164,9 +164,16 @@ async function profileHasBundle(paths: Paths): Promise<boolean> {
 async function stagePluginPackage(paths: Paths): Promise<string> {
   const packageDir = join(paths.dshHome, 'inkbox-packages')
   await mkdir(packageDir, { recursive: true, mode: 0o700 })
-  const result = await run('npm', ['pack', '--silent', '--pack-destination', packageDir], {
-    cwd: paths.packageRoot,
-  })
+  let result: Awaited<ReturnType<typeof run>>
+  try {
+    result = await run('npm', ['pack', '--ignore-scripts', '--silent', '--pack-destination', packageDir], {
+      cwd: paths.packageRoot,
+    })
+  } catch (error) {
+    if (!(error instanceof CommandError)) throw error
+    const detail = error.stderr.trim() || error.stdout.trim() || error.message
+    throw new Error(`Could not stage the Inkbox bundle: ${detail}`)
+  }
   const filename = result.stdout.trim().split(/\r?\n/).at(-1)
   if (!filename?.endsWith('.tgz')) throw new Error('npm did not return the staged plugin package name')
   return join(packageDir, filename)
