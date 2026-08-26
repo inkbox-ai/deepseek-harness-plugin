@@ -6,6 +6,18 @@ export interface RunOptions {
   stdio?: 'inherit' | 'pipe'
 }
 
+export class CommandError extends Error {
+  constructor(
+    command: string,
+    readonly exitCode: number | null,
+    readonly stdout: string,
+    readonly stderr: string,
+  ) {
+    super(`${command} exited ${exitCode ?? 'without a status'}`)
+    this.name = 'CommandError'
+  }
+}
+
 export async function run(
   command: string,
   args: string[],
@@ -29,12 +41,7 @@ export async function run(
     child.once('error', reject)
     child.once('exit', (code) => {
       if (code === 0) resolve({ stdout, stderr })
-      else
-        reject(
-          new Error(
-            `${command} exited ${code ?? 'without a status'}${stderr.trim() ? `: ${stderr.trim()}` : ''}`,
-          ),
-        )
+      else reject(new CommandError(command, code, stdout, stderr))
     })
   })
 }

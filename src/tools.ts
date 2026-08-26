@@ -319,19 +319,16 @@ export const TOOL_CATALOG: readonly CatalogEntry[] = [
     name: 'inkbox_a2a_complete',
     description: 'Complete the active inbound A2A task with a final answer.',
     parameters: { taskId: s('Inbound task UUID.', true), text: s('Final answer.', true) },
-    approval: (a) => `Complete inbound A2A task ${a.taskId as string}`,
   },
   {
     name: 'inkbox_a2a_ask_caller',
     description: 'Ask the caller for input on an inbound A2A task.',
     parameters: { taskId: s('Inbound task UUID.', true), text: s('Question.', true) },
-    approval: (a) => `Ask caller on A2A task ${a.taskId as string}`,
   },
   {
     name: 'inkbox_a2a_fail',
     description: 'Fail an inbound A2A task with a reason.',
     parameters: { taskId: s('Inbound task UUID.', true), reason: s('Failure reason.', true) },
-    approval: (a) => `Fail inbound A2A task ${a.taskId as string}`,
   },
   {
     name: 'inkbox_list_a2a_tasks',

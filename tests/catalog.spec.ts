@@ -37,4 +37,11 @@ describe('communication capability catalog', () => {
   ])('%s declares an approval reason', (name) => {
     expect(TOOL_CATALOG.find((tool) => tool.name === name)?.approval).toBeTypeOf('function')
   })
+
+  it.each(['inkbox_a2a_complete', 'inkbox_a2a_ask_caller', 'inkbox_a2a_fail'])(
+    '%s can answer the already-authorized inbound task without a second human channel',
+    (name) => {
+      expect(TOOL_CATALOG.find((tool) => tool.name === name)?.approval).toBeUndefined()
+    },
+  )
 })

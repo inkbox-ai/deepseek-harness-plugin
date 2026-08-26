@@ -27,12 +27,14 @@ installs this bundle, stores credentials in the Harness credential file, selects
 configures optional channels, and offers to install and restart a background service.
 
 If `~/.env` contains exactly one environment-specific `INKBOX_API_KEY_*` value, setup will use it. Set
-`INKBOX_API_KEY` explicitly when more than one variant exists.
+`INKBOX_API_KEY` explicitly when more than one variant exists, choose an alias in the interactive wizard, or
+pass its name with `--inkbox-key-env` for non-interactive setup.
 
 Then run:
 
 ```bash
 inkbox-deepseek doctor
+inkbox-deepseek status
 inkbox-deepseek run
 ```
 

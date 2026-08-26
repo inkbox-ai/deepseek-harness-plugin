@@ -9,6 +9,14 @@ function quoteSystemd(value: string): string {
   return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
+function systemdPath(value: string): string {
+  return value
+    .replaceAll('%', '%%')
+    .replace(/[\s\\"']/g, (character) =>
+      [...Buffer.from(character)].map((byte) => `\\x${byte.toString(16).padStart(2, '0')}`).join(''),
+    )
+}
+
 function xml(value: string): string {
   return value
     .replaceAll('&', '&amp;')
@@ -95,9 +103,11 @@ export async function serviceInstalled(paths: Paths): Promise<boolean> {
 }
 
 export function renderSystemdUnit(paths: Paths, workspace: string): string {
-  return `[Unit]\nDescription=Inkbox gateway for DeepSeek Harness\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(paths.dshBin)} --profile inkbox\nWorkingDirectory=${quoteSystemd(workspace)}\nEnvironment=DSH_HOME=${quoteSystemd(paths.dshHome)}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=30\n\n[Install]\nWantedBy=default.target\n`
+  const entry = join(paths.runtimeDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  return `[Unit]\nDescription=Inkbox gateway for DeepSeek Harness\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(entry)} --profile inkbox\nWorkingDirectory=${systemdPath(workspace)}\nEnvironment=${quoteSystemd(`DSH_HOME=${paths.dshHome}`)}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=30\n\n[Install]\nWantedBy=default.target\n`
 }
 
 export function renderLaunchdPlist(paths: Paths, workspace: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>ai.inkbox.deepseek</string>\n<key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(paths.dshBin)}</string><string>--profile</string><string>inkbox</string></array>\n<key>WorkingDirectory</key><string>${xml(workspace)}</string>\n<key>EnvironmentVariables</key><dict><key>DSH_HOME</key><string>${xml(paths.dshHome)}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>StandardOutPath</key><string>${xml(join(paths.dshHome, 'inkbox', 'service.log'))}</string>\n<key>StandardErrorPath</key><string>${xml(join(paths.dshHome, 'inkbox', 'service.error.log'))}</string>\n</dict></plist>\n`
+  const entry = join(paths.runtimeDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>ai.inkbox.deepseek</string>\n<key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(entry)}</string><string>--profile</string><string>inkbox</string></array>\n<key>WorkingDirectory</key><string>${xml(workspace)}</string>\n<key>EnvironmentVariables</key><dict><key>DSH_HOME</key><string>${xml(paths.dshHome)}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>StandardOutPath</key><string>${xml(join(paths.dshHome, 'inkbox', 'service.log'))}</string>\n<key>StandardErrorPath</key><string>${xml(join(paths.dshHome, 'inkbox', 'service.error.log'))}</string>\n</dict></plist>\n`
 }

@@ -21,6 +21,16 @@ describe('environment credential selection', () => {
     ).toThrow(/Multiple INKBOX_API_KEY_\*/)
   })
 
+  it('selects a named scoped variant without exposing its value', () => {
+    expect(
+      credentialFromEnvironment(
+        { INKBOX_API_KEY_ONE: 'one', INKBOX_API_KEY_TWO: 'two' },
+        'INKBOX_API_KEY',
+        'INKBOX_API_KEY_TWO',
+      ),
+    ).toBe('two')
+  })
+
   it('returns undefined when no credential is present', () => {
     expect(credentialFromEnvironment({}, 'INKBOX_API_KEY')).toBeUndefined()
   })

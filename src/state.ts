@@ -2,10 +2,19 @@ import { randomBytes } from 'node:crypto'
 import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import lockfile from 'proper-lockfile'
+import type { ReplyTarget } from './routing.js'
 
 export interface RouteRecord {
   sessionId: string
   created: boolean
+}
+
+export interface PendingDelivery {
+  eventIds: string[]
+  target: ReplyTarget
+  response: string
+  attempts: number
+  nextAttemptAt: number
 }
 
 export interface GatewayState {
@@ -14,12 +23,20 @@ export interface GatewayState {
   routes: Record<string, RouteRecord>
   seen: Record<string, number>
   replied: Record<string, number>
+  deliveries: Record<string, PendingDelivery>
 }
 
 const EMPTY_AGE_MS = 14 * 24 * 60 * 60 * 1000
 
 function freshState(): GatewayState {
-  return { version: 1, routingKey: randomBytes(32).toString('base64url'), routes: {}, seen: {}, replied: {} }
+  return {
+    version: 1,
+    routingKey: randomBytes(32).toString('base64url'),
+    routes: {},
+    seen: {},
+    replied: {},
+    deliveries: {},
+  }
 }
 
 function validate(value: unknown): GatewayState {
@@ -34,7 +51,29 @@ function validate(value: unknown): GatewayState {
     routes: raw.routes && typeof raw.routes === 'object' ? raw.routes : {},
     seen: raw.seen && typeof raw.seen === 'object' ? raw.seen : {},
     replied: raw.replied && typeof raw.replied === 'object' ? raw.replied : {},
+    deliveries: validateDeliveries(raw.deliveries),
   }
+}
+
+function validateDeliveries(value: unknown): Record<string, PendingDelivery> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const validated: Record<string, PendingDelivery> = {}
+  for (const [deliveryId, candidate] of Object.entries(value)) {
+    if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) continue
+    const raw = candidate as Partial<PendingDelivery>
+    if (
+      !Array.isArray(raw.eventIds) ||
+      !raw.eventIds.every((eventId) => typeof eventId === 'string') ||
+      typeof raw.target !== 'object' ||
+      raw.target === null ||
+      typeof raw.response !== 'string' ||
+      typeof raw.attempts !== 'number' ||
+      typeof raw.nextAttemptAt !== 'number'
+    )
+      continue
+    validated[deliveryId] = raw as PendingDelivery
+  }
+  return validated
 }
 
 export class StateStore {

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -47,12 +47,20 @@ describe('durable gateway state', () => {
       state.routes.contact = { sessionId: 'inkbox-session', created: true }
       state.seen.event = now
       state.replied.event = now
+      state.deliveries.delivery = {
+        eventIds: ['event'],
+        target: { channel: 'email', to: 'person@example.test', subject: 'Re: Test' },
+        response: 'response',
+        attempts: 1,
+        nextAttemptAt: now,
+      }
     })
     const disk = JSON.parse(await readFile(value.path, 'utf8'))
     expect(disk).toMatchObject({
       routes: { contact: { created: true } },
       seen: { event: now },
       replied: { event: now },
+      deliveries: { delivery: { eventIds: ['event'], attempts: 1 } },
     })
   })
 
@@ -64,5 +72,15 @@ describe('durable gateway state', () => {
         return 'accepted'
       }),
     ).toBe('accepted')
+  })
+
+  it('drops malformed pending deliveries while preserving valid state', async () => {
+    const value = await store()
+    const document = JSON.parse(await readFile(value.path, 'utf8'))
+    document.deliveries = { broken: { response: 42 } }
+    await writeFile(value.path, JSON.stringify(document))
+    const resumed = new StateStore(value.path)
+    await resumed.initialize()
+    expect(resumed.snapshot().deliveries).toEqual({})
   })
 })

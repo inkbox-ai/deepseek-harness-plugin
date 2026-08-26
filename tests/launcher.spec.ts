@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readlink, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -8,7 +8,7 @@ import type { Paths } from '../src/cli/paths.js'
 async function paths(): Promise<Paths> {
   const home = await mkdtemp(join(tmpdir(), 'inkbox-launcher-'))
   const dshHome = join(home, '.dsh')
-  return {
+  const fixture = {
     home,
     dshHome,
     runtimeDir: join(dshHome, 'inkbox-runtime'),
@@ -16,6 +16,10 @@ async function paths(): Promise<Paths> {
     localBin: join(home, '.local', 'bin'),
     packageRoot: '/plugin',
   }
+  const target = join(dshHome, 'profiles', 'inkbox', 'node_modules', '.bin', 'inkbox-deepseek')
+  await mkdir(join(target, '..'), { recursive: true })
+  await writeFile(target, '#!/usr/bin/env node\n', { mode: 0o644 })
+  return fixture
 }
 
 describe('persistent CLI launcher', () => {
@@ -28,6 +32,7 @@ describe('persistent CLI launcher', () => {
     expect(await readlink(launcher)).toBe(
       join(fixture.dshHome, 'profiles', 'inkbox', 'node_modules', '.bin', 'inkbox-deepseek'),
     )
+    expect((await stat(launcher)).mode & 0o777).toBe(0o755)
   })
 
   it('is idempotent when rerun', async () => {

@@ -11,7 +11,7 @@ export interface Paths {
 }
 
 export function resolvePaths(): Paths {
-  const home = resolve(process.env.HOME ?? process.cwd())
+  const home = resolve(process.env.INKBOX_DEEPSEEK_USER_HOME ?? process.env.HOME ?? process.cwd())
   const dshHome = resolve(process.env.DSH_HOME ?? join(home, '.dsh'))
   const runtimeDir = join(dshHome, 'inkbox-runtime')
   const binName = process.platform === 'win32' ? 'dsh.cmd' : 'dsh'

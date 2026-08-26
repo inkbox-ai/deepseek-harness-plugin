@@ -47,6 +47,8 @@ export interface GatewayStatus {
   connected: boolean
   identity: string
   startedAt: string
+  pid: number
+  updatedAt: string
 }
 
 export class Gateway {
@@ -63,6 +65,8 @@ export class Gateway {
   private readonly latestTargets = new Map<string, ReplyTarget>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
   private readonly inflight = new Set<Promise<void>>()
+  private readonly activeDeliveries = new Set<string>()
+  private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly startedAt = new Date().toISOString()
 
   constructor(
@@ -118,6 +122,7 @@ export class Gateway {
         'A webhook signing key already exists but is not available to this profile. Run setup to configure it; it will not be rotated automatically.',
       )
     }
+    this.resumeDeliveries()
     await this.writeStatus(true)
     void this.tunnelTask.catch((error) => {
       if (!this.closing) this.log.error('[inkbox] tunnel stopped unexpectedly', error)
@@ -193,6 +198,8 @@ export class Gateway {
       connected: this.listener?.isConnected ?? false,
       identity: this.identity?.agentHandle ?? this.config.agentHandle ?? 'unconfigured',
       startedAt: this.startedAt,
+      pid: process.pid,
+      updatedAt: new Date().toISOString(),
     }
   }
 
@@ -204,6 +211,8 @@ export class Gateway {
     if (this.closing) return
     this.closing = true
     for (const queue of this.queues.values()) if (queue.timer !== undefined) clearTimeout(queue.timer)
+    for (const timer of this.deliveryTimers.values()) clearTimeout(timer)
+    this.deliveryTimers.clear()
     for (const pending of this.pendingHuman.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Gateway stopped'))
@@ -252,16 +261,30 @@ export class Gateway {
     try {
       const prompt = events.map((event) => event.prompt).join('\n\n')
       const response = (await this.agents.run(routeKey, prompt)).trim()
-      if (response && response !== '[SILENT]' && active.target.channel !== 'none') {
-        await this.deliver(active.target, response)
+      if (queue.active === active) queue.active = undefined
+      const eventIds = active.events.map((event) => event.eventId)
+      if (response && !isSilentResponse(response) && active.target.channel !== 'none') {
+        const deliveryId = eventIds.at(-1)
+        if (deliveryId === undefined) throw new Error('Cannot persist a delivery without an event')
+        await this.state.mutate((state) => {
+          state.deliveries[deliveryId] = {
+            eventIds,
+            target: active.target,
+            response,
+            attempts: 0,
+            nextAttemptAt: Date.now(),
+          }
+        })
+        await this.attemptDelivery(deliveryId)
+      } else {
+        await this.state.mutate((state) => {
+          for (const eventId of eventIds) state.replied[eventId] = Date.now()
+        })
       }
-      await this.state.mutate((state) => {
-        for (const event of active.events) state.replied[event.eventId] = Date.now()
-      })
     } catch (error) {
       this.log.error('[inkbox] inbound turn failed', error)
     } finally {
-      queue.active = undefined
+      if (queue.active === active) queue.active = undefined
       if (queue.buffered.length > 0 && !this.closing) {
         const task = this.runBatch(routeKey, queue)
         this.track(task)
@@ -292,6 +315,51 @@ export class Gateway {
         return
       case 'none':
         return
+    }
+  }
+
+  private resumeDeliveries(): void {
+    for (const [deliveryId, pending] of Object.entries(this.state.snapshot().deliveries)) {
+      this.scheduleDelivery(deliveryId, Math.max(0, pending.nextAttemptAt - Date.now()))
+    }
+  }
+
+  private scheduleDelivery(deliveryId: string, delay: number): void {
+    if (this.closing || this.deliveryTimers.has(deliveryId)) return
+    const timer = setTimeout(() => {
+      this.deliveryTimers.delete(deliveryId)
+      const task = this.attemptDelivery(deliveryId)
+      this.track(task)
+    }, delay)
+    this.deliveryTimers.set(deliveryId, timer)
+  }
+
+  private async attemptDelivery(deliveryId: string): Promise<void> {
+    if (this.closing || this.activeDeliveries.has(deliveryId)) return
+    const pending = this.state.snapshot().deliveries[deliveryId]
+    if (pending === undefined) return
+    this.activeDeliveries.add(deliveryId)
+    try {
+      await this.deliver(pending.target, pending.response)
+      await this.state.mutate((state) => {
+        const current = state.deliveries[deliveryId]
+        if (current === undefined) return
+        const now = Date.now()
+        for (const eventId of current.eventIds) state.replied[eventId] = now
+        delete state.deliveries[deliveryId]
+      })
+    } catch (error) {
+      this.log.warn('[inkbox] delivery failed; retry scheduled', error)
+      const next = await this.state.mutate((state) => {
+        const current = state.deliveries[deliveryId]
+        if (current === undefined) return undefined
+        current.attempts += 1
+        current.nextAttemptAt = Date.now() + deliveryRetryDelay(current.attempts)
+        return current.nextAttemptAt
+      })
+      if (next !== undefined) this.scheduleDelivery(deliveryId, Math.max(0, next - Date.now()))
+    } finally {
+      this.activeDeliveries.delete(deliveryId)
     }
   }
 
@@ -383,4 +451,12 @@ export class Gateway {
       mode: 0o600,
     })
   }
+}
+
+export function isSilentResponse(response: string): boolean {
+  return response.trim().endsWith('[SILENT]')
+}
+
+function deliveryRetryDelay(attempt: number): number {
+  return Math.min(3_600_000, 1_000 * 2 ** Math.min(attempt - 1, 12))
 }

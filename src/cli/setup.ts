@@ -1,12 +1,12 @@
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { IncomingCallAction, Inkbox } from '@inkbox/sdk'
-import { PROFILE_NAME } from '../constants.js'
-import { credentialFromEnvironment, layeredEnvironment } from './env.js'
+import { PLUGIN_PACKAGE, PLUGIN_VERSION, PROFILE_NAME } from '../constants.js'
+import { credentialFromEnvironment, credentialNamesFromEnvironment, layeredEnvironment } from './env.js'
 import { updateYaml } from './files.js'
 import { installLauncher } from './launcher.js'
 import type { Paths } from './paths.js'
-import { run } from './process.js'
+import { CommandError, run } from './process.js'
 import { Prompts } from './prompts.js'
 import { manageService, serviceInstalled } from './service.js'
 
@@ -16,6 +16,7 @@ export interface SetupOptions {
   identity?: string
   workspace?: string
   pluginSpec?: string
+  inkboxKeyEnv?: string
   nonInteractive?: boolean
   service?: boolean
   start?: boolean
@@ -34,17 +35,35 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
   try {
     process.stdout.write('\nInkbox for DeepSeek Harness\n\n')
     const env = await layeredEnvironment(paths.home)
+    let selectedKeyName = options.inkboxKeyEnv
+    if (!env.INKBOX_API_KEY && selectedKeyName === undefined && prompts !== undefined) {
+      const variants = credentialNamesFromEnvironment(env, 'INKBOX_API_KEY')
+      if (variants.length > 1) {
+        const index = await prompts.choose(
+          'Choose the Inkbox credential from your environment:',
+          variants.map(([name]) => name),
+        )
+        selectedKeyName = variants[index]?.[0]
+      }
+    }
     const credentials = await resolveIdentityCredential(
-      credentialFromEnvironment(env, 'INKBOX_API_KEY'),
+      credentialFromEnvironment(env, 'INKBOX_API_KEY', selectedKeyName),
       options.identity,
       prompts,
     )
     const workspace = resolve(options.workspace ?? process.cwd())
+    await mkdir(workspace, { recursive: true })
 
     process.stdout.write('Installing the DeepSeek Harness runtime and Inkbox bundle...\n')
     await ensureRuntime(paths)
-    const pluginSpec = options.pluginSpec ?? paths.packageRoot
-    await run(paths.dshBin, ['plugin', '--profile', PROFILE_NAME, 'add', pluginSpec], {
+    const pluginSpec = options.pluginSpec ?? `${PLUGIN_PACKAGE}@${PLUGIN_VERSION}`
+    if (isLocalPluginSpec(pluginSpec) && (await profileHasBundle(paths))) {
+      await run(paths.dshBin, ['plugin', '--profile', PROFILE_NAME, 'remove', PLUGIN_PACKAGE], {
+        cwd: workspace,
+        env: { ...process.env, DSH_HOME: paths.dshHome },
+      })
+    }
+    await run(paths.dshBin, ['plugin', '--profile', PROFILE_NAME, 'add', '--force', pluginSpec], {
       cwd: workspace,
       env: { ...process.env, DSH_HOME: paths.dshHome },
       stdio: 'inherit',
@@ -64,6 +83,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
           : {}
       refs.INKBOX_API_KEY = credentials.apiKey
       if (env.DEEPSEEK_API_KEY) refs.DEEPSEEK_API_KEY = env.DEEPSEEK_API_KEY
+      if (env.INKBOX_WEBHOOK_SIGNING_KEY) refs.INKBOX_WEBHOOK_SIGNING_KEY = env.INKBOX_WEBHOOK_SIGNING_KEY
       if (env.INKBOX_WEBHOOK_SECRET_GITHUB)
         refs.INKBOX_WEBHOOK_SECRET_GITHUB = env.INKBOX_WEBHOOK_SECRET_GITHUB
       document.refs = refs
@@ -125,6 +145,22 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
   }
 }
 
+function isLocalPluginSpec(spec: string): boolean {
+  return spec.startsWith('/') || spec.startsWith('.') || spec.startsWith('file:')
+}
+
+async function profileHasBundle(paths: Paths): Promise<boolean> {
+  try {
+    const manifest = JSON.parse(
+      await readFile(join(paths.dshHome, 'profiles', PROFILE_NAME, 'package.json'), 'utf8'),
+    ) as { dependencies?: Record<string, unknown> }
+    return manifest.dependencies?.[PLUGIN_PACKAGE] !== undefined
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
 async function ensureRuntime(paths: Paths): Promise<void> {
   await mkdir(paths.runtimeDir, { recursive: true, mode: 0o700 })
   const manifestPath = join(paths.runtimeDir, 'package.json')
@@ -141,7 +177,12 @@ async function ensureRuntime(paths: Paths): Promise<void> {
   try {
     await run('pnpm', ['add', '--save-exact', `@deepseek-ai/dsh@${DSH_VERSION}`], { cwd: paths.runtimeDir })
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message =
+      error instanceof CommandError
+        ? `${error.stdout}\n${error.stderr}`
+        : error instanceof Error
+          ? error.message
+          : String(error)
     const match = /Ignored build scripts:\s*([^\n]+)/i.exec(message)
     if (match?.[1] === undefined) throw error
     const packages = match[1]

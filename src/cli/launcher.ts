@@ -1,4 +1,4 @@
-import { lstat, mkdir, readlink, symlink, unlink } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readlink, symlink, unlink } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { PROFILE_NAME } from '../constants.js'
 import type { Paths } from './paths.js'
@@ -11,6 +11,7 @@ export async function installLauncher(paths: Paths): Promise<LauncherResult> {
   const launcher = join(paths.localBin, 'inkbox-deepseek')
   const target = join(paths.dshHome, 'profiles', PROFILE_NAME, 'node_modules', '.bin', 'inkbox-deepseek')
   await mkdir(paths.localBin, { recursive: true, mode: 0o755 })
+  await chmod(target, 0o755)
   try {
     const existing = await lstat(launcher)
     if (!existing.isSymbolicLink()) {

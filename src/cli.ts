@@ -5,11 +5,13 @@ import { resolvePaths } from './cli/paths.js'
 import { run } from './cli/process.js'
 import { manageService, type ServiceAction } from './cli/service.js'
 import { setup } from './cli/setup.js'
+import { formatRuntimeStatus, readRuntimeStatus } from './cli/status.js'
+import { PLUGIN_VERSION } from './constants.js'
 
 const program = new Command()
   .name('inkbox-deepseek')
   .description('Install and operate Inkbox for DeepSeek Harness.')
-  .version('0.1.0')
+  .version(PLUGIN_VERSION)
 
 program
   .command('setup')
@@ -17,6 +19,7 @@ program
   .option('--identity <handle>', 'select an existing Inkbox identity')
   .option('--workspace <path>', 'workspace used by channel sessions')
   .option('--plugin-spec <spec>', 'package or local path installed into the Harness profile')
+  .option('--inkbox-key-env <name>', 'environment variable containing the Inkbox API key')
   .option('--non-interactive', 'read credentials and choices from flags and environment')
   .option('--install-service', 'install the managed service')
   .option('--skip-service', 'do not install the managed service')
@@ -28,6 +31,7 @@ program
       ...(options.identity ? { identity: options.identity as string } : {}),
       ...(options.workspace ? { workspace: options.workspace as string } : {}),
       ...(options.pluginSpec ? { pluginSpec: options.pluginSpec as string } : {}),
+      ...(options.inkboxKeyEnv ? { inkboxKeyEnv: options.inkboxKeyEnv as string } : {}),
       nonInteractive: Boolean(options.nonInteractive),
       ...(options.installService ? { service: true } : options.skipService ? { service: false } : {}),
       ...(options.start ? { start: true } : {}),
@@ -39,6 +43,15 @@ program
   .description('Check the profile, credentials, identity, channels, composition, and service.')
   .action(async () => {
     await doctor(resolvePaths())
+  })
+
+program
+  .command('status')
+  .description('Show gateway readiness, identity, tunnel, and process state.')
+  .option('--json', 'print machine-readable JSON')
+  .action(async (options) => {
+    const status = await readRuntimeStatus(resolvePaths())
+    process.stdout.write(`${options.json ? JSON.stringify(status, null, 2) : formatRuntimeStatus(status)}\n`)
   })
 
 program

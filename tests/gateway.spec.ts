@@ -7,7 +7,7 @@ import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
 import type { TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ResolvedConfig } from '../src/config.js'
-import { Gateway } from '../src/gateway.js'
+import { Gateway, isSilentResponse } from '../src/gateway.js'
 import type { InkboxRuntime } from '../src/runtime.js'
 
 const tunnel = vi.hoisted(() => ({
@@ -196,6 +196,35 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.close()
   })
 
+  it('queues a new turn when an event arrives after model completion during delivery', async () => {
+    const { gateway, identity } = await harness()
+    let releaseDelivery: (() => void) | undefined
+    identity.sendEmail.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseDelivery = () => resolve({ id: 'mail-delayed' })
+        }),
+    )
+    const run = vi
+      .spyOn(gateway.agents, 'run')
+      .mockResolvedValueOnce('First response')
+      .mockResolvedValueOnce('Second response')
+
+    await gateway.handleRequest(email('event-after-1', 'First'))
+    await vi.waitFor(() => expect(releaseDelivery).toBeTypeOf('function'))
+    await gateway.handleRequest(email('event-after-2', 'Second'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+    releaseDelivery?.()
+    await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() =>
+      expect(gateway.state.snapshot().replied).toMatchObject({
+        'event-after-1': expect.any(Number),
+        'event-after-2': expect.any(Number),
+      }),
+    )
+    await gateway.close()
+  })
+
   it('routes approval prompts and email answers through the same contact channel', async () => {
     const { gateway, identity } = await harness(30_000)
     const agent = {} as Agent
@@ -218,6 +247,30 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.handleRequest(email('event-7'))
     await vi.waitFor(() => expect(gateway.state.snapshot().replied['event-7']).toBeTypeOf('number'))
     expect(identity.sendEmail).not.toHaveBeenCalled()
+    await gateway.close()
+  })
+
+  it('suppresses explanatory text when the model ends with the silent marker', async () => {
+    const { gateway, identity } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockResolvedValue('Nothing requires follow-up.\n\n[SILENT]')
+    await gateway.handleRequest(email('event-8'))
+    await vi.waitFor(() => expect(gateway.state.snapshot().replied['event-8']).toBeTypeOf('number'))
+    expect(identity.sendEmail).not.toHaveBeenCalled()
+    expect(isSilentResponse('Nothing requires follow-up.\n[SILENT]')).toBe(true)
+    await gateway.close()
+  })
+
+  it('persists a failed delivery and retries without rerunning the agent', async () => {
+    const { gateway, identity } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('Retry this response')
+    identity.sendEmail.mockRejectedValueOnce(new Error('temporary delivery failure'))
+    await gateway.handleRequest(email('event-9'))
+    await vi.waitFor(() => expect(gateway.state.snapshot().deliveries['event-9']).toBeDefined())
+    expect(gateway.state.snapshot().replied['event-9']).toBeUndefined()
+    await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(2), { timeout: 2_000 })
+    await vi.waitFor(() => expect(gateway.state.snapshot().replied['event-9']).toBeTypeOf('number'))
+    expect(gateway.state.snapshot().deliveries['event-9']).toBeUndefined()
+    expect(run).toHaveBeenCalledOnce()
     await gateway.close()
   })
 })
