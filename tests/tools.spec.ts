@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { InkboxRuntime } from '../src/runtime.js'
 import { registerTools } from '../src/tools.js'
 
-function harness() {
+function harness(autoApproveInkboxTools = false) {
   const definitions: ToolDefinition[] = []
   const request = vi.fn(async () => 'allowed-once')
   const ctx = {
@@ -29,6 +29,7 @@ function harness() {
   }
   const client = { whoami: vi.fn(async () => ({ authType: 'api_key' })) }
   const runtime = {
+    config: { autoApproveInkboxTools },
     getClient: vi.fn(async () => client),
     getIdentity: vi.fn(async () => identity),
   } as unknown as InkboxRuntime
@@ -72,6 +73,14 @@ describe('Harness tool registration and execution', () => {
     expect(request).toHaveBeenCalledWith(
       expect.objectContaining({ toolName: 'inkbox_send_email', agent: exec.agent }),
     )
+    expect(identity.sendEmail).toHaveBeenCalledOnce()
+  })
+
+  it('skips approval only when the profile trusts Inkbox tools', async () => {
+    const { definitions, request, identity } = harness(true)
+    const tool = findTool(definitions, 'inkbox_send_email')
+    await tool.execute({ to: ['person@example.test'], subject: 'Hello', bodyText: 'Body' }, exec)
+    expect(request).not.toHaveBeenCalled()
     expect(identity.sendEmail).toHaveBeenCalledOnce()
   })
 

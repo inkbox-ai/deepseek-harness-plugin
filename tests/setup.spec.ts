@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { Paths } from '../src/cli/paths.js'
-import { configureManagedService, selectRealtimeCredential, waitForGatewayReady } from '../src/cli/setup.js'
+import {
+  configureManagedService,
+  resolveToolApprovalChoice,
+  selectRealtimeCredential,
+  waitForGatewayReady,
+} from '../src/cli/setup.js'
 
 function paths(home: string): Paths {
   return {
@@ -17,6 +22,18 @@ function paths(home: string): Paths {
 }
 
 describe('setup credential and liveness behavior', () => {
+  it('offers trusted Inkbox tools by default and preserves explicit choices', async () => {
+    const confirm = vi.fn(async (_label: string, fallback?: boolean) => fallback ?? false)
+    await expect(resolveToolApprovalChoice(undefined, undefined, { confirm })).resolves.toBe(true)
+    expect(confirm).toHaveBeenCalledWith(
+      'Allow this agent to run Inkbox tools without asking each time?',
+      true,
+    )
+    await expect(resolveToolApprovalChoice(undefined, false, { confirm })).resolves.toBe(false)
+    await expect(resolveToolApprovalChoice(true, false, { confirm })).resolves.toBe(true)
+    await expect(resolveToolApprovalChoice(undefined, undefined, undefined)).resolves.toBe(false)
+  })
+
   it('prefers the plugin-specific Realtime credential over OPENAI_API_KEY', () => {
     expect(
       selectRealtimeCredential({

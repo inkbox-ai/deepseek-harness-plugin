@@ -24,6 +24,8 @@ program
   .option('--voice-stack <stack>', 'phone-call handling: inkbox_voice_ai or openai_realtime')
   .option('--realtime-model <model>', 'OpenAI Realtime model')
   .option('--realtime-voice <voice>', 'OpenAI Realtime voice')
+  .option('--auto-approve-inkbox-tools', 'run Inkbox tools without per-call approval prompts')
+  .option('--ask-inkbox-tool-approvals', 'ask before each mutating Inkbox tool call')
   .option('--hosted-authority <mode>', 'hosted-agent authority: contact_scoped or yolo')
   .option('--rotate-signing-key', 'rotate the identity webhook signing key')
   .option('--enable-imessage', 'enable shared-line iMessage')
@@ -45,6 +47,8 @@ program
     if (options.enableA2a && options.skipA2a) throw new Error('Choose only one of --enable-a2a or --skip-a2a')
     if (options.provisionPhone && options.skipPhone)
       throw new Error('Choose only one of --provision-phone or --skip-phone')
+    if (options.autoApproveInkboxTools && options.askInkboxToolApprovals)
+      throw new Error('Choose only one of --auto-approve-inkbox-tools or --ask-inkbox-tool-approvals')
     if (options.voiceStack && !['inkbox_voice_ai', 'openai_realtime'].includes(options.voiceStack))
       throw new Error('--voice-stack must be inkbox_voice_ai or openai_realtime')
     if (options.hostedAuthority && !['contact_scoped', 'yolo'].includes(options.hostedAuthority))
@@ -60,6 +64,11 @@ program
         : {}),
       ...(options.realtimeModel ? { realtimeModel: options.realtimeModel as string } : {}),
       ...(options.realtimeVoice ? { realtimeVoice: options.realtimeVoice as string } : {}),
+      ...(options.autoApproveInkboxTools
+        ? { autoApproveInkboxTools: true }
+        : options.askInkboxToolApprovals
+          ? { autoApproveInkboxTools: false }
+          : {}),
       ...(options.hostedAuthority
         ? { hostedAuthority: options.hostedAuthority as 'contact_scoped' | 'yolo' }
         : {}),

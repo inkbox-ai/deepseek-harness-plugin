@@ -12,6 +12,7 @@ export interface Config {
   stateDir?: string
   batchWindowMs?: number
   permissionTimeoutMs?: number
+  autoApproveInkboxTools?: boolean
   externalEvents?: boolean
   voiceEnabled?: boolean
   voiceStack?: VoiceStack
@@ -33,6 +34,7 @@ export const Config: z<Config> = z.object({
   stateDir: z.string(),
   batchWindowMs: z.number().step(1).min(0).max(30_000).default(DEFAULT_BATCH_WINDOW_MS),
   permissionTimeoutMs: z.number().step(1).min(1_000).max(3_600_000).default(DEFAULT_PERMISSION_TIMEOUT_MS),
+  autoApproveInkboxTools: z.boolean().default(false),
   externalEvents: z.boolean().default(false),
   voiceEnabled: z.boolean().default(true),
   voiceStack: z.union(['inkbox_voice_ai', 'openai_realtime']).default('inkbox_voice_ai'),
@@ -52,6 +54,7 @@ export interface ResolvedConfig {
   stateDir: string
   batchWindowMs: number
   permissionTimeoutMs: number
+  autoApproveInkboxTools: boolean
   externalEvents: boolean
   voiceEnabled: boolean
   voiceStack: VoiceStack
@@ -73,6 +76,7 @@ export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME
     stateDir: config.stateDir ? resolve(config.stateDir) : resolve(root, 'inkbox'),
     batchWindowMs: config.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS,
     permissionTimeoutMs: config.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS,
+    autoApproveInkboxTools: config.autoApproveInkboxTools ?? false,
     externalEvents: config.externalEvents ?? false,
     voiceEnabled: config.voiceEnabled ?? true,
     voiceStack: config.voiceStack ?? 'inkbox_voice_ai',

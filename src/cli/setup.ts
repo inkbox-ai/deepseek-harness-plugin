@@ -30,6 +30,7 @@ export interface SetupOptions {
   voiceStack?: VoiceStack
   realtimeModel?: string
   realtimeVoice?: string
+  autoApproveInkboxTools?: boolean
   hostedAuthority?: 'contact_scoped' | 'yolo'
   enableIMessage?: boolean
   enableA2A?: boolean
@@ -136,6 +137,11 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
       ...(options.phoneState ? { phoneState: options.phoneState } : {}),
       nonInteractive: options.nonInteractive ?? false,
     })
+    const autoApproveInkboxTools = await resolveToolApprovalChoice(
+      options.autoApproveInkboxTools,
+      savedSettings.autoApproveInkboxTools,
+      prompts,
+    )
 
     await updateYaml(join(paths.dshHome, '.credentials.yaml'), (document) => {
       const refs = object(document.refs)
@@ -150,6 +156,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
         ...(channels.voiceStack ? { voiceStack: channels.voiceStack } : {}),
         ...(channels.realtimeModel ? { realtimeModel: channels.realtimeModel } : {}),
         ...(channels.realtimeVoice ? { realtimeVoice: channels.realtimeVoice } : {}),
+        autoApproveInkboxTools,
       }
     })
 
@@ -169,6 +176,21 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
   } finally {
     prompts?.close()
   }
+}
+
+export async function resolveToolApprovalChoice(
+  requested: boolean | undefined,
+  saved: unknown,
+  prompts: Pick<SetupPrompts, 'confirm'> | undefined,
+): Promise<boolean> {
+  if (requested !== undefined) return requested
+  const previous = typeof saved === 'boolean' ? saved : undefined
+  if (!prompts) return previous ?? false
+  process.stdout.write('\nInkbox tool approvals\n')
+  process.stdout.write(
+    'Trusting Inkbox tools skips repeated prompts for messages, calls, contacts, and other Inkbox actions. Other Harness tools are unchanged.\n',
+  )
+  return prompts.confirm('Allow this agent to run Inkbox tools without asking each time?', previous ?? true)
 }
 
 export interface ServiceSetupDependencies {
