@@ -12,6 +12,7 @@ describe('configuration', () => {
     expect(config.stateDir).toBe('/tmp/dsh-home/inkbox')
     expect(config.batchWindowMs).toBe(750)
     expect(config.permissionTimeoutMs).toBe(600_000)
+    expect(config.autoApproveInkboxTools).toBe(false)
     expect(config.voiceStack).toBe('inkbox_voice_ai')
     expect(config.realtimeCredentialRef).toBe('INKBOX_REALTIME_API_KEY')
     expect(config.realtimeModel).toBe('gpt-realtime-2')
@@ -27,8 +28,16 @@ describe('configuration', () => {
   })
 
   it('supports disabling gateway effects while retaining registration', () => {
-    const config = resolveConfig({ enabled: false, externalEvents: true, voiceEnabled: false }, '/tmp/dsh')
-    expect(config).toMatchObject({ enabled: false, externalEvents: true, voiceEnabled: false })
+    const config = resolveConfig(
+      { enabled: false, externalEvents: true, voiceEnabled: false, autoApproveInkboxTools: true },
+      '/tmp/dsh',
+    )
+    expect(config).toMatchObject({
+      enabled: false,
+      externalEvents: true,
+      voiceEnabled: false,
+      autoApproveInkboxTools: true,
+    })
   })
 
   it('uses an explicit state directory exactly as configured', () => {

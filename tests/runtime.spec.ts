@@ -19,6 +19,7 @@ async function harness(stack: ResolvedConfig['voiceStack']) {
     stateDir,
     batchWindowMs: 0,
     permissionTimeoutMs: 1_000,
+    autoApproveInkboxTools: false,
     externalEvents: false,
     voiceEnabled: true,
     voiceStack: stack,

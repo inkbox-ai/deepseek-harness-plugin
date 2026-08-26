@@ -115,6 +115,7 @@ async function harness(
     stateDir,
     batchWindowMs,
     permissionTimeoutMs: 2_000,
+    autoApproveInkboxTools: false,
     externalEvents: false,
     voiceEnabled: true,
     voiceStack,

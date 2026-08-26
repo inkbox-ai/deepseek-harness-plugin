@@ -79,8 +79,10 @@ inkbox-deepseek service status
   post-call actions without a separate daemon.
 - **External events:** GitHub HMAC webhooks are supported when explicitly enabled and configured.
 
-Mutating tools use the Harness native approval service. Read-only tools are marked concurrency-safe; writes
-remain exclusive.
+The setup wizard can trust Inkbox tools so they run without repeated approval prompts. This applies only to
+the plugin's `inkbox_*` tools; other Harness tools and actions keep their own approval behavior. When trust is
+disabled, mutating Inkbox tools use the Harness native approval service. Read-only tools are marked
+concurrency-safe, and writes remain exclusive.
 
 ## Configuration
 
@@ -94,6 +96,7 @@ inkbox:
   stateDir: /absolute/path/to/state
   batchWindowMs: 750
   permissionTimeoutMs: 600000
+  autoApproveInkboxTools: true
   externalEvents: false
   voiceEnabled: true
   voiceStack: openai_realtime # or inkbox_voice_ai
