@@ -338,7 +338,7 @@ export async function waitForGatewayReady(
   return false
 }
 
-function printSummary(
+export function printSummary(
   identity: { agentHandle: string; emailAddress?: string | null; phoneNumber?: { number: string } | null },
   voiceStack: VoiceStack | undefined,
   paths: Paths,
@@ -364,7 +364,11 @@ function printSummary(
     process.stdout.write(`╰${'─'.repeat(width - 2)}╯\n`)
     return
   }
-  process.stdout.write(`\nSetup complete for ${identity.agentHandle}.\n`)
+  process.stdout.write(
+    started && !ready
+      ? `\nSetup saved for ${identity.agentHandle}, but the gateway is not ready.\n`
+      : `\nSetup complete for ${identity.agentHandle}.\n`,
+  )
   process.stdout.write(`Email: ${identity.emailAddress ?? 'not provisioned'}\n`)
   process.stdout.write(`Phone: ${identity.phoneNumber?.number ?? 'not provisioned'}\n`)
   if (voiceStack)

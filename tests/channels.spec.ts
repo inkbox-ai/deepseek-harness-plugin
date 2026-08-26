@@ -325,7 +325,13 @@ describe('iMessage and phone onboarding parity', () => {
       },
     } as unknown as Inkbox
     const deps = dependencies()
-    expect(await configureIMessage(identity, client, prompts(), {}, deps)).toBe(true)
+    const prompt = prompts()
+    expect(await configureIMessage(identity, client, prompt, {}, deps)).toBe(true)
+    expect(prompt.confirm).toHaveBeenNthCalledWith(
+      1,
+      'Enable iMessage (RCS/SMS fallback and voice calls) for this agent?',
+      true,
+    )
     expect(update).toHaveBeenCalledWith({ imessageEnabled: true })
     expect(deps.sleep).toHaveBeenCalledWith(3_000)
     expect(sendIMessage).toHaveBeenCalledWith({

@@ -158,7 +158,7 @@ export async function configureIMessage(
   const shouldEnable =
     options.enableIMessage ??
     (!options.nonInteractive && prompts
-      ? await prompts.confirm('Enable iMessage for this agent?', true)
+      ? await prompts.confirm('Enable iMessage (RCS/SMS fallback and voice calls) for this agent?', true)
       : identity.imessageEnabled)
   if (!shouldEnable) return identity.imessageEnabled
   if (!identity.imessageEnabled) await identity.update({ imessageEnabled: true })

@@ -6,6 +6,7 @@ import type { SetupPrompts } from '../src/cli/onboarding.js'
 import type { Paths } from '../src/cli/paths.js'
 import {
   configureManagedService,
+  printSummary,
   resolveToolApprovalChoice,
   selectInkboxCredential,
   selectRealtimeCredential,
@@ -96,6 +97,27 @@ describe('setup credential and liveness behavior', () => {
 })
 
 describe('managed-service wizard parity', () => {
+  it('does not claim setup completed when the gateway failed readiness', () => {
+    const output: string[] = []
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output.push(String(chunk))
+      return true
+    })
+    try {
+      printSummary(
+        { agentHandle: 'deepseek-agent', emailAddress: 'deepseek-agent@example.test' },
+        'inkbox_voice_ai',
+        paths('/tmp/setup-not-ready'),
+        true,
+        false,
+      )
+    } finally {
+      write.mockRestore()
+    }
+    expect(output.join('')).toContain('Setup saved for deepseek-agent, but the gateway is not ready.')
+    expect(output.join('')).not.toContain('Setup complete')
+  })
+
   it('leaves a running gateway live when restart is declined', async () => {
     const manage = vi.fn(async () => 'restarted')
     const confirm = vi.fn(async () => false)
