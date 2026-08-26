@@ -56,9 +56,12 @@ export async function configureChannels(
   const a2aEnabled = await configureA2A(identity, prompts, options)
   const phone = await configurePhone(identity, prompts, options)
   identity = phone.identity
+  printIdentitySummary(identity)
+  if (phone.provisioned && prompts) await waitForSmsOptIn(identity, dependencies)
 
   let voice: Pick<ChannelResult, 'voiceStack' | 'realtimeApiKey' | 'realtimeModel' | 'realtimeVoice'> = {}
-  if (identity.phoneNumber) {
+  if (identity.phoneNumber || imessageEnabled) {
+    if (prompts) await prompts.text('Press Enter to continue and set up phone call handling')
     voice = await configureVoice(identity, credential, prompts, options, dependencies)
   } else if (options.voiceStack) {
     throw new Error('A dedicated phone number is required to configure phone-call handling')
@@ -73,6 +76,58 @@ export async function configureChannels(
   }
 }
 
+function printIdentitySummary(identity: AgentIdentity): void {
+  process.stdout.write('\nInkbox configured\n')
+  process.stdout.write(`Handle: ${identity.agentHandle}\n`)
+  process.stdout.write(`Mailbox: ${identity.emailAddress ?? 'none — set up later in the Inkbox console'}\n`)
+  process.stdout.write(
+    `Phone: ${identity.phoneNumber?.number ?? 'none — provision later in the Inkbox console'}\n`,
+  )
+  if (identity.phoneNumber?.number) {
+    process.stdout.write(
+      `Text START to ${identity.phoneNumber.number} to enable outbound SMS to your phone.\n`,
+    )
+    process.stdout.write(`One-tap START link: sms:${identity.phoneNumber.number}?&body=START\n`)
+  }
+  process.stdout.write('Reachability rules: https://inkbox.ai/console/contact-rules\n')
+}
+
+export async function waitForSmsOptIn(
+  identity: AgentIdentity,
+  dependencies: Pick<ChannelDependencies, 'sleep'> = defaultChannelDependencies,
+  attempts = Number.POSITIVE_INFINITY,
+): Promise<void> {
+  const number = identity.phoneNumber?.number
+  if (!number) return
+  process.stdout.write(`Waiting for an inbound START to ${number}. Press Ctrl+C to skip.\n`)
+  const startedAt = new Date().toISOString()
+  let interrupted = false
+  const interrupt = () => {
+    interrupted = true
+  }
+  process.once('SIGINT', interrupt)
+  try {
+    for (let attempt = 0; attempt < attempts && !interrupted; attempt += 1) {
+      const texts = await identity.listTexts({ limit: 20, startDatetime: startedAt }).catch(() => [])
+      const start = texts.find(
+        (message) => message.direction === 'inbound' && message.text?.trim().toUpperCase() === 'START',
+      )
+      if (start) {
+        process.stdout.write(`SMS opt-in confirmed from ${start.remotePhoneNumber ?? 'your phone'}.\n`)
+        return
+      }
+      await dependencies.sleep(3_000)
+    }
+    process.stdout.write(
+      interrupted
+        ? `Skipped. Text START to ${number} anytime to enable outbound SMS.\n`
+        : `No START text arrived yet. Text START to ${number} anytime to enable outbound SMS.\n`,
+    )
+  } finally {
+    process.off('SIGINT', interrupt)
+  }
+}
+
 export async function configureIMessage(
   identity: AgentIdentity,
   client: Inkbox,
@@ -80,6 +135,12 @@ export async function configureIMessage(
   options: Pick<ChannelOptions, 'enableIMessage' | 'nonInteractive'>,
   dependencies: Pick<ChannelDependencies, 'sleep'> = defaultChannelDependencies,
 ): Promise<boolean> {
+  process.stdout.write('\niMessage\n')
+  process.stdout.write('Inkbox can make this agent reachable over iMessage from your iPhone.\n')
+  process.stdout.write('No number to provision — you connect through the Inkbox iMessage router.\n')
+  process.stdout.write(
+    'Once connected, the agent can also make and take voice calls over that shared line.\n',
+  )
   const existingAssignments = identity.imessageEnabled
     ? await identity.listIMessageAssignments({ limit: 1 }).catch(() => [])
     : []
@@ -87,7 +148,7 @@ export async function configureIMessage(
     const shouldCheck =
       options.enableIMessage ??
       (!options.nonInteractive && prompts
-        ? await prompts.confirm('iMessage is already connected. Show connection setup again?', false)
+        ? await prompts.confirm('Connect another iPhone to this agent now?', false)
         : false)
     if (!shouldCheck) {
       process.stdout.write('iMessage is connected for this identity.\n')
@@ -97,22 +158,21 @@ export async function configureIMessage(
   const shouldEnable =
     options.enableIMessage ??
     (!options.nonInteractive && prompts
-      ? await prompts.confirm('Enable shared-line iMessage?', true)
+      ? await prompts.confirm('Enable iMessage for this agent?', true)
       : identity.imessageEnabled)
   if (!shouldEnable) return identity.imessageEnabled
   if (!identity.imessageEnabled) await identity.update({ imessageEnabled: true })
 
-  const assignments =
-    existingAssignments.length > 0
-      ? existingAssignments
-      : await identity.listIMessageAssignments({ limit: 1 }).catch(() => [])
-  if (assignments.length > 0) {
-    process.stdout.write('iMessage is connected for this identity.\n')
-    return true
-  }
   const triage = await client.imessages.getTriageNumber()
-  process.stdout.write(`To connect iMessage, send "${triage.connectCommand}" to ${triage.number}.\n`)
-  if (!prompts || !(await prompts.confirm('Wait for the first iMessage connection now?', true))) return true
+  process.stdout.write('From your iPhone, in the Messages app:\n')
+  process.stdout.write(`  1. Text "${triage.connectCommand}" to ${triage.number}.\n`)
+  process.stdout.write('  2. Open the new thread from the number assigned to this agent.\n')
+  process.stdout.write('  3. Send any first message, such as "hi", in that new thread.\n')
+  process.stdout.write(
+    `One-tap link: sms:${triage.number}?&body=${encodeURIComponent(triage.connectCommand)}\n`,
+  )
+  process.stdout.write('The agent can only message you after you message it first.\n')
+  if (!prompts || !(await prompts.confirm('Connect your iPhone to this agent now?', true))) return true
   await waitForIMessageConnection(identity, dependencies)
   return true
 }
@@ -120,35 +180,49 @@ export async function configureIMessage(
 export async function waitForIMessageConnection(
   identity: AgentIdentity,
   dependencies: Pick<ChannelDependencies, 'sleep'> = defaultChannelDependencies,
-  attempts = 60,
+  attempts = Number.POSITIVE_INFINITY,
 ): Promise<void> {
-  process.stdout.write('Waiting for the iMessage connection...\n')
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const [assignment] = await identity.listIMessageAssignments({ limit: 1 })
-    if (assignment) {
-      await identity.sendIMessage({
-        to: assignment.remoteNumber,
-        text: `Connected to ${identity.agentHandle}. You can message this agent here anytime.`,
-      })
-      process.stdout.write('iMessage connected and welcome message sent.\n')
-      return
-    }
-    await dependencies.sleep(2_000)
+  process.stdout.write('Waiting for your first iMessage. Press Ctrl+C to skip.\n')
+  const startedAt = new Date().toISOString()
+  let interrupted = false
+  const interrupt = () => {
+    interrupted = true
   }
-  process.stdout.write('No iMessage connection arrived yet. You can finish it later with the same command.\n')
+  process.once('SIGINT', interrupt)
+  try {
+    for (let attempt = 0; attempt < attempts && !interrupted; attempt += 1) {
+      const messages = await identity
+        .listIMessages({ limit: 10, includeGroups: false, startDatetime: startedAt })
+        .catch(() => [])
+      const inbound = messages.find((message) => message.direction === 'inbound')
+      if (inbound) {
+        await identity.sendIMessage({
+          conversationId: inbound.conversationId,
+          text: `You're connected! This is your iMessage channel to your DeepSeek agent @${identity.agentHandle}. Anything you send here goes straight to the agent, and its replies will show up right in this thread.`,
+        })
+        await identity.markIMessageConversationRead(inbound.conversationId).catch(() => undefined)
+        process.stdout.write('First iMessage received and welcome message sent.\n')
+        return
+      }
+      await dependencies.sleep(3_000)
+    }
+    process.stdout.write(
+      interrupted
+        ? 'Skipped. The agent replies over iMessage once you connect and message it.\n'
+        : 'No iMessage connection arrived yet. You can finish it later by rerunning setup.\n',
+    )
+  } finally {
+    process.off('SIGINT', interrupt)
+  }
 }
 
 async function configureA2A(
   identity: AgentIdentity,
-  prompts: SetupPrompts | undefined,
+  _prompts: SetupPrompts | undefined,
   options: Pick<ChannelOptions, 'enableA2A' | 'nonInteractive'>,
 ): Promise<boolean> {
   const current = await identity.a2aSettings().catch(() => ({ enabled: false }))
-  const shouldEnable =
-    options.enableA2A ??
-    (!options.nonInteractive && prompts
-      ? await prompts.confirm('Enable agent-to-agent communication?', current.enabled)
-      : current.enabled)
+  const shouldEnable = options.enableA2A ?? current.enabled
   if (shouldEnable && !current.enabled) await identity.a2aEnable()
   return current.enabled || shouldEnable
 }
@@ -165,19 +239,19 @@ async function configurePhone(
       ? await prompts.confirm('Provision a dedicated phone number for SMS and voice?', true)
       : false)
   if (!shouldProvision) return { identity, provisioned: false }
-  const state = (
-    options.phoneState ?? (prompts ? await prompts.text('US state abbreviation', 'NY') : 'NY')
-  ).toUpperCase()
-  if (!/^[A-Z]{2}$/.test(state)) throw new Error('Phone state must be a two-letter US abbreviation')
   try {
-    await identity.provisionPhoneNumber({ state })
+    await identity.provisionPhoneNumber({
+      type: 'local',
+      ...(options.phoneState ? { state: options.phoneState.toUpperCase() } : {}),
+    })
     const refreshed = await identity.refresh()
     process.stdout.write(`Phone number provisioned: ${refreshed.phoneNumber?.number ?? 'ready'}.\n`)
     process.stdout.write('To enable SMS replies, text START to the new number from your phone.\n')
     return { identity: refreshed, provisioned: true }
   } catch (error) {
-    process.stderr.write(`Phone provisioning could not be completed: ${errorMessage(error)}\n`)
-    process.stderr.write('Setup will continue. You can provision a phone number later and rerun setup.\n')
+    process.stdout.write('Dedicated phone numbers are available on Inkbox paid tiers.\n')
+    process.stdout.write('See https://inkbox.ai/pricing for details.\n')
+    process.stdout.write(`Provisioning response: ${errorMessage(error)}\n`)
     return { identity, provisioned: false }
   }
 }

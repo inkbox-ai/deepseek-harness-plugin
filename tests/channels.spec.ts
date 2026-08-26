@@ -6,6 +6,7 @@ import {
   configureIMessage,
   configureVoice,
   waitForIMessageConnection,
+  waitForSmsOptIn,
 } from '../src/cli/channels.js'
 import type { IdentityCredential, SetupPrompts } from '../src/cli/onboarding.js'
 
@@ -65,6 +66,31 @@ function credential(identity: AgentIdentity, authorityClient?: unknown): Identit
 }
 
 describe('phone-call stack onboarding parity', () => {
+  it('offers phone-call handling for an iMessage-only identity', async () => {
+    const identity = voiceIdentity({
+      phoneNumber: null,
+      imessageEnabled: true,
+      listIMessageAssignments: vi.fn(async () => [{ remoteNumber: '+15550000001' }]),
+      a2aSettings: vi.fn(async () => ({ enabled: false })),
+    })
+    const client = { getIdentity: vi.fn(async () => identity) } as unknown as Inkbox
+    const prompt = prompts({
+      confirm: vi.fn(async (_label, fallback) => fallback ?? false),
+      text: vi.fn(async () => ''),
+    })
+    const result = await configureChannels(
+      { ...credential(identity), client },
+      prompt,
+      { provisionPhone: false },
+      dependencies(),
+    )
+    expect(result.voiceStack).toBe('inkbox_voice_ai')
+    expect(prompt.text).toHaveBeenCalledWith('Press Enter to continue and set up phone call handling')
+    expect(identity.setIncomingCallAction).toHaveBeenCalledWith({
+      incomingCallAction: IncomingCallAction.HOSTED_AGENT,
+    })
+  })
+
   it('offers only hosted agent and OpenAI Realtime, validates the key, and saves raw-media routing', async () => {
     const identity = voiceIdentity()
     const prompt = prompts({ choose: vi.fn(async () => 1), secret: vi.fn(async () => 'sk-realtime') })
@@ -228,6 +254,39 @@ describe('phone-call stack onboarding parity', () => {
 })
 
 describe('iMessage and phone onboarding parity', () => {
+  it('does not add an interactive A2A question', async () => {
+    const identity = {
+      agentHandle: 'deepseek-agent',
+      imessageEnabled: false,
+      phoneNumber: null,
+      a2aSettings: vi.fn(async () => ({ enabled: false })),
+    } as unknown as AgentIdentity
+    const client = { getIdentity: vi.fn(async () => identity) } as unknown as Inkbox
+    const confirm = vi.fn(async () => false)
+    await configureChannels(
+      { apiKey: 'ApiKey_agent', client, identity },
+      prompts({ confirm }),
+      {},
+      dependencies(),
+    )
+    expect(confirm.mock.calls.flat().join(' ')).not.toMatch(/agent-to-agent/i)
+  })
+
+  it('waits for an inbound START after provisioning', async () => {
+    const listTexts = vi
+      .fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ direction: 'inbound', text: 'START', remotePhoneNumber: '+15550000001' }])
+    const identity = {
+      phoneNumber: { number: '+15550000002' },
+      listTexts,
+    } as unknown as AgentIdentity
+    const deps = dependencies()
+    await waitForSmsOptIn(identity, deps, 2)
+    expect(deps.sleep).toHaveBeenCalledWith(3_000)
+    expect(listTexts).toHaveBeenCalledTimes(2)
+  })
+
   it('defaults to leaving an existing iMessage connection untouched', async () => {
     const identity = {
       imessageEnabled: true,
@@ -236,27 +295,29 @@ describe('iMessage and phone onboarding parity', () => {
     } as unknown as AgentIdentity
     const prompt = prompts()
     expect(await configureIMessage(identity, {} as Inkbox, prompt, {}, dependencies())).toBe(true)
-    expect(prompt.confirm).toHaveBeenCalledWith(
-      'iMessage is already connected. Show connection setup again?',
-      false,
-    )
+    expect(prompt.confirm).toHaveBeenCalledWith('Connect another iPhone to this agent now?', false)
     expect(identity.update).not.toHaveBeenCalled()
   })
 
-  it('enables iMessage, waits for the first assignment, and sends a welcome', async () => {
+  it('enables iMessage, waits for the first inbound message, and sends a welcome', async () => {
     const update = vi.fn(async () => ({}))
     const sendIMessage = vi.fn(async () => ({}))
-    const listIMessageAssignments = vi
+    const listIMessageAssignments = vi.fn(async () => [])
+    const listIMessages = vi
       .fn()
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ remoteNumber: '+15550000001' }])
+      .mockResolvedValueOnce([
+        { direction: 'inbound', conversationId: 'conversation-1', remoteNumber: '+15550000001' },
+      ])
+    const markIMessageConversationRead = vi.fn(async () => ({}))
     const identity = {
       agentHandle: 'deepseek-agent',
       imessageEnabled: false,
       update,
       listIMessageAssignments,
+      listIMessages,
       sendIMessage,
+      markIMessageConversationRead,
     } as unknown as AgentIdentity
     const client = {
       imessages: {
@@ -266,19 +327,20 @@ describe('iMessage and phone onboarding parity', () => {
     const deps = dependencies()
     expect(await configureIMessage(identity, client, prompts(), {}, deps)).toBe(true)
     expect(update).toHaveBeenCalledWith({ imessageEnabled: true })
-    expect(deps.sleep).toHaveBeenCalledWith(2_000)
+    expect(deps.sleep).toHaveBeenCalledWith(3_000)
     expect(sendIMessage).toHaveBeenCalledWith({
-      to: '+15550000001',
-      text: 'Connected to deepseek-agent. You can message this agent here anytime.',
+      conversationId: 'conversation-1',
+      text: expect.stringContaining('DeepSeek agent @deepseek-agent'),
     })
+    expect(markIMessageConversationRead).toHaveBeenCalledWith('conversation-1')
   })
 
   it('times out iMessage waiting without failing the rest of setup', async () => {
     const identity = {
-      listIMessageAssignments: vi.fn(async () => []),
+      listIMessages: vi.fn(async () => []),
     } as unknown as AgentIdentity
     await expect(waitForIMessageConnection(identity, dependencies(), 2)).resolves.toBeUndefined()
-    expect(identity.listIMessageAssignments).toHaveBeenCalledTimes(2)
+    expect(identity.listIMessages).toHaveBeenCalledTimes(2)
   })
 
   it('continues setup when optional phone provisioning fails', async () => {

@@ -64,14 +64,16 @@ export class Prompts {
   }
 
   async choose(label: string, choices: readonly string[], defaultIndex = 0): Promise<number> {
-    stdout.write(`${label}\n`)
-    choices.forEach((choice, index) => {
-      stdout.write(`  ${index + 1}. ${choice}${index === defaultIndex ? ' (recommended)' : ''}\n`)
-    })
-    const answer = await this.text('Choose', String(defaultIndex + 1))
-    const index = Number.parseInt(answer, 10) - 1
-    if (!Number.isInteger(index) || index < 0 || index >= choices.length) throw new Error('Invalid selection')
-    return index
+    while (true) {
+      stdout.write(`${label}\n`)
+      choices.forEach((choice, index) => {
+        stdout.write(`  ${index + 1}. ${choice}${index === defaultIndex ? ' (recommended)' : ''}\n`)
+      })
+      const answer = await this.text('Choose', String(defaultIndex + 1))
+      const index = Number.parseInt(answer, 10) - 1
+      if (Number.isInteger(index) && index >= 0 && index < choices.length) return index
+      stdout.write(`Choose a number from 1 to ${choices.length}.\n`)
+    }
   }
 
   close(): void {}

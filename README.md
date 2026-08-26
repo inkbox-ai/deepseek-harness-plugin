@@ -41,12 +41,13 @@ This private-source command requires GitHub access to the repository. The wizard
 `~/.dsh/inkbox-packages`, installs a pinned Harness runtime in `~/.dsh/inkbox-runtime`, creates the `inkbox`
 profile, installs this bundle, stores credentials in the Harness credential file, selects or creates an
 identity, configures optional channels, and offers to install and restart a background service.
-The wizard creates or recovers the identity webhook signing key, can provision a phone number, guides the
-iMessage connection, and validates call handling before it saves the selected mode.
+The wizard defaults to guided self-signup, or securely accepts an existing API key when you choose that path.
+It attaches the bundled avatar, explains server-side reachability rules, walks through iMessage before an
+optional dedicated number, waits for the first iMessage and SMS opt-in when requested, configures either the
+hosted call agent or OpenAI Realtime, configures webhook signing, and finishes by verifying the gateway is live.
 
-If `~/.env` contains exactly one environment-specific `INKBOX_API_KEY_*` value, setup will use it. Set
-`INKBOX_API_KEY` explicitly when more than one variant exists, choose an alias in the interactive wizard, or
-pass its name with `--inkbox-key-env` for non-interactive setup.
+Environment-specific `INKBOX_API_KEY_*` credentials are never listed in the interactive wizard. Automated
+setup can select one explicitly with `--inkbox-key-env`; otherwise non-interactive setup uses `INKBOX_API_KEY`.
 
 Then run:
 
@@ -79,10 +80,9 @@ inkbox-deepseek service status
   post-call actions without a separate daemon.
 - **External events:** GitHub HMAC webhooks are supported when explicitly enabled and configured.
 
-The setup wizard can trust Inkbox tools so they run without repeated approval prompts. This applies only to
-the plugin's `inkbox_*` tools; other Harness tools and actions keep their own approval behavior. When trust is
-disabled, mutating Inkbox tools use the Harness native approval service. Read-only tools are marked
-concurrency-safe, and writes remain exclusive.
+The setup wizard trusts Inkbox tools so they run without repeated approval prompts. This applies only to the
+plugin's `inkbox_*` tools; other Harness tools and actions keep their own approval behavior. Automated setup
+can explicitly keep per-action prompts with `--ask-inkbox-tool-approvals`.
 
 ## Configuration
 
