@@ -2,6 +2,7 @@ import { type AgentIdentity, HostedAgentAuthorityMode, IncomingCallAction, Inkbo
 import type { VoiceStack } from '../config.js'
 import { validateOpenAIRealtimeKey } from '../realtime.js'
 import type { IdentityCredential, SetupPrompts } from './onboarding.js'
+import { showQr, smsDraftLink, smsToQrPayload } from './qr.js'
 
 export interface ChannelOptions {
   voiceStack?: VoiceStack
@@ -61,7 +62,6 @@ export async function configureChannels(
 
   let voice: Pick<ChannelResult, 'voiceStack' | 'realtimeApiKey' | 'realtimeModel' | 'realtimeVoice'> = {}
   if (identity.phoneNumber || imessageEnabled) {
-    if (prompts) await prompts.text('Press Enter to continue and set up phone call handling')
     voice = await configureVoice(identity, credential, prompts, options, dependencies)
   } else if (options.voiceStack) {
     throw new Error('A dedicated phone number is required to configure phone-call handling')
@@ -87,7 +87,11 @@ function printIdentitySummary(identity: AgentIdentity): void {
     process.stdout.write(
       `Text START to ${identity.phoneNumber.number} to enable outbound SMS to your phone.\n`,
     )
-    process.stdout.write(`One-tap START link: sms:${identity.phoneNumber.number}?&body=START\n`)
+    const fallbackLink = smsDraftLink(identity.phoneNumber.number, 'START')
+    process.stdout.write('\nOr just scan this with your phone camera to draft that text in one tap:\n\n')
+    if (!showQr(smsToQrPayload(identity.phoneNumber.number, 'START'))) {
+      process.stdout.write(`Open this one-tap link instead: ${fallbackLink}\n`)
+    }
   }
   process.stdout.write('Reachability rules: https://inkbox.ai/console/contact-rules\n')
 }
@@ -168,10 +172,12 @@ export async function configureIMessage(
   process.stdout.write(`  1. Text "${triage.connectCommand}" to ${triage.number}.\n`)
   process.stdout.write('  2. Open the new thread from the number assigned to this agent.\n')
   process.stdout.write('  3. Send any first message, such as "hi", in that new thread.\n')
-  process.stdout.write(
-    `One-tap link: sms:${triage.number}?&body=${encodeURIComponent(triage.connectCommand)}\n`,
-  )
   process.stdout.write('The agent can only message you after you message it first.\n')
+  const fallbackLink = smsDraftLink(triage.number, triage.connectCommand)
+  process.stdout.write('\nOr just scan this with your iPhone camera to do step 1 in one tap:\n\n')
+  if (!showQr(smsToQrPayload(triage.number, triage.connectCommand))) {
+    process.stdout.write(`Open this one-tap link instead: ${fallbackLink}\n`)
+  }
   if (!prompts || !(await prompts.confirm('Connect your iPhone to this agent now?', true))) return true
   await waitForIMessageConnection(identity, dependencies)
   return true

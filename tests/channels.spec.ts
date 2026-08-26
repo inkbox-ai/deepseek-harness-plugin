@@ -85,7 +85,7 @@ describe('phone-call stack onboarding parity', () => {
       dependencies(),
     )
     expect(result.voiceStack).toBe('inkbox_voice_ai')
-    expect(prompt.text).toHaveBeenCalledWith('Press Enter to continue and set up phone call handling')
+    expect(prompt.text).not.toHaveBeenCalledWith('Press Enter to continue and set up phone call handling')
     expect(identity.setIncomingCallAction).toHaveBeenCalledWith({
       incomingCallAction: IncomingCallAction.HOSTED_AGENT,
     })
