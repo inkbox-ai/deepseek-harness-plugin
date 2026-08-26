@@ -1,0 +1,7 @@
+# Inkbox runs inside the selected DeepSeek Harness profile and owns its tunnel,
+# subscriptions, durable routing state, and channel-to-agent lifecycle.
+- insert:
+    - id: inkbox
+      name: '@inkbox/deepseek-harness-plugin'
+      config:
+        workspace: !!js process.cwd()
