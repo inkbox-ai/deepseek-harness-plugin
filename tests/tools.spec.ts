@@ -25,6 +25,7 @@ function harness() {
     imessageNumber: null,
     tunnel: { id: 'tunnel' },
     sendEmail: vi.fn(async () => ({ id: 'mail-1' })),
+    sendIMessage: vi.fn(async () => ({ id: 'imessage-1' })),
   }
   const client = { whoami: vi.fn(async () => ({ authType: 'api_key' })) }
   const runtime = {
@@ -72,6 +73,16 @@ describe('Harness tool registration and execution', () => {
       expect.objectContaining({ toolName: 'inkbox_send_email', agent: exec.agent }),
     )
     expect(identity.sendEmail).toHaveBeenCalledOnce()
+  })
+
+  it('converts explicit iMessage tool sends to plain text', async () => {
+    const { definitions, identity } = harness()
+    const tool = findTool(definitions, 'inkbox_send_imessage')
+    await tool.execute({ conversationId: 'conversation-1', text: '**Done**\n- First item' }, exec)
+    expect(identity.sendIMessage).toHaveBeenCalledWith({
+      conversationId: 'conversation-1',
+      text: 'Done\nFirst item',
+    })
   })
 
   it('fails closed when outbound approval is rejected', async () => {

@@ -7,7 +7,12 @@ import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
 import type { TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ResolvedConfig } from '../src/config.js'
-import { Gateway, isSilentResponse } from '../src/gateway.js'
+import {
+  Gateway,
+  IMESSAGE_TYPING_MAX_MS,
+  IMESSAGE_TYPING_REFRESH_MS,
+  isSilentResponse,
+} from '../src/gateway.js'
 import type { InkboxRuntime } from '../src/runtime.js'
 
 const tunnel = vi.hoisted(() => ({
@@ -59,6 +64,7 @@ interface Harness {
     sendEmail: ReturnType<typeof vi.fn>
     sendText: ReturnType<typeof vi.fn>
     sendIMessage: ReturnType<typeof vi.fn>
+    sendIMessageTyping: ReturnType<typeof vi.fn>
   }
   subscriptions: {
     list: ReturnType<typeof vi.fn>
@@ -88,6 +94,7 @@ async function harness(
     sendEmail: vi.fn(async () => ({ id: 'mail-1' })),
     sendText: vi.fn(async () => ({ id: 'text-1' })),
     sendIMessage: vi.fn(async () => ({ id: 'imessage-1' })),
+    sendIMessageTyping: vi.fn(async () => {}),
   }
   const runtime = {
     getClient: vi.fn(async () => client as unknown as Inkbox),
@@ -170,6 +177,26 @@ function sms(id: string, body = 'Hello from SMS'): Request {
           sender_phone_number: '+15550000001',
           conversation_id: 'sms-conversation-1',
           text: body,
+        },
+        contacts: [{ id: 'contact-1', address: '+15550000001' }],
+      },
+    }),
+  })
+}
+
+function imessage(id: string, body = 'Hello from iMessage', group = false): Request {
+  return new Request('https://agent.example.test/webhook', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
+    body: JSON.stringify({
+      id,
+      event_type: 'imessage.received',
+      data: {
+        message: {
+          sender_number: '+15550000001',
+          conversation_id: group ? 'imessage-group-1' : 'imessage-conversation-1',
+          content: body,
+          is_group: group,
         },
         contacts: [{ id: 'contact-1', address: '+15550000001' }],
       },
@@ -269,6 +296,104 @@ describe('gateway lifecycle and delivery', () => {
       inReplyToMessageId: '<event-2@example.test>',
     })
     await vi.waitFor(() => expect(gateway.state.snapshot().replied['event-2']).toBeTypeOf('number'))
+    await gateway.close()
+  })
+
+  it('shows typing for a one-to-one iMessage and sends a plain-text reply', async () => {
+    const { gateway, identity } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockResolvedValue(
+      '# Update\n\n**Done**\n- First item\n[Report](https://example.test/report)',
+    )
+
+    expect((await gateway.handleRequest(imessage('event-imessage-1'))).status).toBe(202)
+    await vi.waitFor(() => expect(identity.sendIMessageTyping).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(identity.sendIMessage).toHaveBeenCalledOnce())
+    expect(identity.sendIMessage).toHaveBeenCalledWith({
+      conversationId: 'imessage-conversation-1',
+      text: 'Update\n\nDone\nFirst item\nReport: https://example.test/report',
+    })
+    await gateway.close()
+  })
+
+  it('refreshes one typing pulse and cancels it after a silent turn', async () => {
+    const { gateway, identity } = await harness()
+    vi.useFakeTimers()
+    let finish: ((value: string) => void) | undefined
+    vi.spyOn(gateway.agents, 'run').mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          finish = resolve
+        }),
+    )
+    try {
+      await gateway.handleRequest(imessage('event-imessage-pulse'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(identity.sendIMessageTyping).toHaveBeenCalledOnce()
+      expect(IMESSAGE_TYPING_REFRESH_MS).toBe(40_000)
+      expect(IMESSAGE_TYPING_MAX_MS).toBe(600_000)
+
+      await vi.advanceTimersByTimeAsync(IMESSAGE_TYPING_REFRESH_MS)
+      expect(identity.sendIMessageTyping).toHaveBeenCalledTimes(2)
+      finish?.('[SILENT]')
+      await vi.advanceTimersByTimeAsync(0)
+      const stoppedAt = identity.sendIMessageTyping.mock.calls.length
+      await vi.advanceTimersByTimeAsync(IMESSAGE_TYPING_REFRESH_MS * 2)
+      expect(identity.sendIMessageTyping).toHaveBeenCalledTimes(stoppedAt)
+      expect(identity.sendIMessage).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+      await gateway.close()
+    }
+  })
+
+  it('expires a typing pulse at the ten-minute safety cap while a turn is still running', async () => {
+    const { gateway, identity } = await harness()
+    vi.useFakeTimers()
+    let finish: ((value: string) => void) | undefined
+    vi.spyOn(gateway.agents, 'run').mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          finish = resolve
+        }),
+    )
+    try {
+      await gateway.handleRequest(imessage('event-imessage-cap'))
+      await vi.advanceTimersByTimeAsync(IMESSAGE_TYPING_MAX_MS)
+      const pulsesAtCap = identity.sendIMessageTyping.mock.calls.length
+      expect(pulsesAtCap).toBeGreaterThan(1)
+      await vi.advanceTimersByTimeAsync(IMESSAGE_TYPING_REFRESH_MS * 2)
+      expect(identity.sendIMessageTyping).toHaveBeenCalledTimes(pulsesAtCap)
+      finish?.('[SILENT]')
+      await vi.advanceTimersByTimeAsync(0)
+    } finally {
+      vi.useRealTimers()
+      await gateway.close()
+    }
+  })
+
+  it('cancels a queued typing pulse during gateway shutdown', async () => {
+    const { gateway, identity } = await harness(30_000)
+    vi.useFakeTimers()
+    try {
+      await gateway.handleRequest(imessage('event-imessage-shutdown'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(identity.sendIMessageTyping).toHaveBeenCalledOnce()
+      await gateway.close()
+      await vi.advanceTimersByTimeAsync(IMESSAGE_TYPING_REFRESH_MS * 2)
+      expect(identity.sendIMessageTyping).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('never shows typing for a group iMessage', async () => {
+    const { gateway, identity } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    await gateway.handleRequest(imessage('event-imessage-group', 'Hello group', true))
+    await vi.waitFor(() =>
+      expect(gateway.state.snapshot().replied['event-imessage-group']).toBeTypeOf('number'),
+    )
+    expect(identity.sendIMessageTyping).not.toHaveBeenCalled()
     await gateway.close()
   })
 
