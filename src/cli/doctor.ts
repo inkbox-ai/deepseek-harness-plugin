@@ -44,6 +44,7 @@ export async function doctor(paths: Paths): Promise<Check[]> {
   const settings = await readYaml(join(paths.dshHome, 'settings.yaml'))
   const section = settings?.inkbox as Record<string, unknown> | undefined
   const agentHandle = typeof section?.agentHandle === 'string' ? section.agentHandle : undefined
+  const voiceStack = section?.voiceStack === 'openai_realtime' ? 'openai_realtime' : 'inkbox_voice_ai'
   add(
     'Profile settings',
     agentHandle !== undefined,
@@ -58,6 +59,16 @@ export async function doctor(paths: Paths): Promise<Check[]> {
     typeof refs?.DEEPSEEK_API_KEY === 'string' ? refs.DEEPSEEK_API_KEY : process.env.DEEPSEEK_API_KEY
   add('DeepSeek credential', Boolean(deepseekKey), deepseekKey ? 'Configured' : 'Missing DEEPSEEK_API_KEY')
   add('Inkbox credential', Boolean(inkboxKey), inkboxKey ? 'Configured' : 'Missing INKBOX_API_KEY')
+  const realtimeKey =
+    typeof refs?.INKBOX_REALTIME_API_KEY === 'string'
+      ? refs.INKBOX_REALTIME_API_KEY
+      : (process.env.INKBOX_REALTIME_API_KEY ?? process.env.OPENAI_API_KEY)
+  if (voiceStack === 'openai_realtime')
+    add(
+      'OpenAI Realtime credential',
+      Boolean(realtimeKey),
+      realtimeKey ? 'Configured' : 'Missing INKBOX_REALTIME_API_KEY',
+    )
 
   if (inkboxKey && agentHandle) {
     try {
@@ -83,6 +94,19 @@ export async function doctor(paths: Paths): Promise<Check[]> {
         identity.imessageEnabled,
         identity.imessageEnabled ? 'Enabled' : 'Optional channel is disabled',
       )
+      if (identity.phoneNumber) {
+        const incoming = await identity.getIncomingCallAction()
+        const expected = voiceStack === 'openai_realtime' ? 'auto_accept' : 'hosted_agent'
+        add(
+          'Call handling',
+          incoming.incomingCallAction === expected,
+          incoming.incomingCallAction === expected
+            ? voiceStack === 'openai_realtime'
+              ? 'OpenAI Realtime'
+              : 'Inkbox hosted agent'
+            : `Expected ${expected}; found ${incoming.incomingCallAction}`,
+        )
+      }
       const signingConfigured = (await identity.getSigningKeyStatus()).configured
       const signingStored = typeof refs?.INKBOX_WEBHOOK_SIGNING_KEY === 'string'
       add(

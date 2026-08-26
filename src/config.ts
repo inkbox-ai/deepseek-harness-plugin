@@ -14,7 +14,14 @@ export interface Config {
   permissionTimeoutMs?: number
   externalEvents?: boolean
   voiceEnabled?: boolean
+  voiceStack?: VoiceStack
+  realtimeCredentialRef?: string
+  realtimeModel?: string
+  realtimeVoice?: string
+  channelInstructions?: Record<string, string>
 }
+
+export type VoiceStack = 'inkbox_voice_ai' | 'openai_realtime'
 
 export const Config: z<Config> = z.object({
   enabled: z.boolean().default(true),
@@ -28,6 +35,11 @@ export const Config: z<Config> = z.object({
   permissionTimeoutMs: z.number().step(1).min(1_000).max(3_600_000).default(DEFAULT_PERMISSION_TIMEOUT_MS),
   externalEvents: z.boolean().default(false),
   voiceEnabled: z.boolean().default(true),
+  voiceStack: z.union(['inkbox_voice_ai', 'openai_realtime']).default('inkbox_voice_ai'),
+  realtimeCredentialRef: z.string().default('INKBOX_REALTIME_API_KEY'),
+  realtimeModel: z.string().default('gpt-realtime-2'),
+  realtimeVoice: z.string().default('cedar'),
+  channelInstructions: z.dict(z.string()).default({}),
 })
 
 export interface ResolvedConfig {
@@ -42,6 +54,11 @@ export interface ResolvedConfig {
   permissionTimeoutMs: number
   externalEvents: boolean
   voiceEnabled: boolean
+  voiceStack: VoiceStack
+  realtimeCredentialRef: string
+  realtimeModel: string
+  realtimeVoice: string
+  channelInstructions: Record<string, string>
 }
 
 export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME): ResolvedConfig {
@@ -58,5 +75,10 @@ export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME
     permissionTimeoutMs: config.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS,
     externalEvents: config.externalEvents ?? false,
     voiceEnabled: config.voiceEnabled ?? true,
+    voiceStack: config.voiceStack ?? 'inkbox_voice_ai',
+    realtimeCredentialRef: config.realtimeCredentialRef?.trim() || 'INKBOX_REALTIME_API_KEY',
+    realtimeModel: config.realtimeModel?.trim() || 'gpt-realtime-2',
+    realtimeVoice: config.realtimeVoice?.trim() || 'cedar',
+    channelInstructions: { ...config.channelInstructions },
   }
 }

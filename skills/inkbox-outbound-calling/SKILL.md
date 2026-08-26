@@ -42,8 +42,10 @@ explicitly only to override that default.
    - `toNumber`
    - `reason` — required. Include the purpose, desired opening, and concise background the voice agent needs.
    - `origination` — usually omit it; it auto-follows the conversation's channel (and the only available line). Set it explicitly only to override.
-4. The call runs through Inkbox Voice AI; do not invent or request a media WebSocket URL.
-5. When the callee answers, the hosted voice agent follows the `reason` task brief.
+4. The plugin routes the call through the call mode selected during setup. Do not invent or request a media
+   WebSocket URL.
+5. When the callee answers, the configured call agent follows the `reason` task brief and can consult the main
+   Harness session when needed.
 
 ## Follow-ups
 

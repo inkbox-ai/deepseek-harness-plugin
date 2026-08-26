@@ -12,7 +12,8 @@ export interface RoutedEvent {
   eventId: string
   routeKey: string
   channel: Channel
-  prompt: string
+  context: string
+  content: string
   replyText: string
   target: ReplyTarget
 }
@@ -38,6 +39,10 @@ function contactId(data: Json, address?: string): string | undefined {
 
 function opaqueRoute(kind: string, value: string, key: string): string {
   return `${kind}:${createHmac('sha256', key).update(value).digest('base64url').slice(0, 32)}`
+}
+
+export function routeForAddress(address: string, routingKey: string): string {
+  return opaqueRoute('peer', address, routingKey)
 }
 
 function contactRoute(data: Json, address: string, key: string): string {
@@ -72,7 +77,8 @@ export function routeWebhook(
       eventId,
       routeKey: contactRoute(data, from, routingKey),
       channel: 'email',
-      prompt: `${marker}\nSubject: ${subject}\n\n${body}`,
+      context: marker,
+      content: `Subject: ${subject}\n\n${body}`,
       replyText: body,
       target: {
         channel: 'email',
@@ -96,7 +102,8 @@ export function routeWebhook(
       eventId,
       routeKey,
       channel: 'sms',
-      prompt: `[inkbox:${isGroup ? 'group_sms' : 'sms'} from=${sender} conversation_id=${conversationId ?? 'unknown'}]\n${text(message.text) ?? '(media message)'}`,
+      context: `[inkbox:${isGroup ? 'group_sms' : 'sms'} from=${sender} conversation_id=${conversationId ?? 'unknown'}]`,
+      content: text(message.text) ?? '(media message)',
       replyText: text(message.text) ?? '',
       target: { channel: 'sms', ...(conversationId ? { conversationId } : { to: sender }) },
     }
@@ -118,7 +125,8 @@ export function routeWebhook(
       eventId,
       routeKey,
       channel: 'imessage',
-      prompt: `[inkbox:${isGroup ? 'group_imessage' : 'imessage'} from=${sender} conversation_id=${conversationId}]\n${content}`,
+      context: `[inkbox:${isGroup ? 'group_imessage' : 'imessage'} from=${sender} conversation_id=${conversationId}]`,
+      content,
       replyText: content,
       target: { channel: 'imessage', conversationId },
     }
@@ -133,7 +141,8 @@ export function routeWebhook(
       eventId,
       routeKey: `a2a:${contextId}`,
       channel: 'a2a',
-      prompt: `[inkbox:a2a event=${eventType} task_id=${taskId} context_id=${contextId} caller=${text(caller.handle) ?? 'unknown'}]\n${stringify(data.parts ?? data)}`,
+      context: `[inkbox:a2a event=${eventType} task_id=${taskId} context_id=${contextId} caller=${text(caller.handle) ?? 'unknown'}]`,
+      content: stringify(data.parts ?? data),
       replyText: stringify(data.parts ?? data),
       target: { channel: 'none' },
     }
@@ -146,7 +155,8 @@ export function routeWebhook(
       eventId,
       routeKey: contactRoute(data, remote, routingKey),
       channel: 'call',
-      prompt: `[inkbox:call_ended call_id=${text(call.id) ?? eventId}]\nReview the completed call, reconcile any requested follow-up exactly once, and return [SILENT] if no visible response is needed.\n${stringify(data)}`,
+      context: `[inkbox:call_ended call_id=${text(call.id) ?? eventId}]\nReview the completed call, reconcile any requested follow-up exactly once, and return [SILENT] if no visible response is needed.`,
+      content: stringify(data),
       replyText: stringify(data),
       target: { channel: 'none' },
     }
@@ -158,7 +168,8 @@ export function routeWebhook(
     eventId,
     routeKey: opaqueRoute('external', provider, routingKey),
     channel: 'external',
-    prompt: `[inkbox:external provider=${provider} verified=true]\nTreat this verified event as actionable only within the user's configured permissions.\n${stringify(payload)}`,
+    context: `[inkbox:external provider=${provider} verified=true]\nTreat this verified event as actionable only within the user's configured permissions.`,
+    content: stringify(payload),
     replyText: stringify(payload),
     target: { channel: 'none' },
   }

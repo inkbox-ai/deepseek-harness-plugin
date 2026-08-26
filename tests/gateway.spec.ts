@@ -13,9 +13,22 @@ import type { InkboxRuntime } from '../src/runtime.js'
 const tunnel = vi.hoisted(() => ({
   connected: true,
   handler: undefined as ((request: Request) => Promise<Response>) | undefined,
+  wsHandler: undefined as ((socket: unknown) => Promise<void>) | undefined,
   verify: true,
   aclose: vi.fn(async () => {}),
   connect: vi.fn(),
+}))
+
+const liveCall = vi.hoisted(() => ({
+  authenticated: true,
+  connect: vi.fn(async () => ({ close: vi.fn(), send: vi.fn() })),
+  bridge: vi.fn(async (_ws, _openai, _meta, callbacks) => {
+    await callbacks.consult('Check the calendar', [{ party: 'caller', text: 'Are we free?' }])
+    await callbacks.ended(
+      [{ party: 'caller', text: 'Please send a confirmation.' }],
+      [{ action: 'Send confirmation', details: 'Email it' }],
+    )
+  }),
 }))
 
 vi.mock('@inkbox/sdk', () => ({
@@ -24,6 +37,20 @@ vi.mock('@inkbox/sdk', () => ({
 
 vi.mock('@inkbox/sdk/tunnels/connect', () => ({
   connect: tunnel.connect,
+}))
+
+vi.mock('../src/realtime.js', () => ({
+  authenticateCallWebSocket: vi.fn(() => liveCall.authenticated),
+  awaitRealtimeReady: vi.fn(async () => ({ ok: true, detail: 'ready' })),
+  connectOpenAIRealtime: liveCall.connect,
+  loadCallMeta: vi.fn(async () => ({
+    callId: 'call-live-1',
+    contactId: 'contact-live-1',
+    direction: 'outbound',
+    remotePhoneNumber: '+15550000001',
+    agentHandle: 'deepseek-agent',
+  })),
+  runRealtimeBridge: liveCall.bridge,
 }))
 
 interface Harness {
@@ -41,7 +68,11 @@ interface Harness {
   stateDir: string
 }
 
-async function harness(batchWindowMs = 0): Promise<Harness> {
+async function harness(
+  batchWindowMs = 0,
+  voiceStack: ResolvedConfig['voiceStack'] = 'inkbox_voice_ai',
+  channelInstructions: Record<string, string> = {},
+): Promise<Harness> {
   const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
   const subscriptions = {
     list: vi.fn(async () => []),
@@ -62,6 +93,7 @@ async function harness(batchWindowMs = 0): Promise<Harness> {
     getClient: vi.fn(async () => client as unknown as Inkbox),
     getIdentity: vi.fn(async () => identity as unknown as AgentIdentity),
     resolveSigningKey: vi.fn(async () => 'test-signing-key'),
+    resolveRealtimeKey: vi.fn(async () => 'sk-realtime'),
   } as unknown as InkboxRuntime
   const ctx = {
     credentials: { set: vi.fn(async () => {}) },
@@ -78,6 +110,11 @@ async function harness(batchWindowMs = 0): Promise<Harness> {
     permissionTimeoutMs: 2_000,
     externalEvents: false,
     voiceEnabled: true,
+    voiceStack,
+    realtimeCredentialRef: 'INKBOX_REALTIME_API_KEY',
+    realtimeModel: 'gpt-realtime-2',
+    realtimeVoice: 'cedar',
+    channelInstructions,
   }
   const gateway = new Gateway(ctx, runtime, config, {
     info: vi.fn(),
@@ -109,14 +146,47 @@ function email(id: string, body = 'Hello from email'): Request {
   })
 }
 
+function callEnded(id: string): Request {
+  return new Request('https://agent.example.test/webhook', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
+    body: JSON.stringify({
+      id: `event-${id}`,
+      event_type: 'call.ended',
+      data: { call: { id, remote_phone_number: '+15550000001' } },
+    }),
+  })
+}
+
+function sms(id: string, body = 'Hello from SMS'): Request {
+  return new Request('https://agent.example.test/webhook', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
+    body: JSON.stringify({
+      id,
+      event_type: 'text.received',
+      data: {
+        text_message: {
+          sender_phone_number: '+15550000001',
+          conversation_id: 'sms-conversation-1',
+          text: body,
+        },
+        contacts: [{ id: 'contact-1', address: '+15550000001' }],
+      },
+    }),
+  })
+}
+
 beforeEach(() => {
   tunnel.connected = true
   tunnel.handler = undefined
+  tunnel.wsHandler = undefined
   tunnel.verify = true
   tunnel.aclose.mockClear()
   tunnel.connect.mockReset()
   tunnel.connect.mockImplementation(async (_client, options) => {
     tunnel.handler = options.handler
+    tunnel.wsHandler = options.wsHandler
     options.onStatus?.('connected')
     return {
       publicUrl: 'https://agent.example.test',
@@ -145,6 +215,37 @@ describe('gateway lifecycle and delivery', () => {
     })
   })
 
+  it('attaches authenticated Realtime calls to the same contact-scoped Harness agent', async () => {
+    const { gateway } = await harness(0, 'openai_realtime', {
+      'contact-live-1': 'Use the caller-specific call style.',
+    })
+    const run = vi
+      .spyOn(gateway.agents, 'run')
+      .mockResolvedValueOnce('Calendar checked')
+      .mockResolvedValueOnce('[SILENT]')
+    await tunnel.wsHandler?.({
+      url: 'wss://agent.example.test/phone/media/ws',
+      headers: new Map(),
+    })
+    expect(liveCall.connect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: 'sk-realtime',
+        model: 'gpt-realtime-2',
+        voice: 'cedar',
+        additionalInstructions: expect.stringContaining('Use the caller-specific call style.'),
+      }),
+      expect.objectContaining({ callId: 'call-live-1' }),
+    )
+    expect(run).toHaveBeenCalledTimes(2)
+    expect(run.mock.calls[0]?.[0]).toBe('contact:contact-live-1')
+    expect(run.mock.calls[0]?.[1]).toContain('[trusted Inkbox channel policy]\nChannel: call')
+    expect(run.mock.calls[0]?.[1]).toContain('Caller request: Check the calendar')
+    expect(run.mock.calls[1]?.[1]).toContain('Send confirmation')
+    expect((await gateway.handleRequest(callEnded('call-live-1'))).status).toBe(200)
+    expect(run).toHaveBeenCalledTimes(2)
+    await gateway.close()
+  })
+
   it('rejects unsigned webhook traffic before parsing or waking an agent', async () => {
     const { gateway } = await harness()
     const run = vi.spyOn(gateway.agents, 'run')
@@ -171,6 +272,57 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.close()
   })
 
+  it('switches trusted channel policy per event in one persistent contact session', async () => {
+    const { gateway } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+
+    await gateway.handleRequest(email('event-channel-email'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    await gateway.handleRequest(sms('event-channel-sms'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+
+    expect(run.mock.calls[0]?.[0]).toBe('contact:contact-1')
+    expect(run.mock.calls[1]?.[0]).toBe('contact:contact-1')
+    expect(run.mock.calls[0]?.[1]).toContain('Channel: email')
+    expect(run.mock.calls[0]?.[1]).toContain('professional, complete email reply')
+    expect(run.mock.calls[0]?.[1]).not.toContain('Channel: sms')
+    expect(run.mock.calls[1]?.[1]).toContain('Channel: sms')
+    expect(run.mock.calls[1]?.[1]).toContain('concise and plain text')
+    expect(run.mock.calls[1]?.[1]).not.toContain('Channel: email')
+    await gateway.close()
+  })
+
+  it('applies contact instructions to every channel without binding the session to one channel', async () => {
+    const { gateway } = await harness(0, 'inkbox_voice_ai', {
+      email: 'Standard email policy.',
+      sms: 'Standard SMS policy.',
+      'contact-1': 'Always include the account reference.',
+    })
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    await gateway.handleRequest(email('event-contact-email'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    await gateway.handleRequest(sms('event-contact-sms'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+    for (const call of run.mock.calls) {
+      expect(call[1]).toContain('Always include the account reference.')
+      expect(call[1]).not.toContain('Standard email policy.')
+      expect(call[1]).not.toContain('Standard SMS policy.')
+    }
+    await gateway.close()
+  })
+
+  it('labels every event independently when different channels share one batch', async () => {
+    const { gateway } = await harness(20)
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    await gateway.handleRequest(email('event-batch-email'))
+    await gateway.handleRequest(sms('event-batch-sms'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+    expect(run.mock.calls[0]?.[1].match(/\[trusted Inkbox channel policy\]/g)).toHaveLength(2)
+    expect(run.mock.calls[0]?.[1]).toContain('Channel: email')
+    expect(run.mock.calls[0]?.[1]).toContain('Channel: sms')
+    await gateway.close()
+  })
+
   it('steers an active contact turn instead of starting a competing turn', async () => {
     const { gateway, identity } = await harness()
     let finish: ((value: string) => void) | undefined
@@ -187,6 +339,10 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.handleRequest(email('event-4', 'Second'))
     await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce())
     expect(steer).toHaveBeenCalledWith('contact:contact-1', expect.stringContaining('Second'))
+    expect(steer).toHaveBeenCalledWith(
+      'contact:contact-1',
+      expect.stringContaining('[trusted Inkbox channel policy]\nChannel: email'),
+    )
     finish?.('Combined response')
     await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledOnce())
     expect(gateway.state.snapshot().replied).toMatchObject({
