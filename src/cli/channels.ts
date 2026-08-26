@@ -9,6 +9,7 @@ export interface ChannelOptions {
   realtimeApiKey?: string
   realtimeModel?: string
   realtimeVoice?: string
+  callInstruction?: string
   enableIMessage?: boolean
   enableA2A?: boolean
   provisionPhone?: boolean
@@ -241,7 +242,9 @@ export async function configureVoice(
   const authorityMode =
     authority === 'yolo' ? HostedAgentAuthorityMode.YOLO : HostedAgentAuthorityMode.CONTACT_SCOPED
   try {
-    await identity.setHostedAgentConfig({})
+    await identity.setHostedAgentConfig({
+      ...(options.callInstruction?.trim() ? { instructions: options.callInstruction.trim() } : {}),
+    })
     if (previousConfig.authorityMode !== authorityMode) {
       if (!authorityIdentity) {
         if (!prompts)

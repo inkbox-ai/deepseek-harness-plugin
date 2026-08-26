@@ -16,6 +16,7 @@ describe('configuration', () => {
     expect(config.realtimeCredentialRef).toBe('INKBOX_REALTIME_API_KEY')
     expect(config.realtimeModel).toBe('gpt-realtime-2')
     expect(config.realtimeVoice).toBe('cedar')
+    expect(config.channelInstructions).toEqual({})
   })
 
   it('normalizes workspace and identity without inventing an identity', () => {
@@ -32,5 +33,19 @@ describe('configuration', () => {
 
   it('uses an explicit state directory exactly as configured', () => {
     expect(resolveConfig({ stateDir: '/tmp/custom-state' }, '/tmp/dsh').stateDir).toBe('/tmp/custom-state')
+  })
+
+  it('preserves channel and contact-specific instructions', () => {
+    expect(
+      resolveConfig(
+        {
+          channelInstructions: {
+            sms: 'Keep it brief.',
+            'contact-1': 'Use the agreed status format.',
+          },
+        },
+        '/tmp/dsh',
+      ).channelInstructions,
+    ).toEqual({ sms: 'Keep it brief.', 'contact-1': 'Use the agreed status format.' })
   })
 })

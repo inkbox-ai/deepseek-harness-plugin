@@ -25,6 +25,7 @@ async function harness(stack: ResolvedConfig['voiceStack']) {
     realtimeCredentialRef: 'INKBOX_REALTIME_API_KEY',
     realtimeModel: 'gpt-realtime-2',
     realtimeVoice: 'cedar',
+    channelInstructions: {},
   }
   const runtime = new InkboxRuntime({} as Context, config)
   const identity = {

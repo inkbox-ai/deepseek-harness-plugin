@@ -64,7 +64,7 @@ describe('webhook routing', () => {
       subject: 'Re: Hello',
       inReplyToMessageId: '<one@example.test>',
     })
-    expect(routed?.prompt).toContain('Email body')
+    expect(routed?.content).toContain('Email body')
   })
 
   it('routes iMessage groups by conversation', () => {
@@ -111,7 +111,7 @@ describe('webhook routing', () => {
       false,
     )
     expect(routed?.routeKey).toBe('contact:contact-2')
-    expect(routed?.prompt).toContain('Reaction like')
+    expect(routed?.content).toContain('Reaction like')
   })
 
   it('keeps A2A work in its context and suppresses automatic channel replies', () => {

@@ -8,6 +8,7 @@ import type { AskUserQuestionAnswer, AskUserQuestionRequest } from '@deepseek-ai
 import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
 import { connect, type InkboxWebSocket, type TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { AgentManager } from './agent-manager.js'
+import { renderChannelEvent, resolveChannelInstruction } from './channel-instructions.js'
 import type { ResolvedConfig } from './config.js'
 import {
   authenticateCallWebSocket,
@@ -186,11 +187,22 @@ export class Gateway {
     const apiKey = await this.runtime.resolveRealtimeKey()
     if (!apiKey) throw new Error(`${this.config.realtimeCredentialRef} is not configured`)
     const meta = await loadCallMeta(ws, this.identity, this.config.stateDir, this.client)
+    const routeKey =
+      meta.direction === 'inbound'
+        ? `call:${meta.callId}`
+        : meta.contactId
+          ? `contact:${meta.contactId}`
+          : routeForAddress(meta.remotePhoneNumber ?? `call:${meta.callId}`, this.state.snapshot().routingKey)
+    const instructionRouteKey = meta.contactId ? `contact:${meta.contactId}` : routeKey
     const openai = await connectOpenAIRealtime(
       {
         apiKey,
         model: this.config.realtimeModel,
         voice: this.config.realtimeVoice,
+        additionalInstructions: resolveChannelInstruction(
+          { channel: 'call', routeKey: instructionRouteKey },
+          this.config.channelInstructions,
+        ),
       },
       meta,
     )
@@ -199,17 +211,22 @@ export class Gateway {
       await openai.close().catch(() => {})
       throw new Error(ready.detail)
     }
-    const routeKey =
-      meta.direction === 'inbound'
-        ? `call:${meta.callId}`
-        : meta.contactId
-          ? `contact:${meta.contactId}`
-          : routeForAddress(meta.remotePhoneNumber ?? `call:${meta.callId}`, this.state.snapshot().routingKey)
     await runRealtimeBridge(ws, openai, meta, {
       consult: async (query, transcript) =>
         this.agents.run(
           routeKey,
-          `[inkbox:live_call call_id=${meta.callId}]\n${renderTranscript(transcript)}\n\nCaller request: ${query}`,
+          renderChannelEvent(
+            {
+              eventId: `${meta.callId}:consult`,
+              routeKey: instructionRouteKey,
+              channel: 'call',
+              context: `[inkbox:live_call call_id=${meta.callId}]`,
+              content: `${renderTranscript(transcript)}\n\nCaller request: ${query}`,
+              replyText: query,
+              target: { channel: 'none' },
+            },
+            this.config,
+          ),
         ),
       ended: async (transcript, actions) => {
         if (transcript.length === 0 && actions.length === 0) return
@@ -224,7 +241,18 @@ export class Gateway {
           : ''
         await this.agents.run(
           routeKey,
-          `[inkbox:realtime_call_ended call_id=${meta.callId}]\nReconcile the call and complete each explicit post-call action exactly once. Return [SILENT] if no visible channel response is needed.\n\n${renderTranscript(transcript)}${actionText}`,
+          renderChannelEvent(
+            {
+              eventId: `${meta.callId}:ended`,
+              routeKey: instructionRouteKey,
+              channel: 'call',
+              context: `[inkbox:realtime_call_ended call_id=${meta.callId}]\nReconcile the call and complete each explicit post-call action exactly once. Return [SILENT] if no visible channel response is needed.`,
+              content: `${renderTranscript(transcript)}${actionText}`,
+              replyText: renderTranscript(transcript),
+              target: { channel: 'none' },
+            },
+            this.config,
+          ),
         )
       },
     })
@@ -306,7 +334,7 @@ export class Gateway {
       queue.active.events.push(event)
       queue.active.target = event.target
       const task = this.agents
-        .steer(event.routeKey, event.prompt)
+        .steer(event.routeKey, renderChannelEvent(event, this.config))
         .catch((error) => this.log.error('[inkbox] steer failed', error))
       this.track(task)
       return
@@ -326,7 +354,7 @@ export class Gateway {
     const active = { events, target: events.at(-1)?.target ?? { channel: 'none' as const } }
     queue.active = active
     try {
-      const prompt = events.map((event) => event.prompt).join('\n\n')
+      const prompt = events.map((event) => renderChannelEvent(event, this.config)).join('\n\n')
       const response = (await this.agents.run(routeKey, prompt)).trim()
       if (queue.active === active) queue.active = undefined
       const eventIds = active.events.map((event) => event.eventId)

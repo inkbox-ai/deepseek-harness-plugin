@@ -18,6 +18,7 @@ export interface Config {
   realtimeCredentialRef?: string
   realtimeModel?: string
   realtimeVoice?: string
+  channelInstructions?: Record<string, string>
 }
 
 export type VoiceStack = 'inkbox_voice_ai' | 'openai_realtime'
@@ -38,6 +39,7 @@ export const Config: z<Config> = z.object({
   realtimeCredentialRef: z.string().default('INKBOX_REALTIME_API_KEY'),
   realtimeModel: z.string().default('gpt-realtime-2'),
   realtimeVoice: z.string().default('cedar'),
+  channelInstructions: z.dict(z.string()).default({}),
 })
 
 export interface ResolvedConfig {
@@ -56,6 +58,7 @@ export interface ResolvedConfig {
   realtimeCredentialRef: string
   realtimeModel: string
   realtimeVoice: string
+  channelInstructions: Record<string, string>
 }
 
 export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME): ResolvedConfig {
@@ -76,5 +79,6 @@ export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME
     realtimeCredentialRef: config.realtimeCredentialRef?.trim() || 'INKBOX_REALTIME_API_KEY',
     realtimeModel: config.realtimeModel?.trim() || 'gpt-realtime-2',
     realtimeVoice: config.realtimeVoice?.trim() || 'cedar',
+    channelInstructions: { ...config.channelInstructions },
   }
 }

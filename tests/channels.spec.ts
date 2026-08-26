@@ -138,6 +138,24 @@ describe('phone-call stack onboarding parity', () => {
     expect(result).toEqual({ voiceStack: 'inkbox_voice_ai' })
   })
 
+  it('stores the call instruction in hosted-agent configuration', async () => {
+    const identity = voiceIdentity()
+    await configureVoice(
+      identity,
+      credential(identity),
+      undefined,
+      {
+        voiceStack: 'inkbox_voice_ai',
+        hostedAuthority: 'contact_scoped',
+        callInstruction: 'Speak in short, natural sentences.',
+      },
+      dependencies(),
+    )
+    expect(identity.setHostedAgentConfig).toHaveBeenCalledWith({
+      instructions: 'Speak in short, natural sentences.',
+    })
+  })
+
   it('uses transient admin authority for YOLO mode', async () => {
     const identity = voiceIdentity()
     const authorityIdentity = {

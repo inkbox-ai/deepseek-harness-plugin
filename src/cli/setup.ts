@@ -1,5 +1,6 @@
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { BUILTIN_CHANNEL_INSTRUCTIONS } from '../channel-instructions.js'
 import type { VoiceStack } from '../config.js'
 import { PLUGIN_PACKAGE, PROFILE_NAME } from '../constants.js'
 import { configureChannels } from './channels.js'
@@ -54,6 +55,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
     const savedSettings = object((await readYaml(join(paths.dshHome, 'settings.yaml')))?.inkbox)
     const savedVoiceStack =
       savedSettings.voiceStack === 'openai_realtime' ? 'openai_realtime' : 'inkbox_voice_ai'
+    const savedChannelInstructions = object(savedSettings.channelInstructions)
     const deepseekKey = env.DEEPSEEK_API_KEY
     if (!deepseekKey)
       throw new Error('DEEPSEEK_API_KEY was not found in the environment or ~/.env. Add it and rerun setup.')
@@ -121,6 +123,12 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
       realtimeVoice:
         options.realtimeVoice ??
         (typeof savedSettings.realtimeVoice === 'string' ? savedSettings.realtimeVoice : 'cedar'),
+      callInstruction: [
+        BUILTIN_CHANNEL_INSTRUCTIONS.call,
+        typeof savedChannelInstructions.call === 'string' ? savedChannelInstructions.call.trim() : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
       ...(options.hostedAuthority ? { hostedAuthority: options.hostedAuthority } : {}),
       ...(options.enableIMessage !== undefined ? { enableIMessage: options.enableIMessage } : {}),
       ...(options.enableA2A !== undefined ? { enableA2A: options.enableA2A } : {}),
