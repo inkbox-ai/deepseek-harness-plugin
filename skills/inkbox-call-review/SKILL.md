@@ -11,7 +11,8 @@ Use this skill when the user asks about Inkbox phone calls, transcripts, or post
 ## DeepSeek Harness tool availability
 
 - DeepSeek Harness exposes `inkbox_place_call` for outbound calls.
-- Inkbox Voice AI calls provide transcript and post-call context to DeepSeek Harness during call wrap-up.
+- Hosted-agent and OpenAI Realtime calls provide transcript and post-call context to DeepSeek Harness during
+  call wrap-up.
 - DeepSeek Harness does not register historical call-read tools such as `inkbox_list_calls` or `inkbox_list_call_transcripts`.
 
 ## Workflow

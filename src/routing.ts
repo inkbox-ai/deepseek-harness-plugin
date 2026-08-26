@@ -40,6 +40,10 @@ function opaqueRoute(kind: string, value: string, key: string): string {
   return `${kind}:${createHmac('sha256', key).update(value).digest('base64url').slice(0, 32)}`
 }
 
+export function routeForAddress(address: string, routingKey: string): string {
+  return opaqueRoute('peer', address, routingKey)
+}
+
 function contactRoute(data: Json, address: string, key: string): string {
   const resolved = contactId(data, address)
   return resolved ? `contact:${resolved}` : opaqueRoute('peer', address, key)

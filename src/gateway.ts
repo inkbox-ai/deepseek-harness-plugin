@@ -6,10 +6,18 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import type { AskUserQuestionAnswer, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
-import { connect, type TunnelListener } from '@inkbox/sdk/tunnels/connect'
+import { connect, type InkboxWebSocket, type TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { AgentManager } from './agent-manager.js'
 import type { ResolvedConfig } from './config.js'
-import { type ReplyTarget, type RoutedEvent, routeWebhook } from './routing.js'
+import {
+  authenticateCallWebSocket,
+  awaitRealtimeReady,
+  connectOpenAIRealtime,
+  loadCallMeta,
+  runRealtimeBridge,
+  type TranscriptTurn,
+} from './realtime.js'
+import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } from './routing.js'
 import type { InkboxRuntime } from './runtime.js'
 import { StateStore } from './state.js'
 import { authenticateWebhook } from './webhook-providers.js'
@@ -100,6 +108,7 @@ export class Gateway {
       stateDir: join(this.config.stateDir, 'tunnel'),
       installSignalHandlers: false,
       handler: (request) => this.handleRequest(request),
+      wsHandler: (ws) => this.handleWebSocket(ws),
       onStatus: (status) => {
         this.log.info(`[inkbox] tunnel ${status}`)
         if (status === 'connected') connectedResolve?.()
@@ -147,6 +156,9 @@ export class Gateway {
     if (authenticated.outcome === 'invalid') return new Response(authenticated.detail, { status: 401 })
     if (authenticated.outcome === 'unavailable') return new Response(authenticated.detail, { status: 503 })
     if (authenticated.outcome === 'ignored') return new Response(authenticated.detail, { status: 202 })
+    const callId = endedCallId(authenticated.payload)
+    if (callId && !(await this.claimCallReconciliation(callId)))
+      return new Response('Duplicate', { status: 200 })
     const routed = routeWebhook(
       authenticated.payload,
       this.state.snapshot().routingKey,
@@ -161,6 +173,61 @@ export class Gateway {
     if (!accepted) return new Response('Duplicate', { status: 200 })
     this.accept(routed)
     return new Response('Accepted', { status: 202 })
+  }
+
+  async handleWebSocket(ws: InkboxWebSocket): Promise<void> {
+    const url = new URL(ws.url)
+    if (url.pathname !== '/phone/media/ws') throw new Error('WebSocket path is not available')
+    if (!this.config.voiceEnabled || this.config.voiceStack !== 'openai_realtime')
+      throw new Error('OpenAI Realtime phone-call handling is not enabled')
+    if (!this.signingKey || !authenticateCallWebSocket(ws, this.signingKey))
+      throw new Error('Call WebSocket authentication failed')
+    if (!this.identity) throw new Error('Gateway identity is unavailable')
+    const apiKey = await this.runtime.resolveRealtimeKey()
+    if (!apiKey) throw new Error(`${this.config.realtimeCredentialRef} is not configured`)
+    const meta = await loadCallMeta(ws, this.identity, this.config.stateDir, this.client)
+    const openai = await connectOpenAIRealtime(
+      {
+        apiKey,
+        model: this.config.realtimeModel,
+        voice: this.config.realtimeVoice,
+      },
+      meta,
+    )
+    const ready = await awaitRealtimeReady(openai)
+    if (!ready.ok) {
+      await openai.close().catch(() => {})
+      throw new Error(ready.detail)
+    }
+    const routeKey =
+      meta.direction === 'inbound'
+        ? `call:${meta.callId}`
+        : meta.contactId
+          ? `contact:${meta.contactId}`
+          : routeForAddress(meta.remotePhoneNumber ?? `call:${meta.callId}`, this.state.snapshot().routingKey)
+    await runRealtimeBridge(ws, openai, meta, {
+      consult: async (query, transcript) =>
+        this.agents.run(
+          routeKey,
+          `[inkbox:live_call call_id=${meta.callId}]\n${renderTranscript(transcript)}\n\nCaller request: ${query}`,
+        ),
+      ended: async (transcript, actions) => {
+        if (transcript.length === 0 && actions.length === 0) return
+        if (!(await this.claimCallReconciliation(meta.callId))) return
+        const actionText = actions.length
+          ? `\n\nExplicit post-call actions:\n${actions
+              .map(
+                (action, index) =>
+                  `${index + 1}. ${action.action}${action.details ? ` — ${action.details}` : ''}`,
+              )
+              .join('\n')}`
+          : ''
+        await this.agents.run(
+          routeKey,
+          `[inkbox:realtime_call_ended call_id=${meta.callId}]\nReconcile the call and complete each explicit post-call action exactly once. Return [SILENT] if no visible channel response is needed.\n\n${renderTranscript(transcript)}${actionText}`,
+        )
+      },
+    })
   }
 
   async askApproval(agent: Agent, prompt: string, signal?: AbortSignal): Promise<ApprovalOutcome> {
@@ -444,6 +511,15 @@ export class Gateway {
     void promise.finally(() => this.inflight.delete(promise))
   }
 
+  private claimCallReconciliation(callId: string): Promise<boolean> {
+    const marker = `call-reconciled:${callId}`
+    return this.state.mutate((state) => {
+      if (state.seen[marker] !== undefined) return false
+      state.seen[marker] = Date.now()
+      return true
+    })
+  }
+
   private async writeStatus(ready: boolean): Promise<void> {
     const path = join(this.config.stateDir, 'status.json')
     await writeFile(path, `${JSON.stringify({ ...this.status(), ready })}\n`, {
@@ -459,4 +535,19 @@ export function isSilentResponse(response: string): boolean {
 
 function deliveryRetryDelay(attempt: number): number {
   return Math.min(3_600_000, 1_000 * 2 ** Math.min(attempt - 1, 12))
+}
+
+function renderTranscript(transcript: readonly TranscriptTurn[]): string {
+  if (transcript.length === 0) return '(No final transcript was available.)'
+  return transcript.map((turn) => `${turn.party === 'agent' ? 'Agent' : 'Caller'}: ${turn.text}`).join('\n')
+}
+
+function endedCallId(payload: Record<string, unknown>): string | undefined {
+  if (payload.event_type !== 'call.ended') return undefined
+  const data =
+    typeof payload.data === 'object' && payload.data !== null ? (payload.data as Record<string, unknown>) : {}
+  const call =
+    typeof data.call === 'object' && data.call !== null ? (data.call as Record<string, unknown>) : {}
+  const value = call.id ?? data.call_id
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }

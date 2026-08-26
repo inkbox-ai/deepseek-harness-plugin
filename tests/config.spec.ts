@@ -12,6 +12,10 @@ describe('configuration', () => {
     expect(config.stateDir).toBe('/tmp/dsh-home/inkbox')
     expect(config.batchWindowMs).toBe(750)
     expect(config.permissionTimeoutMs).toBe(600_000)
+    expect(config.voiceStack).toBe('inkbox_voice_ai')
+    expect(config.realtimeCredentialRef).toBe('INKBOX_REALTIME_API_KEY')
+    expect(config.realtimeModel).toBe('gpt-realtime-2')
+    expect(config.realtimeVoice).toBe('cedar')
   })
 
   it('normalizes workspace and identity without inventing an identity', () => {

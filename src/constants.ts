@@ -5,7 +5,7 @@ export const DEFAULT_BATCH_WINDOW_MS = 750
 export const DEFAULT_PERMISSION_TIMEOUT_MS = 10 * 60 * 1000
 export const DEFAULT_STATE_DIRNAME = 'inkbox'
 export const PLUGIN_PACKAGE = '@inkbox/deepseek-harness-plugin'
-export const PLUGIN_VERSION = '0.1.0'
+export const PLUGIN_VERSION = '0.2.0'
 
 export const TOOL_NAMES = [
   'inkbox_whoami',

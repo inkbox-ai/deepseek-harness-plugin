@@ -13,9 +13,22 @@ import type { InkboxRuntime } from '../src/runtime.js'
 const tunnel = vi.hoisted(() => ({
   connected: true,
   handler: undefined as ((request: Request) => Promise<Response>) | undefined,
+  wsHandler: undefined as ((socket: unknown) => Promise<void>) | undefined,
   verify: true,
   aclose: vi.fn(async () => {}),
   connect: vi.fn(),
+}))
+
+const liveCall = vi.hoisted(() => ({
+  authenticated: true,
+  connect: vi.fn(async () => ({ close: vi.fn(), send: vi.fn() })),
+  bridge: vi.fn(async (_ws, _openai, _meta, callbacks) => {
+    await callbacks.consult('Check the calendar', [{ party: 'caller', text: 'Are we free?' }])
+    await callbacks.ended(
+      [{ party: 'caller', text: 'Please send a confirmation.' }],
+      [{ action: 'Send confirmation', details: 'Email it' }],
+    )
+  }),
 }))
 
 vi.mock('@inkbox/sdk', () => ({
@@ -24,6 +37,20 @@ vi.mock('@inkbox/sdk', () => ({
 
 vi.mock('@inkbox/sdk/tunnels/connect', () => ({
   connect: tunnel.connect,
+}))
+
+vi.mock('../src/realtime.js', () => ({
+  authenticateCallWebSocket: vi.fn(() => liveCall.authenticated),
+  awaitRealtimeReady: vi.fn(async () => ({ ok: true, detail: 'ready' })),
+  connectOpenAIRealtime: liveCall.connect,
+  loadCallMeta: vi.fn(async () => ({
+    callId: 'call-live-1',
+    contactId: 'contact-live-1',
+    direction: 'outbound',
+    remotePhoneNumber: '+15550000001',
+    agentHandle: 'deepseek-agent',
+  })),
+  runRealtimeBridge: liveCall.bridge,
 }))
 
 interface Harness {
@@ -41,7 +68,10 @@ interface Harness {
   stateDir: string
 }
 
-async function harness(batchWindowMs = 0): Promise<Harness> {
+async function harness(
+  batchWindowMs = 0,
+  voiceStack: ResolvedConfig['voiceStack'] = 'inkbox_voice_ai',
+): Promise<Harness> {
   const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
   const subscriptions = {
     list: vi.fn(async () => []),
@@ -62,6 +92,7 @@ async function harness(batchWindowMs = 0): Promise<Harness> {
     getClient: vi.fn(async () => client as unknown as Inkbox),
     getIdentity: vi.fn(async () => identity as unknown as AgentIdentity),
     resolveSigningKey: vi.fn(async () => 'test-signing-key'),
+    resolveRealtimeKey: vi.fn(async () => 'sk-realtime'),
   } as unknown as InkboxRuntime
   const ctx = {
     credentials: { set: vi.fn(async () => {}) },
@@ -78,6 +109,10 @@ async function harness(batchWindowMs = 0): Promise<Harness> {
     permissionTimeoutMs: 2_000,
     externalEvents: false,
     voiceEnabled: true,
+    voiceStack,
+    realtimeCredentialRef: 'INKBOX_REALTIME_API_KEY',
+    realtimeModel: 'gpt-realtime-2',
+    realtimeVoice: 'cedar',
   }
   const gateway = new Gateway(ctx, runtime, config, {
     info: vi.fn(),
@@ -109,14 +144,28 @@ function email(id: string, body = 'Hello from email'): Request {
   })
 }
 
+function callEnded(id: string): Request {
+  return new Request('https://agent.example.test/webhook', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
+    body: JSON.stringify({
+      id: `event-${id}`,
+      event_type: 'call.ended',
+      data: { call: { id, remote_phone_number: '+15550000001' } },
+    }),
+  })
+}
+
 beforeEach(() => {
   tunnel.connected = true
   tunnel.handler = undefined
+  tunnel.wsHandler = undefined
   tunnel.verify = true
   tunnel.aclose.mockClear()
   tunnel.connect.mockReset()
   tunnel.connect.mockImplementation(async (_client, options) => {
     tunnel.handler = options.handler
+    tunnel.wsHandler = options.wsHandler
     options.onStatus?.('connected')
     return {
       publicUrl: 'https://agent.example.test',
@@ -143,6 +192,29 @@ describe('gateway lifecycle and delivery', () => {
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
       ready: false,
     })
+  })
+
+  it('attaches authenticated Realtime calls to the same contact-scoped Harness agent', async () => {
+    const { gateway } = await harness(0, 'openai_realtime')
+    const run = vi
+      .spyOn(gateway.agents, 'run')
+      .mockResolvedValueOnce('Calendar checked')
+      .mockResolvedValueOnce('[SILENT]')
+    await tunnel.wsHandler?.({
+      url: 'wss://agent.example.test/phone/media/ws',
+      headers: new Map(),
+    })
+    expect(liveCall.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: 'sk-realtime', model: 'gpt-realtime-2', voice: 'cedar' }),
+      expect.objectContaining({ callId: 'call-live-1' }),
+    )
+    expect(run).toHaveBeenCalledTimes(2)
+    expect(run.mock.calls[0]?.[0]).toBe('contact:contact-live-1')
+    expect(run.mock.calls[0]?.[1]).toContain('Caller request: Check the calendar')
+    expect(run.mock.calls[1]?.[1]).toContain('Send confirmation')
+    expect((await gateway.handleRequest(callEnded('call-live-1'))).status).toBe(200)
+    expect(run).toHaveBeenCalledTimes(2)
+    await gateway.close()
   })
 
   it('rejects unsigned webhook traffic before parsing or waking an agent', async () => {

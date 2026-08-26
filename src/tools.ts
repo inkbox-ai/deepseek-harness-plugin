@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ParameterPropertySpec, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
-import { CallMode, CallOrigin } from '@inkbox/sdk'
+import { CallOrigin, type VoicemailDetection } from '@inkbox/sdk'
 import type { InkboxRuntime } from './runtime.js'
 
 type Args = Record<string, unknown>
@@ -385,7 +385,13 @@ function compact<T extends Args>(args: T): T {
   return Object.fromEntries(Object.entries(args).filter(([, value]) => value !== undefined)) as T
 }
 
-async function execute(name: string, args: Args, client: Inkbox, identity: AgentIdentity): Promise<unknown> {
+async function execute(
+  name: string,
+  args: Args,
+  client: Inkbox,
+  identity: AgentIdentity,
+  runtime: InkboxRuntime,
+): Promise<unknown> {
   switch (name) {
     case 'inkbox_whoami':
       return {
@@ -454,12 +460,13 @@ async function execute(name: string, args: Args, client: Inkbox, identity: Agent
     case 'inkbox_mark_imessage_conversation_read':
       return identity.markIMessageConversationRead(args.conversationId as string)
     case 'inkbox_place_call':
-      return identity.placeCall({
+      return runtime.placeCall({
         toNumber: args.toNumber as string,
         reason: args.reason as string,
-        mode: CallMode.HOSTED_AGENT,
         origination: (args.origination as CallOrigin | undefined) ?? CallOrigin.DEDICATED_NUMBER,
-        ...(args.voicemailDetection ? { voicemailDetection: args.voicemailDetection as never } : {}),
+        ...(args.voicemailDetection
+          ? { voicemailDetection: args.voicemailDetection as VoicemailDetection }
+          : {}),
       })
     case 'inkbox_a2a_call': {
       const a2a = await identity.a2aClient()
@@ -529,7 +536,7 @@ export function registerTools(ctx: Context, runtime: InkboxRuntime): void {
           try {
             const client = await runtime.getClient()
             const identity = await runtime.getIdentity()
-            return json(await execute(entry.name, args, client, identity))
+            return json(await execute(entry.name, args, client, identity, runtime))
           } catch (error) {
             throw presentError(error)
           }
