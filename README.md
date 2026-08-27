@@ -37,15 +37,60 @@ supported on Linux and macOS.
 
 ## Quick Start
 
-Run the one-command installer and setup wizard:
+### Add Inkbox to an Existing DeepSeek Harness
+
+Confirm that the supported Harness is installed and available:
+
+```bash
+dsh --version
+```
+
+Then run the Inkbox installer and setup wizard:
 
 ```bash
 npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepseek setup
 ```
 
-The command verifies the existing `dsh` installation, installs the `inkbox-deepseek` launcher, creates the
-`inkbox` Harness profile, and walks through identity and channel setup. It does not install a second Harness
-runtime. It can also install and launch a background service. When the wizard finishes, check the agent:
+The wizard installs Inkbox into a dedicated `inkbox` profile under the existing Harness home. It does not
+replace the running Harness or install another copy.
+
+### From Scratch
+
+Install Node.js 22.19 or newer, then install `pnpm` and the supported DeepSeek Harness:
+
+```bash
+npm install --global pnpm @deepseek-ai/dsh@0.1.1-rc.2
+```
+
+Create the Harness environment file and add your DeepSeek API key:
+
+```bash
+mkdir -p ~/.dsh
+read -rsp 'DeepSeek API key: ' DEEPSEEK_API_KEY
+printf '\n'
+export DEEPSEEK_API_KEY
+(umask 077 && printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY" > ~/.dsh/.env)
+```
+
+Verify the Harness installation and configuration:
+
+```bash
+dsh --version
+dsh web
+```
+
+After the Web UI opens successfully, stop it with `Ctrl+C`, then run the Inkbox wizard in the same terminal:
+
+```bash
+npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepseek setup
+```
+
+The wizard creates the `inkbox` Harness profile, installs the persistent `inkbox-deepseek` launcher, and
+walks through identity and channel setup. It can also install and launch a background service.
+
+### Verify the Inkbox Agent
+
+When the wizard finishes, check the agent:
 
 ```bash
 inkbox-deepseek doctor
