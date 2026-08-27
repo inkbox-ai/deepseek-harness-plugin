@@ -18,8 +18,7 @@ async function fixture(): Promise<Paths> {
   return {
     home,
     dshHome,
-    runtimeDir: join(dshHome, 'inkbox-runtime'),
-    dshBin: join(dshHome, 'inkbox-runtime', 'node_modules', '.bin', 'dsh'),
+    dshBin: join(home, '.local', 'bin', 'dsh'),
     localBin: join(home, '.local', 'bin'),
     packageRoot: home,
   }

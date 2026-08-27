@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { BUILTIN_CHANNEL_INSTRUCTIONS } from '../channel-instructions.js'
 import type { VoiceStack } from '../config.js'
@@ -7,6 +7,7 @@ import { configureAvatar } from './avatar.js'
 import { configureChannels } from './channels.js'
 import { credentialFromEnvironment, layeredEnvironment } from './env.js'
 import { readYaml, updateYaml } from './files.js'
+import { validateHarness } from './harness.js'
 import { installLauncher } from './launcher.js'
 import type { SetupPrompts } from './onboarding.js'
 import { reconcileSigningKey, resolveIdentityCredential } from './onboarding.js'
@@ -15,8 +16,6 @@ import { CommandError, run } from './process.js'
 import { Prompts } from './prompts.js'
 import { manageService, serviceInstalled } from './service.js'
 import { readRuntimeStatus } from './status.js'
-
-const DSH_VERSION = '0.1.1-rc.2'
 
 export interface SetupOptions {
   identity?: string
@@ -59,9 +58,12 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
     const savedVoiceStack =
       savedSettings.voiceStack === 'openai_realtime' ? 'openai_realtime' : 'inkbox_voice_ai'
     const savedChannelInstructions = object(savedSettings.channelInstructions)
-    const deepseekKey = env.DEEPSEEK_API_KEY
+    await validateHarness(paths)
+    const deepseekKey = resolveDeepSeekCredential(env, savedCredentials)
     if (!deepseekKey)
-      throw new Error('DEEPSEEK_API_KEY was not found in the environment or ~/.env. Add it and rerun setup.')
+      throw new Error(
+        'DeepSeek Harness is not configured with DEEPSEEK_API_KEY. Configure the Harness or add the key to your environment or ~/.env, then rerun setup.',
+      )
 
     if (
       prompts &&
@@ -86,8 +88,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
     const workspace = resolve(options.workspace ?? process.cwd())
     await mkdir(workspace, { recursive: true })
 
-    process.stdout.write('Installing the DeepSeek Harness runtime and Inkbox bundle...\n')
-    await ensureRuntime(paths)
+    process.stdout.write('Installing the Inkbox bundle into DeepSeek Harness...\n')
     const pluginSpec = options.pluginSpec ?? (await stagePluginPackage(paths))
     if (isLocalPluginSpec(pluginSpec) && (await profileHasBundle(paths))) {
       await run(paths.dshBin, ['plugin', '--profile', PROFILE_NAME, 'remove', PLUGIN_PACKAGE], {
@@ -243,6 +244,8 @@ export async function configureManagedService(
       options.start ?? (prompts ? await prompts.confirm('Restart the running gateway now?', true) : false)
     if (!wantsRestart) return { installed, started: true, ready: true }
     try {
+      await dependencies.manage('install', paths, workspace)
+      installed = true
       await dependencies.manage('restart', paths, workspace)
       started = true
       ready = await dependencies.waitUntilReady(paths)
@@ -260,12 +263,9 @@ export async function configureManagedService(
     options.start ?? options.service ?? (prompts ? await prompts.confirm(question, true) : false)
   if (!wantsStart) return { installed, started, ready }
   try {
-    if (!installed) {
-      process.stdout.write(`${await dependencies.manage('install', paths, workspace)}\n`)
-      installed = true
-    } else {
-      await dependencies.manage('restart', paths, workspace)
-    }
+    process.stdout.write(`${await dependencies.manage('install', paths, workspace)}\n`)
+    installed = true
+    await dependencies.manage('restart', paths, workspace)
     started = true
     ready = await dependencies.waitUntilReady(paths)
     process.stdout.write(
@@ -320,6 +320,16 @@ export function selectRealtimeCredential(
     return value
   }
   return env.INKBOX_REALTIME_API_KEY || env.OPENAI_API_KEY
+}
+
+export function resolveDeepSeekCredential(
+  env: Readonly<Record<string, string>>,
+  savedCredentials: Readonly<Record<string, unknown>>,
+): string | undefined {
+  return (
+    env.DEEPSEEK_API_KEY ??
+    (typeof savedCredentials.DEEPSEEK_API_KEY === 'string' ? savedCredentials.DEEPSEEK_API_KEY : undefined)
+  )
 }
 
 export async function waitForGatewayReady(
@@ -426,43 +436,4 @@ async function stagePluginPackage(paths: Paths): Promise<string> {
   const filename = result.stdout.trim().split(/\r?\n/).at(-1)
   if (!filename?.endsWith('.tgz')) throw new Error('npm did not return the staged plugin package name')
   return join(packageDir, filename)
-}
-
-async function ensureRuntime(paths: Paths): Promise<void> {
-  await mkdir(paths.runtimeDir, { recursive: true, mode: 0o700 })
-  const manifestPath = join(paths.runtimeDir, 'package.json')
-  let manifest: Record<string, unknown> = {}
-  try {
-    manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
-  manifest.name = 'inkbox-deepseek-runtime'
-  manifest.private = true
-  manifest.type = 'module'
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-  try {
-    await run('pnpm', ['add', '--save-exact', `@deepseek-ai/dsh@${DSH_VERSION}`], { cwd: paths.runtimeDir })
-  } catch (error) {
-    const message =
-      error instanceof CommandError
-        ? `${error.stdout}\n${error.stderr}`
-        : error instanceof Error
-          ? error.message
-          : String(error)
-    const match = /Ignored build scripts:\s*([^\n]+)/i.exec(message)
-    if (match?.[1] === undefined) throw error
-    const packages = match[1]
-      .split(',')
-      .map((value) => value.trim().replace(/@\d[^,]*$/, ''))
-      .filter(Boolean)
-    if (packages.length === 0) throw error
-    process.stdout.write('Completing approved Harness dependency builds...\n')
-    await run(
-      'pnpm',
-      ['add', `--allow-build=${packages.join(',')}`, '--save-exact', `@deepseek-ai/dsh@${DSH_VERSION}`],
-      { cwd: paths.runtimeDir, stdio: 'inherit' },
-    )
-  }
-  await access(paths.dshBin)
 }

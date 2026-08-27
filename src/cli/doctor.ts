@@ -1,7 +1,8 @@
-import { access, readFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Inkbox } from '@inkbox/sdk'
 import { readYaml } from './files.js'
+import { validateHarness } from './harness.js'
 import type { Paths } from './paths.js'
 import { run } from './process.js'
 import { manageService, serviceInstalled } from './service.js'
@@ -19,11 +20,13 @@ export async function doctor(paths: Paths): Promise<Check[]> {
   }
   add('Node.js', Number(process.versions.node.split('.')[0]) >= 22, process.version)
 
+  let harnessReady = false
   try {
-    await access(paths.dshBin)
-    add('Harness runtime', true, paths.dshBin)
-  } catch {
-    add('Harness runtime', false, 'Run inkbox-deepseek setup')
+    const version = await validateHarness(paths)
+    harnessReady = true
+    add('DeepSeek Harness', true, `${version} at ${paths.dshBin}`)
+  } catch (error) {
+    add('DeepSeek Harness', false, error instanceof Error ? error.message : String(error))
   }
 
   const profileManifest = join(paths.dshHome, 'profiles', 'inkbox', 'package.json')
@@ -123,14 +126,16 @@ export async function doctor(paths: Paths): Promise<Check[]> {
     }
   }
 
-  try {
-    await run(paths.dshBin, ['--profile', 'inkbox', '--dump-config'], {
-      env: { ...process.env, DSH_HOME: paths.dshHome },
-    })
-    add('Harness composition', true, 'Profile composes successfully')
-  } catch (error) {
-    add('Harness composition', false, error instanceof Error ? error.message : String(error))
-  }
+  if (!harnessReady) add('Harness composition', false, 'DeepSeek Harness is unavailable')
+  else
+    try {
+      await run(paths.dshBin, ['--profile', 'inkbox', '--dump-config'], {
+        env: { ...process.env, DSH_HOME: paths.dshHome },
+      })
+      add('Harness composition', true, 'Profile composes successfully')
+    } catch (error) {
+      add('Harness composition', false, error instanceof Error ? error.message : String(error))
+    }
 
   const installed = await serviceInstalled(paths)
   if (!installed) add('Managed service', true, 'Not installed; foreground mode is available')

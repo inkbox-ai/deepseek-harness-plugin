@@ -23,8 +23,12 @@ supported on Linux and macOS.
 
 ## Prerequisites
 
-- **Node.js 22.19 or newer and `pnpm`.** Setup installs a pinned DeepSeek Harness runtime in its own directory.
-- **A DeepSeek API key.** Set `DEEPSEEK_API_KEY` in your environment or `~/.env` before running setup.
+- **An installed DeepSeek Harness `0.1.1-rc.2`.** The `dsh` command must be on `PATH`. Install the currently
+  supported Harness version with `npm install --global @deepseek-ai/dsh@0.1.1-rc.2`.
+- **A configured DeepSeek Harness.** `DEEPSEEK_API_KEY` can already be stored in the Harness home, inherited
+  from the environment, or set in `~/.env`.
+- **Node.js 22.19 or newer and `pnpm`.** The existing Harness uses `pnpm` to install the Inkbox bundle into
+  its dedicated `inkbox` profile.
 - **An Inkbox identity.** Nothing needs to be created in advance: the wizard can create one through guided
   email verification, or it can use an existing Inkbox API key.
 - **Repository access.** The one-command installer downloads the plugin from GitHub.
@@ -39,9 +43,9 @@ Run the one-command installer and setup wizard:
 npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepseek setup
 ```
 
-The command installs the `inkbox-deepseek` launcher, creates the `inkbox` Harness profile, and walks through
-identity and channel setup. It can also install and launch a background service. When the wizard finishes,
-check the agent:
+The command verifies the existing `dsh` installation, installs the `inkbox-deepseek` launcher, creates the
+`inkbox` Harness profile, and walks through identity and channel setup. It does not install a second Harness
+runtime. It can also install and launch a background service. When the wizard finishes, check the agent:
 
 ```bash
 inkbox-deepseek doctor
@@ -61,11 +65,12 @@ and routes inbound email, SMS, iMessage, calls, and A2A events into persistent D
 
 `inkbox-deepseek setup` walks through the complete Inkbox configuration:
 
-1. Verifies that `DEEPSEEK_API_KEY` is available and discovers any existing `inkbox` profile.
+1. Verifies the installed DeepSeek Harness version and configuration, then discovers any existing `inkbox`
+   profile.
 2. Creates a fresh Inkbox identity through email verification, or securely accepts an existing API key.
 3. Selects or creates the identity used by this Harness profile, attaches the bundled contact avatar, and
    explains the server-side reachability rules that control who can contact the agent.
-4. Installs the pinned DeepSeek Harness runtime and Inkbox bundle and creates the `inkbox` profile.
+4. Installs the Inkbox bundle into the existing DeepSeek Harness and creates the `inkbox` profile.
 5. Offers iMessage with RCS/SMS fallback and voice calls, displays a scannable connection QR code, and can
    wait for the first iMessage before continuing.
 6. Optionally provisions a dedicated number for SMS and voice. New numbers display a scannable `START` QR
@@ -246,8 +251,8 @@ active owner; use a separate identity when testing another host concurrently.
 ## Architecture Notes
 
 - The plugin is a native DeepSeek Harness bundle loaded by the dedicated `inkbox` profile.
-- The CLI stages a durable plugin package under `~/.dsh/inkbox-packages` and a pinned Harness runtime under
-  `~/.dsh/inkbox-runtime`.
+- The CLI stages a durable plugin package under `~/.dsh/inkbox-packages` and installs it with the existing
+  `dsh` executable.
 - The gateway verifies signed webhooks before dispatch, stores durable delivery and session state, and exposes
   `GET /health` plus authenticated `POST /webhook` handling through the Inkbox tunnel.
 - Current public URL and readiness state are written to `status.json` in the configured state directory.
