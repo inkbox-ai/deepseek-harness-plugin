@@ -2,11 +2,13 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
+import { SUPPORTED_DSH_VERSION, validateHarness } from '../src/cli/harness.js'
 import type { SetupPrompts } from '../src/cli/onboarding.js'
 import type { Paths } from '../src/cli/paths.js'
 import {
   configureManagedService,
   printSummary,
+  resolveDeepSeekCredential,
   resolveToolApprovalChoice,
   selectInkboxCredential,
   selectRealtimeCredential,
@@ -17,14 +19,47 @@ function paths(home: string): Paths {
   return {
     home,
     dshHome: join(home, '.dsh'),
-    runtimeDir: join(home, '.dsh', 'inkbox-runtime'),
-    dshBin: join(home, '.dsh', 'inkbox-runtime', 'node_modules', '.bin', 'dsh'),
+    dshBin: join(home, '.local', 'bin', 'dsh'),
     localBin: join(home, '.local', 'bin'),
     packageRoot: home,
   }
 }
 
 describe('setup credential and liveness behavior', () => {
+  it('requires the supported installed DeepSeek Harness', async () => {
+    const execute = vi.fn(async () => ({ stdout: `${SUPPORTED_DSH_VERSION}\n`, stderr: '' }))
+    await expect(validateHarness(paths('/tmp/harness-installed'), execute)).resolves.toBe(
+      SUPPORTED_DSH_VERSION,
+    )
+    expect(execute).toHaveBeenCalledWith(
+      '/tmp/harness-installed/.local/bin/dsh',
+      ['--version'],
+      expect.objectContaining({ env: expect.objectContaining({ DSH_HOME: '/tmp/harness-installed/.dsh' }) }),
+    )
+  })
+
+  it('rejects a missing or incompatible DeepSeek Harness', async () => {
+    await expect(
+      validateHarness(
+        paths('/tmp/harness-missing'),
+        vi.fn(async () => Promise.reject(new Error('ENOENT'))),
+      ),
+    ).rejects.toThrow('was not found on PATH')
+    await expect(
+      validateHarness(
+        paths('/tmp/harness-old'),
+        vi.fn(async () => ({ stdout: '0.1.0\n', stderr: '' })),
+      ),
+    ).rejects.toThrow(`DeepSeek Harness ${SUPPORTED_DSH_VERSION} is required; found 0.1.0`)
+  })
+
+  it('reuses a DeepSeek credential already configured in the Harness home', () => {
+    expect(resolveDeepSeekCredential({}, { DEEPSEEK_API_KEY: 'saved-key' })).toBe('saved-key')
+    expect(
+      resolveDeepSeekCredential({ DEEPSEEK_API_KEY: 'environment-key' }, { DEEPSEEK_API_KEY: 'saved-key' }),
+    ).toBe('environment-key')
+  })
+
   it('uses self-signup by default instead of enumerating environment credentials', async () => {
     const confirm = vi.fn(async () => false)
     const secret = vi.fn(async () => 'ApiKey_pasted')
@@ -139,7 +174,9 @@ describe('managed-service wizard parity', () => {
   })
 
   it('offers restart for an installed service and claims readiness only after a live status', async () => {
-    const manage = vi.fn(async () => 'restarted')
+    const manage = vi.fn(
+      async (_action: 'install' | 'restart', _paths: Paths, _workspace: string) => 'restarted',
+    )
     const result = await configureManagedService(
       paths('/tmp/setup-service'),
       '/tmp/workspace',
@@ -152,7 +189,7 @@ describe('managed-service wizard parity', () => {
         waitUntilReady: vi.fn(async () => true),
       },
     )
-    expect(manage).toHaveBeenCalledWith('restart', expect.anything(), '/tmp/workspace')
+    expect(manage.mock.calls.map(([action]) => action)).toEqual(['install', 'restart'])
     expect(result).toEqual({ installed: true, started: true, ready: true })
   })
 
