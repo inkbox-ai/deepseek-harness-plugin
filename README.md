@@ -163,7 +163,9 @@ npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepsee
 - **Phone calls:** the wizard offers exactly two call modes: the Inkbox hosted agent or OpenAI Realtime. The
   same `inkbox_place_call` tool uses the selected mode for outbound calls, while inbound calls follow the
   matching saved identity configuration. Realtime calls can consult the main Harness agent and register
-  post-call actions without a separate daemon.
+  post-call actions without a separate daemon. The Realtime model also receives `hang_up_call`, which follows
+  a spoken-goodbye grace period, cancels when the caller barges in, and drains pending tool responses before
+  ending the call.
 - **External events:** GitHub HMAC webhooks are supported when explicitly enabled and configured.
 
 The setup wizard trusts Inkbox tools so they run without repeated approval prompts. This applies only to the

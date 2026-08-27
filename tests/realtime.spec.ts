@@ -19,8 +19,12 @@ type Json = Record<string, unknown>
 class FakeRealtime implements RealtimeConnection {
   readonly sent: Json[] = []
   closed = false
+  private finish: (() => void) | undefined
 
-  constructor(private readonly events: Json[]) {}
+  constructor(
+    private readonly events: Array<Json | Promise<Json>>,
+    private readonly stayOpen = false,
+  ) {}
 
   async send(event: Json): Promise<void> {
     this.sent.push(event)
@@ -28,13 +32,18 @@ class FakeRealtime implements RealtimeConnection {
 
   async close(): Promise<void> {
     this.closed = true
+    this.finish?.()
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<Json> {
     for (const event of this.events) {
       await Promise.resolve()
-      yield event
+      yield await event
     }
+    if (this.stayOpen && !this.closed)
+      await new Promise<void>((resolve) => {
+        this.finish = resolve
+      })
   }
 }
 
@@ -43,6 +52,7 @@ class FakeInkboxSocket implements InkboxWebSocket {
   readonly accepted: unknown[] = []
   readonly sent: string[] = []
   closed = false
+  private finish: (() => void) | undefined
 
   constructor(
     readonly url: string,
@@ -60,11 +70,15 @@ class FakeInkboxSocket implements InkboxWebSocket {
 
   async close(): Promise<void> {
     this.closed = true
+    this.finish?.()
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<string | Buffer> {
     for (const frame of this.frames) yield frame
-    while (!this.closed) await new Promise((resolve) => setTimeout(resolve, 1))
+    if (!this.closed)
+      await new Promise<void>((resolve) => {
+        this.finish = resolve
+      })
   }
 }
 
@@ -193,42 +207,58 @@ describe('OpenAI Realtime call bridge', () => {
   })
 
   it('bridges PCMU audio both ways, relays transcripts, executes tools, and hangs up after goodbye audio', async () => {
+    vi.useFakeTimers()
     const inkbox = new FakeInkboxSocket('wss://agent.example.test/phone/media/ws', new Map(), [
       JSON.stringify({ event: 'start', stream_id: 'stream-1' }),
       JSON.stringify({ event: 'media', media: { payload: 'caller-audio' } }),
     ])
-    const openai = new FakeRealtime([
-      { type: 'response.output_audio.delta', delta: 'agent-audio' },
-      { type: 'conversation.item.input_audio_transcription.completed', transcript: 'Please follow up.' },
-      { type: 'response.output_audio_transcript.done', transcript: 'I will.' },
-      {
-        type: 'response.function_call_arguments.done',
-        call_id: 'tool-1',
-        name: 'consult_agent',
-        arguments: JSON.stringify({ query: 'Look up the appointment' }),
-      },
-      {
-        type: 'response.function_call_arguments.done',
-        call_id: 'tool-2',
-        name: 'register_post_call_action',
-        arguments: JSON.stringify({ action: 'Send confirmation', details: 'Email the caller' }),
-      },
-      {
-        type: 'response.function_call_arguments.done',
-        call_id: 'tool-3',
-        name: 'hang_up_call',
-        arguments: '{}',
-      },
-      { type: 'response.output_audio.done' },
-    ])
+    const openai = new FakeRealtime(
+      [
+        { type: 'response.output_audio.delta', delta: 'agent-audio' },
+        { type: 'conversation.item.input_audio_transcription.completed', transcript: 'Please follow up.' },
+        { type: 'response.output_audio_transcript.done', transcript: 'I will.' },
+        {
+          type: 'response.function_call_arguments.done',
+          call_id: 'tool-1',
+          name: 'consult_agent',
+          arguments: JSON.stringify({ query: 'Look up the appointment' }),
+        },
+        {
+          type: 'response.function_call_arguments.done',
+          call_id: 'tool-2',
+          name: 'register_post_call_action',
+          arguments: JSON.stringify({ action: 'Send confirmation', details: 'Email the caller' }),
+        },
+        {
+          type: 'response.function_call_arguments.done',
+          call_id: 'tool-3',
+          name: 'hang_up_call',
+          arguments: '{}',
+        },
+        { type: 'response.output_audio.done' },
+        { type: 'response.done' },
+        { type: 'response.done' },
+        { type: 'response.done' },
+        { type: 'response.done' },
+      ],
+      true,
+    )
     const ended = vi.fn(async () => {})
     const consult = vi.fn(async () => 'The appointment is tomorrow at 3 PM.')
-    await runRealtimeBridge(
+    const bridge = runRealtimeBridge(
       inkbox,
       openai,
       { callId: 'call-1', direction: 'inbound', agentHandle: 'deepseek-agent' },
       { consult, ended },
     )
+
+    await vi.advanceTimersByTimeAsync(2_499)
+    expect(inkbox.sent.map((value) => JSON.parse(value))).not.toContainEqual(
+      expect.objectContaining({ event: 'stop' }),
+    )
+    await vi.advanceTimersByTimeAsync(1)
+    await bridge
+    vi.useRealTimers()
 
     expect(inkbox.accepted).toEqual([
       {
@@ -260,6 +290,107 @@ describe('OpenAI Realtime call bridge', () => {
       ],
       [{ action: 'Send confirmation', details: 'Email the caller' }],
     )
+  })
+
+  it('disarms an automatic hangup when the caller barges in during the goodbye window', async () => {
+    vi.useFakeTimers()
+    let bargeIn: (() => void) | undefined
+    const callerBargeIn = new Promise<Json>((resolve) => {
+      bargeIn = () => resolve({ type: 'input_audio_buffer.speech_started' })
+    })
+    const inkbox = new FakeInkboxSocket('wss://agent.example.test/phone/media/ws', new Map(), [
+      JSON.stringify({ event: 'start', stream_id: 'stream-1' }),
+    ])
+    const openai = new FakeRealtime(
+      [
+        { type: 'response.created' },
+        {
+          type: 'response.function_call_arguments.done',
+          call_id: 'hangup-arm',
+          name: 'hang_up_call',
+          arguments: '{}',
+        },
+        { type: 'response.output_audio.done' },
+        callerBargeIn,
+        { type: 'response.done' },
+        { type: 'response.done' },
+      ],
+      true,
+    )
+    const bridge = runRealtimeBridge(
+      inkbox,
+      openai,
+      { callId: 'call-2', direction: 'inbound', agentHandle: 'deepseek-agent' },
+      { consult: vi.fn(), ended: vi.fn(async () => {}) },
+    )
+
+    await vi.advanceTimersByTimeAsync(2_500)
+    bargeIn?.()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(inkbox.sent.map((value) => JSON.parse(value))).toContainEqual({
+      event: 'clear',
+      stream_id: 'stream-1',
+    })
+    expect(inkbox.sent.map((value) => JSON.parse(value))).not.toContainEqual(
+      expect.objectContaining({ event: 'stop' }),
+    )
+
+    await openai.close()
+    await bridge
+    vi.useRealTimers()
+  })
+
+  it('honors a second hangup tool call after the goodbye and delays teardown to avoid clipping audio', async () => {
+    vi.useFakeTimers()
+    const inkbox = new FakeInkboxSocket('wss://agent.example.test/phone/media/ws', new Map(), [
+      JSON.stringify({ event: 'start', stream_id: 'stream-1' }),
+    ])
+    const openai = new FakeRealtime(
+      [
+        {
+          type: 'response.function_call_arguments.done',
+          call_id: 'hangup-arm',
+          name: 'hang_up_call',
+          arguments: '{}',
+        },
+        {
+          type: 'response.function_call_arguments.done',
+          call_id: 'hangup-confirm',
+          name: 'hang_up_call',
+          arguments: JSON.stringify({ reason: 'conversation complete' }),
+        },
+        { type: 'response.done' },
+        { type: 'response.done' },
+      ],
+      true,
+    )
+    const bridge = runRealtimeBridge(
+      inkbox,
+      openai,
+      { callId: 'call-3', direction: 'outbound', agentHandle: 'deepseek-agent' },
+      { consult: vi.fn(), ended: vi.fn(async () => {}) },
+    )
+
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(inkbox.sent.map((value) => JSON.parse(value))).not.toContainEqual(
+      expect.objectContaining({ event: 'stop' }),
+    )
+    await vi.advanceTimersByTimeAsync(1)
+    await bridge
+
+    expect(inkbox.sent.map((value) => JSON.parse(value))).toContainEqual({
+      event: 'stop',
+      reason: 'conversation complete',
+      stream_id: 'stream-1',
+    })
+    const outputs = openai.sent
+      .filter((event) => event.type === 'conversation.item.create')
+      .map((event) => JSON.parse(String((event.item as Json).output)))
+    expect(outputs).toEqual([
+      expect.objectContaining({ status: 'confirm_goodbye' }),
+      expect.objectContaining({ status: 'hangup_requested' }),
+    ])
+    vi.useRealTimers()
   })
 
   it('keeps the live voice prompt scoped to spoken call behavior and the configured identity', () => {

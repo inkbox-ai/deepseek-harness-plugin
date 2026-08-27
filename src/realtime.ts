@@ -55,6 +55,10 @@ export type RealtimeConnector = (
 const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime'
 const CONNECT_TIMEOUT_MS = 12_000
 const VALIDATION_TIMEOUT_MS = 8_000
+const HANGUP_CONFIRM_WINDOW_MS = 60_000
+const HANGUP_CLOSE_DELAY_MS = 2_000
+const HANGUP_AUTO_CONFIRM_DELAY_MS = 2_500
+const REALTIME_RESPONSE_DRAIN_TIMEOUT_MS = 30_000
 
 function record(value: unknown): Json {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Json) : {}
@@ -300,7 +304,11 @@ function realtimeTools(): Json[] {
       },
       ['action_index'],
     ),
-    tool('hang_up_call', 'End the call after saying a short goodbye.', { reason: { type: 'string' } }),
+    tool(
+      'hang_up_call',
+      'End the live phone call. Calling this arms the hangup and prompts you to say a short goodbye; once your goodbye finishes playing, the call ends automatically. Use it only when the caller asks to hang up, says goodbye, or the conversation is clearly complete.',
+      { reason: { type: 'string', description: 'Optional short reason for ending the call.' } },
+    ),
   ]
 }
 
@@ -378,12 +386,18 @@ interface BridgeState {
   greetingSent: boolean
   responseActive: boolean
   responsePending: boolean
+  responseRequests: number
+  lifecycleWaiters: Set<() => void>
   transcript: TranscriptTurn[]
   actions: PostCallAction[]
   functionCalls: Map<string, { callId: string; name: string; args: string }>
   dispatchedCalls: Set<string>
   toolTasks: Set<Promise<void>>
-  hangupArmed: boolean
+  hangupArmedAt: number | undefined
+  hangupAutoConfirmTimer: ReturnType<typeof setTimeout> | undefined
+  hangupCloseTimer: ReturnType<typeof setTimeout> | undefined
+  stopSent: boolean
+  closed: boolean
 }
 
 export async function runRealtimeBridge(
@@ -396,12 +410,18 @@ export async function runRealtimeBridge(
     greetingSent: false,
     responseActive: false,
     responsePending: false,
+    responseRequests: 0,
+    lifecycleWaiters: new Set(),
     transcript: [],
     actions: [],
     functionCalls: new Map(),
     dispatchedCalls: new Set(),
     toolTasks: new Set(),
-    hangupArmed: false,
+    hangupArmedAt: undefined,
+    hangupAutoConfirmTimer: undefined,
+    hangupCloseTimer: undefined,
+    stopSent: false,
+    closed: false,
   }
   await inkbox.accept({
     headers: [
@@ -415,6 +435,10 @@ export async function runRealtimeBridge(
   try {
     await Promise.race([fromInkbox, fromOpenAI])
   } finally {
+    cancelHangupAutoConfirm(state)
+    cancelHangupClose(state)
+    state.closed = true
+    signalLifecycleChange(state)
     await openai.close().catch(() => {})
     await inkbox.close().catch(() => {})
     await Promise.allSettled([fromInkbox, fromOpenAI])
@@ -443,18 +467,12 @@ async function pumpInkbox(
       if (streamId) state.streamId = streamId
       if (!state.greetingSent) {
         state.greetingSent = true
-        await openai.send({
-          type: 'response.create',
-          response: { instructions: buildRealtimeGreeting(meta) },
-        })
+        await requestResponse(openai, state, buildRealtimeGreeting(meta))
       }
     } else if (event === 'media') {
       if (!state.greetingSent) {
         state.greetingSent = true
-        await openai.send({
-          type: 'response.create',
-          response: { instructions: buildRealtimeGreeting(meta) },
-        })
+        await requestResponse(openai, state, buildRealtimeGreeting(meta))
       }
       const payload = text(record(frame.media).payload)
       if (payload) await openai.send({ type: 'input_audio_buffer.append', audio: payload })
@@ -472,16 +490,16 @@ async function pumpOpenAI(
     const type = text(frame.type)
     if (type === 'response.output_audio.delta' || type === 'response.audio.delta') {
       const delta = text(frame.delta)
-      if (delta)
+      if (delta) {
+        cancelHangupAutoConfirm(state)
         await sendInkbox(inkbox, state, { event: 'media', media: { payload: delta, track: 'outbound' } })
+      }
     } else if (type === 'response.output_audio.done' || type === 'response.audio.done') {
       await sendInkbox(inkbox, state, { event: 'audio_done' })
-      if (state.hangupArmed) {
-        await sendInkbox(inkbox, state, { event: 'stop', reason: 'goodbye complete' })
-        return
-      }
+      if (state.hangupArmedAt !== undefined) scheduleHangupAutoConfirm(inkbox, openai, state)
     } else if (type === 'input_audio_buffer.speech_started') {
-      state.hangupArmed = false
+      state.hangupArmedAt = undefined
+      cancelHangupAutoConfirm(state)
       await sendInkbox(inkbox, state, { event: 'clear' })
     } else if (
       type === 'response.output_audio_transcript.done' ||
@@ -512,18 +530,22 @@ async function pumpOpenAI(
       call.callId = text(frame.call_id) ?? call.callId
       call.name = text(frame.name) ?? call.name
       call.args = text(frame.arguments) ?? call.args
-      await handleToolCall(openai, state, callbacks, call)
+      await handleToolCall(openai, inkbox, state, callbacks, call)
     } else if (type === 'response.output_item.done' || type === 'conversation.item.done') {
       const item = record(frame.item)
       if (item.type === 'function_call')
-        await handleToolCall(openai, state, callbacks, {
+        await handleToolCall(openai, inkbox, state, callbacks, {
           callId: text(item.call_id) ?? '',
           name: text(item.name) ?? '',
           args: text(item.arguments) ?? '{}',
         })
-    } else if (type === 'response.created') state.responseActive = true
-    else if (type === 'response.done') {
+    } else if (type === 'response.created') {
+      state.responseActive = true
+      signalLifecycleChange(state)
+    } else if (type === 'response.done') {
       state.responseActive = false
+      if (state.responseRequests > 0) state.responseRequests -= 1
+      signalLifecycleChange(state)
       if (state.responsePending) {
         state.responsePending = false
         await requestResponse(openai, state)
@@ -557,6 +579,7 @@ async function sendInkbox(inkbox: InkboxWebSocket, state: BridgeState, value: Js
 
 async function dispatchTool(
   openai: RealtimeConnection,
+  inkbox: InkboxWebSocket,
   state: BridgeState,
   callbacks: RealtimeCallbacks,
   call: { callId: string; name: string; args: string },
@@ -568,6 +591,8 @@ async function dispatchTool(
     args = record(JSON.parse(call.args || '{}'))
   } catch {}
   let output: Json
+  let createResponse = true
+  let confirmedHangupReason: string | undefined
   if (call.name === 'consult_agent') {
     const query = text(args.query)
     output = query
@@ -597,36 +622,167 @@ async function dispatchTool(
       output = { status: 'deleted', action_index: index + 1 }
     }
   } else if (call.name === 'hang_up_call') {
-    state.hangupArmed = true
-    output = { status: 'confirm_goodbye', message: 'Say a brief goodbye. The call will end after it plays.' }
+    const now = Date.now()
+    const armedAt = state.hangupArmedAt
+    if (armedAt === undefined || now - armedAt > HANGUP_CONFIRM_WINDOW_MS) {
+      state.hangupArmedAt = now
+      output = {
+        status: 'confirm_goodbye',
+        message:
+          "Don't hang up yet. Say a brief, natural goodbye to the caller now; the call will end automatically once your goodbye finishes playing.",
+      }
+    } else {
+      cancelHangupAutoConfirm(state)
+      const reason = text(args.reason)
+      output = {
+        status: 'hangup_requested',
+        reason: reason ?? '',
+        message: 'The call is ending now.',
+      }
+      createResponse = false
+      confirmedHangupReason = reason
+    }
   } else output = { error: `Unknown live-call tool: ${call.name}` }
 
   await openai.send({
     type: 'conversation.item.create',
     item: { type: 'function_call_output', call_id: call.callId, output: JSON.stringify(output) },
   })
-  await requestResponse(openai, state)
+  if (!createResponse) scheduleHangupClose(inkbox, openai, state, confirmedHangupReason)
+  if (createResponse) await requestResponse(openai, state)
 }
 
 async function handleToolCall(
   openai: RealtimeConnection,
+  inkbox: InkboxWebSocket,
   state: BridgeState,
   callbacks: RealtimeCallbacks,
   call: { callId: string; name: string; args: string },
 ): Promise<void> {
   if (call.name !== 'consult_agent') {
-    await dispatchTool(openai, state, callbacks, call)
+    await dispatchTool(openai, inkbox, state, callbacks, call)
     return
   }
-  const task = dispatchTool(openai, state, callbacks, call)
+  const task = dispatchTool(openai, inkbox, state, callbacks, call)
   state.toolTasks.add(task)
-  void task.finally(() => state.toolTasks.delete(task)).catch(() => {})
+  signalLifecycleChange(state)
+  void task
+    .finally(() => {
+      state.toolTasks.delete(task)
+      signalLifecycleChange(state)
+    })
+    .catch(() => {})
 }
 
-async function requestResponse(openai: RealtimeConnection, state: BridgeState): Promise<void> {
+async function requestResponse(
+  openai: RealtimeConnection,
+  state: BridgeState,
+  instructions?: string,
+): Promise<void> {
   if (state.responseActive) {
     state.responsePending = true
+    signalLifecycleChange(state)
     return
   }
-  await openai.send({ type: 'response.create' })
+  state.responseRequests += 1
+  signalLifecycleChange(state)
+  await openai.send({
+    type: 'response.create',
+    ...(instructions ? { response: { instructions } } : {}),
+  })
+}
+
+function cancelHangupAutoConfirm(state: BridgeState): void {
+  if (state.hangupAutoConfirmTimer) clearTimeout(state.hangupAutoConfirmTimer)
+  state.hangupAutoConfirmTimer = undefined
+}
+
+function cancelHangupClose(state: BridgeState): void {
+  if (state.hangupCloseTimer) clearTimeout(state.hangupCloseTimer)
+  state.hangupCloseTimer = undefined
+}
+
+function scheduleHangupAutoConfirm(
+  inkbox: InkboxWebSocket,
+  openai: RealtimeConnection,
+  state: BridgeState,
+): void {
+  cancelHangupAutoConfirm(state)
+  const armedAt = state.hangupArmedAt
+  state.hangupAutoConfirmTimer = setTimeout(() => {
+    state.hangupAutoConfirmTimer = undefined
+    if (armedAt === undefined || state.hangupArmedAt !== armedAt || state.closed) return
+    void requestStopAfterResponseDrain(inkbox, openai, state, 'goodbye complete', armedAt).catch(() => {})
+  }, HANGUP_AUTO_CONFIRM_DELAY_MS)
+}
+
+function scheduleHangupClose(
+  inkbox: InkboxWebSocket,
+  openai: RealtimeConnection,
+  state: BridgeState,
+  reason?: string,
+): void {
+  cancelHangupClose(state)
+  state.hangupCloseTimer = setTimeout(() => {
+    state.hangupCloseTimer = undefined
+    void requestStopAfterResponseDrain(inkbox, openai, state, reason).catch(() => {})
+  }, HANGUP_CLOSE_DELAY_MS)
+}
+
+function signalLifecycleChange(state: BridgeState): void {
+  const waiters = [...state.lifecycleWaiters]
+  state.lifecycleWaiters.clear()
+  for (const resolve of waiters) resolve()
+}
+
+async function waitForResponseDrain(state: BridgeState): Promise<void> {
+  while (state.toolTasks.size > 0 && !state.closed) await Promise.allSettled([...state.toolTasks])
+
+  const deadline = Date.now() + REALTIME_RESPONSE_DRAIN_TIMEOUT_MS
+  while (!state.closed && (state.responseActive || state.responsePending || state.responseRequests > 0)) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        state.lifecycleWaiters.delete(changed)
+        resolve()
+      }, remaining)
+      const changed = (): void => {
+        clearTimeout(timeout)
+        resolve()
+      }
+      state.lifecycleWaiters.add(changed)
+    })
+  }
+}
+
+async function requestStopAfterResponseDrain(
+  inkbox: InkboxWebSocket,
+  openai: RealtimeConnection,
+  state: BridgeState,
+  reason?: string,
+  expectedArmedAt?: number,
+): Promise<void> {
+  await waitForResponseDrain(state)
+  if (expectedArmedAt !== undefined && state.hangupArmedAt !== expectedArmedAt) return
+  await sendStopAndClose(inkbox, openai, state, reason)
+}
+
+async function sendStopAndClose(
+  inkbox: InkboxWebSocket,
+  openai: RealtimeConnection,
+  state: BridgeState,
+  reason?: string,
+): Promise<void> {
+  if (state.closed || state.stopSent) return
+  state.stopSent = true
+  state.closed = true
+  signalLifecycleChange(state)
+  cancelHangupAutoConfirm(state)
+  cancelHangupClose(state)
+  try {
+    await sendInkbox(inkbox, state, { event: 'stop', ...(reason ? { reason } : {}) })
+  } finally {
+    await Promise.allSettled([inkbox.close(), openai.close()])
+  }
 }
