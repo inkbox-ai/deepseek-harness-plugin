@@ -17,51 +17,138 @@
 
 ---
 
-This is a native DeepSeek Harness bundle and CLI. It runs inside the Harness process; it is not a desktop-only
-companion and does not require a second plugin daemon. The optional managed-service installer supports Linux
-user services and macOS LaunchAgents.
+This is a native DeepSeek Harness bundle and CLI. It runs inside the Harness process rather than using a
+second plugin daemon. Foreground mode works anywhere DeepSeek Harness runs; managed background services are
+supported on Linux and macOS.
 
-## Install
+## Prerequisites
 
-Requirements:
+- **Node.js 22.19 or newer and `pnpm`.** Setup installs a pinned DeepSeek Harness runtime in its own directory.
+- **A DeepSeek API key.** Set `DEEPSEEK_API_KEY` in your environment or `~/.env` before running setup.
+- **An Inkbox identity.** Nothing needs to be created in advance: the wizard can create one through guided
+  email verification, or it can use an existing Inkbox API key.
+- **Repository access.** The one-command installer downloads the plugin from GitHub.
+- **Optional OpenAI API key.** This is needed only if you choose OpenAI Realtime instead of the hosted call
+  agent.
 
-- Node.js 22.19 or newer
-- `pnpm`
-- `DEEPSEEK_API_KEY` in your environment or `~/.env`
-- An Inkbox API key, or an email address for the guided identity signup
-- An OpenAI API key only if you choose OpenAI Realtime for calls
+## Quick Start
 
-Run the wizard:
+Run the one-command installer and setup wizard:
 
 ```bash
-npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#v0.2.0 inkbox-deepseek setup
+npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepseek setup
 ```
 
-This private-source command requires GitHub access to the repository. The wizard stages a durable package in
-`~/.dsh/inkbox-packages`, installs a pinned Harness runtime in `~/.dsh/inkbox-runtime`, creates the `inkbox`
-profile, installs this bundle, stores credentials in the Harness credential file, selects or creates an
-identity, configures optional channels, and offers to install and restart a background service.
-The wizard creates or recovers the identity webhook signing key, can provision a phone number, guides the
-iMessage connection, and validates call handling before it saves the selected mode.
-
-If `~/.env` contains exactly one environment-specific `INKBOX_API_KEY_*` value, setup will use it. Set
-`INKBOX_API_KEY` explicitly when more than one variant exists, choose an alias in the interactive wizard, or
-pass its name with `--inkbox-key-env` for non-interactive setup.
-
-Then run:
+The command installs the `inkbox-deepseek` launcher, creates the `inkbox` Harness profile, and walks through
+identity and channel setup. It can also install and launch a background service. When the wizard finishes,
+check the agent:
 
 ```bash
 inkbox-deepseek doctor
 inkbox-deepseek status
+```
+
+If you did not start the background service during setup, run the gateway in the foreground:
+
+```bash
 inkbox-deepseek run
 ```
 
-To manage the background process:
+Keep the foreground process running. The gateway opens the agent tunnel, reconciles channel subscriptions,
+and routes inbound email, SMS, iMessage, calls, and A2A events into persistent DeepSeek Harness sessions.
+
+## Setup Wizard
+
+`inkbox-deepseek setup` walks through the complete Inkbox configuration:
+
+1. Verifies that `DEEPSEEK_API_KEY` is available and discovers any existing `inkbox` profile.
+2. Creates a fresh Inkbox identity through email verification, or securely accepts an existing API key.
+3. Selects or creates the identity used by this Harness profile, attaches the bundled contact avatar, and
+   explains the server-side reachability rules that control who can contact the agent.
+4. Installs the pinned DeepSeek Harness runtime and Inkbox bundle and creates the `inkbox` profile.
+5. Offers iMessage with RCS/SMS fallback and voice calls, displays a scannable connection QR code, and can
+   wait for the first iMessage before continuing.
+6. Optionally provisions a dedicated number for SMS and voice. New numbers display a scannable `START` QR
+   code and can wait for SMS opt-in.
+7. Configures either the Inkbox hosted call agent or the OpenAI Realtime API. TTS/STT mode is not offered.
+8. Reuses a supplied webhook signing key or creates a new one with explicit rotation confirmation.
+9. Saves the identity, credentials, channel choices, trusted Inkbox-tool behavior, and workspace in the
+   `inkbox` Harness profile.
+10. Offers to install or restart the managed gateway and verifies that the process and tunnel are ready.
+
+Rerunning setup discovers the existing profile and asks before reconfiguring it. Existing avatars and channel
+resources are preserved unless a setup choice explicitly changes them.
+
+Environment-specific `INKBOX_API_KEY_*` credentials are never listed in the interactive wizard. Automated
+setup can select one explicitly with `--inkbox-key-env`; otherwise non-interactive setup uses `INKBOX_API_KEY`.
+
+## Running the Gateway
+
+The setup wizard can install a systemd user service on Linux or a LaunchAgent on macOS. Manage it with:
 
 ```bash
 inkbox-deepseek service install
-inkbox-deepseek service restart
+inkbox-deepseek service start
 inkbox-deepseek service status
+inkbox-deepseek service restart
+inkbox-deepseek service stop
+inkbox-deepseek service uninstall
+```
+
+For foreground operation or troubleshooting:
+
+```bash
+inkbox-deepseek run
+```
+
+Do not run foreground and managed gateways for the same profile at the same time. One Inkbox tunnel has one
+active gateway owner.
+
+## CLI
+
+| Command | Purpose |
+|---|---|
+| `inkbox-deepseek setup` | Install or reconfigure the runtime, identity, channels, credentials, and service. |
+| `inkbox-deepseek doctor` | Check the profile, credentials, identity, channels, bundle, and service. |
+| `inkbox-deepseek status` | Show gateway, process, identity, tunnel, and public-URL readiness. |
+| `inkbox-deepseek status --json` | Print machine-readable readiness information. |
+| `inkbox-deepseek run` | Run the `inkbox` Harness profile in the foreground. |
+| `inkbox-deepseek service <action>` | Install, start, stop, restart, inspect, or uninstall the managed service. |
+| `inkbox-deepseek profile` | Print the selected Harness profile name. |
+
+## Smoke Test
+
+Verify the installation and live gateway:
+
+```bash
+inkbox-deepseek doctor
+inkbox-deepseek status
+```
+
+`doctor` should pass every required check. `status` should report the gateway as ready, the tunnel as
+connected, and the process as running. Then send an email or iMessage to the identity printed by setup; if a
+dedicated number was provisioned and opted in, SMS works too. The agent should reply in the originating
+channel.
+
+If the gateway is not ready, stop any duplicate foreground process and inspect it interactively:
+
+```bash
+inkbox-deepseek service stop
+inkbox-deepseek run
+```
+
+## Update or Reconfigure
+
+Rerun the installed wizard at any time:
+
+```bash
+inkbox-deepseek setup
+```
+
+To reinstall the current GitHub package and rerun setup in one command:
+
+```bash
+npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepseek setup
 ```
 
 ## Capabilities
@@ -76,15 +163,16 @@ inkbox-deepseek service status
 - **Phone calls:** the wizard offers exactly two call modes: the Inkbox hosted agent or OpenAI Realtime. The
   same `inkbox_place_call` tool uses the selected mode for outbound calls, while inbound calls follow the
   matching saved identity configuration. Realtime calls can consult the main Harness agent and register
-  post-call actions without a separate daemon.
+  post-call actions without a separate daemon. The Realtime model also receives `hang_up_call`, which follows
+  a spoken-goodbye grace period, cancels when the caller barges in, and drains pending tool responses before
+  ending the call.
 - **External events:** GitHub HMAC webhooks are supported when explicitly enabled and configured.
 
-The setup wizard can trust Inkbox tools so they run without repeated approval prompts. This applies only to
-the plugin's `inkbox_*` tools; other Harness tools and actions keep their own approval behavior. When trust is
-disabled, mutating Inkbox tools use the Harness native approval service. Read-only tools are marked
-concurrency-safe, and writes remain exclusive.
+The setup wizard trusts Inkbox tools so they run without repeated approval prompts. This applies only to the
+plugin's `inkbox_*` tools; other Harness tools and actions keep their own approval behavior. Automated setup
+can explicitly keep per-action prompts with `--ask-inkbox-tool-approvals`.
 
-## Configuration
+## Config Reference
 
 The bundle reads the `inkbox` settings namespace:
 
@@ -137,10 +225,7 @@ Credentials are references, not plaintext settings:
 - `INKBOX_REALTIME_API_KEY` (required only for OpenAI Realtime call handling; `OPENAI_API_KEY` is detected by setup)
 - `INKBOX_WEBHOOK_SECRET_GITHUB` (optional)
 
-The gateway exposes `GET /health` and accepts authenticated events at `POST /webhook`. Its current public URL
-and readiness are written to `status.json` in the configured state directory.
-
-## Source development
+## Development Commands
 
 ```bash
 pnpm install --frozen-lockfile
@@ -157,6 +242,15 @@ node dist/cli.js setup --plugin-spec "$PWD"
 
 Do not run two gateways against the same Inkbox identity at once. A tunnel and its signing credential have one
 active owner; use a separate identity when testing another host concurrently.
+
+## Architecture Notes
+
+- The plugin is a native DeepSeek Harness bundle loaded by the dedicated `inkbox` profile.
+- The CLI stages a durable plugin package under `~/.dsh/inkbox-packages` and a pinned Harness runtime under
+  `~/.dsh/inkbox-runtime`.
+- The gateway verifies signed webhooks before dispatch, stores durable delivery and session state, and exposes
+  `GET /health` plus authenticated `POST /webhook` handling through the Inkbox tunnel.
+- Current public URL and readiness state are written to `status.json` in the configured state directory.
 
 ## License
 

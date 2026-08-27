@@ -50,7 +50,6 @@ async function promptIdentityDetails(prompts: SetupPrompts, preferredHandle?: st
   return {
     humanEmail,
     agentHandle,
-    displayName: await prompts.text('Display name', agentHandle),
   }
 }
 
@@ -64,12 +63,25 @@ async function selfSignup(
     try {
       response = await dependencies.signup({
         ...details,
-        noteToHuman: 'Verify this identity to finish DeepSeek Harness setup.',
+        noteToHuman: 'Setting up a DeepSeek Harness agent on Inkbox.',
         harness: 'deepseek-harness',
       })
     } catch (error) {
       process.stderr.write(`Identity signup failed: ${message(error)}\n`)
-      if (!(await prompts.confirm('Try signup again?', true))) throw error
+      const status = (error as { statusCode?: number }).statusCode
+      const detail = message(error).toLowerCase()
+      const retryLabel =
+        status === 429 && detail.includes('unclaimed agents')
+          ? 'Try a different email'
+          : status === 409 ||
+              (status === 422 && (detail.includes('handle') || detail.includes('unavailable')))
+            ? 'Pick a different handle'
+            : 'Re-enter all details and try again'
+      const choice = await prompts.choose('What now?', [
+        retryLabel,
+        'Abort — keep existing Inkbox configuration unchanged',
+      ])
+      if (choice !== 0) throw error
     }
   }
 
@@ -109,10 +121,10 @@ async function selfSignup(
 async function createIdentity(client: Inkbox, prompts: SetupPrompts, preferredHandle?: string) {
   let handle = preferredHandle ?? ''
   while (true) {
-    if (!handle) handle = await prompts.text('Agent handle', 'deepseek-agent')
-    const displayName = await prompts.text('Display name', handle)
+    if (!handle) handle = await prompts.text('Agent handle (globally unique; also the mailbox local part)')
+    const displayName = await prompts.text('Display name for recipients (optional)')
     try {
-      return await client.createIdentity(handle, { displayName: displayName || handle })
+      return await client.createIdentity(handle, { ...(displayName ? { displayName } : {}) })
     } catch (error) {
       process.stderr.write(`Identity creation failed: ${message(error)}\n`)
       if (!(await prompts.confirm('Choose another handle?', true))) throw error
@@ -129,8 +141,6 @@ export async function resolveIdentityCredential(
 ): Promise<IdentityCredential> {
   if (!apiKey) {
     if (prompts === undefined) throw new Error('INKBOX_API_KEY is required for non-interactive setup')
-    if (!(await prompts.confirm('No Inkbox API key was found. Create a new identity?', true)))
-      throw new Error('Set INKBOX_API_KEY and rerun setup')
     return selfSignup(prompts, dependencies)
   }
 
@@ -158,14 +168,23 @@ export async function resolveIdentityCredential(
   if (selected !== undefined) {
     identity = await client.getIdentity(selected.agentHandle)
   } else if (isAdmin && prompts !== undefined) {
-    const choices = [...identities.map((candidate) => candidate.agentHandle), 'Create a new identity']
+    const details = await Promise.all(
+      identities.map((candidate) => client.getIdentity(candidate.agentHandle).catch(() => undefined)),
+    )
+    const choices = [
+      ...identities.map((candidate, index) => {
+        const detail = details[index]
+        return `${candidate.agentHandle} — ${detail?.emailAddress ?? candidate.emailAddress ?? 'no mailbox'} — ${detail?.phoneNumber?.number ?? 'no phone'}`
+      }),
+      'Create a new identity',
+    ]
     const index = requested
       ? choices.length - 1
-      : await prompts.choose('Choose the Inkbox identity for this profile:', choices)
+      : await prompts.choose('Select the identity this DeepSeek gateway should run as:', choices)
     identity =
       index === identities.length
         ? await createIdentity(client, prompts, requested)
-        : await client.getIdentity(identities[index]?.agentHandle ?? '')
+        : (details[index] ?? (await client.getIdentity(identities[index]?.agentHandle ?? '')))
   } else if (identities.length === 0) {
     throw new Error('This credential cannot access an Inkbox identity')
   } else {
@@ -195,18 +214,23 @@ export async function reconcileSigningKey(
   rotate = false,
 ): Promise<string> {
   const status = await identity.getSigningKeyStatus()
-  if (!status.configured || rotate) return (await identity.createSigningKey()).signingKey
-  if (localKey) return localKey
   if (prompts === undefined) {
+    if (!status.configured || rotate) return (await identity.createSigningKey()).signingKey
+    if (localKey) return localKey
     throw new Error(
       'A signing key already exists for this identity but is unavailable locally. Supply INKBOX_WEBHOOK_SIGNING_KEY or rerun with explicit rotation.',
     )
   }
-  if (await prompts.confirm('Do you already have this identity’s webhook signing key?', true)) {
-    const supplied = await prompts.secret('Webhook signing key')
+
+  process.stdout.write('\nWebhook signing key\n')
+  process.stdout.write('Inkbox signs outbound webhooks so the gateway can verify inbound traffic.\n')
+  if (!rotate && (await prompts.confirm('Do you already have an Inkbox signing key?', false))) {
+    const supplied = await prompts.secret('Paste your Inkbox signing key')
     if (supplied) return supplied
+    process.stderr.write('No key entered; a signing key is required, so a new one must be generated.\n')
   }
-  if (!(await prompts.confirm('Rotate the existing webhook signing key?', false)))
-    throw new Error('A webhook signing key is required before the gateway can start')
+  process.stdout.write('Generating a new key rotates any existing key for this identity.\n')
+  if (!(await prompts.confirm('Generate a new signing key now?', true)))
+    throw new Error('A signing key is required; setup cannot continue without one')
   return (await identity.createSigningKey()).signingKey
 }

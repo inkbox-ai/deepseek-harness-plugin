@@ -3,8 +3,9 @@ import { join, resolve } from 'node:path'
 import { BUILTIN_CHANNEL_INSTRUCTIONS } from '../channel-instructions.js'
 import type { VoiceStack } from '../config.js'
 import { PLUGIN_PACKAGE, PROFILE_NAME } from '../constants.js'
+import { configureAvatar } from './avatar.js'
 import { configureChannels } from './channels.js'
-import { credentialFromEnvironment, credentialNamesFromEnvironment, layeredEnvironment } from './env.js'
+import { credentialFromEnvironment, layeredEnvironment } from './env.js'
 import { readYaml, updateYaml } from './files.js'
 import { installLauncher } from './launcher.js'
 import type { SetupPrompts } from './onboarding.js'
@@ -54,6 +55,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
     process.stdout.write('\nInkbox for DeepSeek Harness\n\n')
     const env = await layeredEnvironment(paths.home)
     const savedSettings = object((await readYaml(join(paths.dshHome, 'settings.yaml')))?.inkbox)
+    const savedCredentials = object((await readYaml(join(paths.dshHome, '.credentials.yaml')))?.refs)
     const savedVoiceStack =
       savedSettings.voiceStack === 'openai_realtime' ? 'openai_realtime' : 'inkbox_voice_ai'
     const savedChannelInstructions = object(savedSettings.channelInstructions)
@@ -61,13 +63,25 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
     if (!deepseekKey)
       throw new Error('DEEPSEEK_API_KEY was not found in the environment or ~/.env. Add it and rerun setup.')
 
-    const inkboxKey = await selectEnvironmentCredential(env, options.inkboxKeyEnv, prompts)
+    if (
+      prompts &&
+      typeof savedCredentials.INKBOX_API_KEY === 'string' &&
+      typeof savedSettings.agentHandle === 'string'
+    ) {
+      process.stdout.write(`Inkbox is already configured for identity '${savedSettings.agentHandle}'.\n`)
+      if (!(await prompts.confirm('Reconfigure Inkbox?', false)))
+        return existingSetupResult(paths, savedSettings)
+    }
+
+    const inkboxKey = await selectInkboxCredential(env, options.inkboxKeyEnv, prompts)
     const credential = await resolveIdentityCredential(inkboxKey, options.identity, prompts)
-    const signingKey = await reconcileSigningKey(
-      credential.identity,
-      env.INKBOX_WEBHOOK_SIGNING_KEY,
-      prompts,
-      options.rotateSigningKey,
+    await configureAvatar(credential.identity, credential.apiKey, prompts, {
+      ...(env.INKBOX_BASE_URL ? { baseUrl: env.INKBOX_BASE_URL } : {}),
+      isSignup: inkboxKey === undefined,
+    })
+    process.stdout.write('\nInkbox authorization lives server-side through contact rules.\n')
+    process.stdout.write(
+      'Anyone allowed by those rules reaches the agent; there is no second local allowlist.\n',
     )
     const workspace = resolve(options.workspace ?? process.cwd())
     await mkdir(workspace, { recursive: true })
@@ -98,7 +112,6 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
       const refs = object(document.refs)
       refs.INKBOX_API_KEY = credential.apiKey
       refs.DEEPSEEK_API_KEY = deepseekKey
-      refs.INKBOX_WEBHOOK_SIGNING_KEY = signingKey
       if (env.INKBOX_WEBHOOK_SECRET_GITHUB)
         refs.INKBOX_WEBHOOK_SECRET_GITHUB = env.INKBOX_WEBHOOK_SECRET_GITHUB
       document.refs = refs
@@ -137,6 +150,14 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
       ...(options.phoneState ? { phoneState: options.phoneState } : {}),
       nonInteractive: options.nonInteractive ?? false,
     })
+    const signingKey = await reconcileSigningKey(
+      channels.identity,
+      typeof savedCredentials.INKBOX_WEBHOOK_SIGNING_KEY === 'string'
+        ? savedCredentials.INKBOX_WEBHOOK_SIGNING_KEY
+        : env.INKBOX_WEBHOOK_SIGNING_KEY,
+      prompts,
+      options.rotateSigningKey,
+    )
     const autoApproveInkboxTools = await resolveToolApprovalChoice(
       options.autoApproveInkboxTools,
       savedSettings.autoApproveInkboxTools,
@@ -145,6 +166,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
 
     await updateYaml(join(paths.dshHome, '.credentials.yaml'), (document) => {
       const refs = object(document.refs)
+      refs.INKBOX_WEBHOOK_SIGNING_KEY = signingKey
       if (channels.realtimeApiKey) refs.INKBOX_REALTIME_API_KEY = channels.realtimeApiKey
       document.refs = refs
     })
@@ -181,26 +203,26 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
 export async function resolveToolApprovalChoice(
   requested: boolean | undefined,
   saved: unknown,
-  prompts: Pick<SetupPrompts, 'confirm'> | undefined,
+  prompts: SetupPrompts | undefined,
 ): Promise<boolean> {
   if (requested !== undefined) return requested
   const previous = typeof saved === 'boolean' ? saved : undefined
-  if (!prompts) return previous ?? false
-  process.stdout.write('\nInkbox tool approvals\n')
-  process.stdout.write(
-    'Trusting Inkbox tools skips repeated prompts for messages, calls, contacts, and other Inkbox actions. Other Harness tools are unchanged.\n',
-  )
-  return prompts.confirm('Allow this agent to run Inkbox tools without asking each time?', previous ?? true)
+  return previous ?? Boolean(prompts)
 }
 
 export interface ServiceSetupDependencies {
   isInstalled(paths: Paths): Promise<boolean>
+  isRunning(paths: Paths): Promise<boolean>
   manage(action: 'install' | 'restart', paths: Paths, workspace: string): Promise<string>
   waitUntilReady(paths: Paths): Promise<boolean>
 }
 
 const defaultServiceSetupDependencies: ServiceSetupDependencies = {
   isInstalled: serviceInstalled,
+  isRunning: async (paths) => {
+    const status = await readRuntimeStatus(paths).catch(() => undefined)
+    return status?.processRunning ?? false
+  },
   manage: manageService,
   waitUntilReady: waitForGatewayReady,
 }
@@ -213,27 +235,37 @@ export async function configureManagedService(
   dependencies: ServiceSetupDependencies = defaultServiceSetupDependencies,
 ): Promise<{ installed: boolean; started: boolean; ready: boolean }> {
   let installed = await dependencies.isInstalled(paths)
+  const running = await dependencies.isRunning(paths)
   let started = false
   let ready = false
-  const wantsService =
-    options.service ??
-    (prompts ? await prompts.confirm('Install a managed background service?', true) : false)
-  if (!wantsService) return { installed, started, ready }
-  if (!installed) {
+  if (running) {
+    const wantsRestart =
+      options.start ?? (prompts ? await prompts.confirm('Restart the running gateway now?', true) : false)
+    if (!wantsRestart) return { installed, started: true, ready: true }
     try {
-      process.stdout.write(`${await dependencies.manage('install', paths, workspace)}\n`)
-      installed = true
+      await dependencies.manage('restart', paths, workspace)
+      started = true
+      ready = await dependencies.waitUntilReady(paths)
+      return { installed, started, ready }
     } catch (error) {
-      process.stderr.write(`Managed service installation failed: ${errorMessage(error)}\n`)
-      process.stderr.write('Foreground mode is still available with inkbox-deepseek run.\n')
+      process.stderr.write(`Could not restart the managed service: ${errorMessage(error)}\n`)
       return { installed, started, ready }
     }
   }
+
+  const question = installed
+    ? 'The gateway service is installed but stopped. Launch it now?'
+    : 'Install and launch the gateway service now?'
   const wantsStart =
-    options.start ?? (prompts ? await prompts.confirm('Start or restart DeepSeek Harness now?', true) : false)
+    options.start ?? options.service ?? (prompts ? await prompts.confirm(question, true) : false)
   if (!wantsStart) return { installed, started, ready }
   try {
-    await dependencies.manage('restart', paths, workspace)
+    if (!installed) {
+      process.stdout.write(`${await dependencies.manage('install', paths, workspace)}\n`)
+      installed = true
+    } else {
+      await dependencies.manage('restart', paths, workspace)
+    }
     started = true
     ready = await dependencies.waitUntilReady(paths)
     process.stdout.write(
@@ -248,22 +280,34 @@ export async function configureManagedService(
   return { installed, started, ready }
 }
 
-async function selectEnvironmentCredential(
+export async function selectInkboxCredential(
   env: Readonly<Record<string, string>>,
   selectedName: string | undefined,
-  prompts: Prompts | undefined,
+  prompts: Pick<SetupPrompts, 'confirm' | 'secret'> | undefined,
 ): Promise<string | undefined> {
-  if (env.INKBOX_API_KEY || selectedName !== undefined)
-    return credentialFromEnvironment(env, 'INKBOX_API_KEY', selectedName)
-  const variants = credentialNamesFromEnvironment(env, 'INKBOX_API_KEY')
-  if (variants.length > 1 && prompts) {
-    const index = await prompts.choose(
-      'Choose the Inkbox credential from your environment:',
-      variants.map(([name]) => name),
-    )
-    return variants[index]?.[1]
+  if (selectedName !== undefined) return credentialFromEnvironment(env, 'INKBOX_API_KEY', selectedName)
+  if (!prompts) return credentialFromEnvironment(env, 'INKBOX_API_KEY')
+  process.stdout.write('If you do not have an Inkbox API key yet, that is fine.\n')
+  process.stdout.write('We can create a fresh agent identity for you via self-signup.\n')
+  if (!(await prompts.confirm('Do you already have an Inkbox API key?', false))) return undefined
+  const key = (await prompts.secret('Paste your Inkbox API key (ApiKey_...)')).trim()
+  if (!key) throw new Error('No Inkbox API key was provided')
+  return key
+}
+
+async function existingSetupResult(paths: Paths, settings: Record<string, unknown>): Promise<SetupResult> {
+  const status = await readRuntimeStatus(paths).catch(() => undefined)
+  return {
+    identity: String(settings.agentHandle),
+    dshHome: paths.dshHome,
+    workspace: typeof settings.workspace === 'string' ? settings.workspace : process.cwd(),
+    serviceInstalled: await serviceInstalled(paths),
+    serviceStarted: status?.processRunning ?? false,
+    gatewayReady: Boolean(status?.ready && status.connected && status.processRunning),
+    ...(settings.voiceStack === 'inkbox_voice_ai' || settings.voiceStack === 'openai_realtime'
+      ? { voiceStack: settings.voiceStack }
+      : {}),
   }
-  return credentialFromEnvironment(env, 'INKBOX_API_KEY')
 }
 
 export function selectRealtimeCredential(
@@ -294,14 +338,37 @@ export async function waitForGatewayReady(
   return false
 }
 
-function printSummary(
+export function printSummary(
   identity: { agentHandle: string; emailAddress?: string | null; phoneNumber?: { number: string } | null },
   voiceStack: VoiceStack | undefined,
   paths: Paths,
   started: boolean,
   ready: boolean,
 ): void {
-  process.stdout.write(`\nSetup complete for ${identity.agentHandle}.\n`)
+  if (started && ready) {
+    const rows = [
+      ['Inkbox identity', identity.agentHandle],
+      ['Check its health', 'inkbox-deepseek doctor'],
+    ] as const
+    const labelWidth = Math.max(...rows.map(([label]) => label.length + 1))
+    const body = [
+      'Your DeepSeek agent is set up and running on Inkbox.',
+      '',
+      ...rows.map(([label, value]) => `  ${`${label}:`.padEnd(labelWidth)}  ${value}`),
+    ]
+    const width = Math.max(...body.map((line) => line.length)) + 4
+    process.stdout.write(`\n╭${'─'.repeat(width - 2)}╮\n`)
+    body.forEach((line) => {
+      process.stdout.write(`│ ${line.padEnd(width - 4)} │\n`)
+    })
+    process.stdout.write(`╰${'─'.repeat(width - 2)}╯\n`)
+    return
+  }
+  process.stdout.write(
+    started && !ready
+      ? `\nSetup saved for ${identity.agentHandle}, but the gateway is not ready.\n`
+      : `\nSetup complete for ${identity.agentHandle}.\n`,
+  )
   process.stdout.write(`Email: ${identity.emailAddress ?? 'not provisioned'}\n`)
   process.stdout.write(`Phone: ${identity.phoneNumber?.number ?? 'not provisioned'}\n`)
   if (voiceStack)
@@ -309,6 +376,9 @@ function printSummary(
       `Calls: ${voiceStack === 'inkbox_voice_ai' ? 'Inkbox hosted agent' : 'OpenAI Realtime API'}\n`,
     )
   process.stdout.write(`Profile: ${PROFILE_NAME} under ${paths.dshHome}\n`)
+  process.stdout.write('\nReachability rules\n')
+  process.stdout.write('Open https://inkbox.ai/console/contact-rules to control who can reach this agent.\n')
+  process.stdout.write('You can allow or block contacts, phone numbers, email addresses, and domains.\n')
   process.stdout.write('Run diagnostics: inkbox-deepseek doctor\n')
   if (!started) process.stdout.write('Start in the foreground: inkbox-deepseek run\n')
   else if (!ready) process.stdout.write('Check readiness: inkbox-deepseek status\n')

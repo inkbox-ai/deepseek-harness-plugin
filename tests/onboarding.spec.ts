@@ -86,7 +86,7 @@ describe('identity onboarding parity', () => {
       prompts({ text: vi.fn(async (_label, fallback) => fallback ?? 'New Agent') }),
       deps((key) => (key === 'ApiKey_admin' ? admin : scoped)),
     )
-    expect(admin.createIdentity).toHaveBeenCalledWith('new-agent', { displayName: 'new-agent' })
+    expect(admin.createIdentity).toHaveBeenCalledWith('new-agent', { displayName: 'New Agent' })
     expect(result.apiKey).toBe('ApiKey_scoped')
   })
 
@@ -94,10 +94,8 @@ describe('identity onboarding parity', () => {
     const answers = [
       'person@example.test',
       'deepseek-agent',
-      'DeepSeek Agent',
       'person@example.test',
       'deepseek-agent',
-      'DeepSeek Agent',
       '111111',
       '222222',
       '333333',
@@ -135,6 +133,15 @@ describe('identity onboarding parity', () => {
     expect(signup).toHaveBeenCalledTimes(2)
     expect(verifySignup).toHaveBeenCalledTimes(4)
     expect(resendSignupVerification).toHaveBeenCalledWith('ApiKey_signup')
+    expect(signup).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        humanEmail: 'person@example.test',
+        agentHandle: 'deepseek-agent',
+        harness: 'deepseek-harness',
+        noteToHuman: 'Setting up a DeepSeek Harness agent on Inkbox.',
+      }),
+    )
+    expect(signup.mock.calls.at(-1)?.[0]).not.toHaveProperty('displayName')
     expect(result.apiKey).toBe('ApiKey_signup')
   })
 })

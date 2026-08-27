@@ -2,10 +2,13 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
+import type { SetupPrompts } from '../src/cli/onboarding.js'
 import type { Paths } from '../src/cli/paths.js'
 import {
   configureManagedService,
+  printSummary,
   resolveToolApprovalChoice,
+  selectInkboxCredential,
   selectRealtimeCredential,
   waitForGatewayReady,
 } from '../src/cli/setup.js'
@@ -22,15 +25,33 @@ function paths(home: string): Paths {
 }
 
 describe('setup credential and liveness behavior', () => {
+  it('uses self-signup by default instead of enumerating environment credentials', async () => {
+    const confirm = vi.fn(async () => false)
+    const secret = vi.fn(async () => 'ApiKey_pasted')
+    await expect(
+      selectInkboxCredential({ INKBOX_API_KEY_FIRST: 'first', INKBOX_API_KEY_SECOND: 'second' }, undefined, {
+        confirm,
+        secret,
+      }),
+    ).resolves.toBeUndefined()
+    expect(confirm).toHaveBeenCalledWith('Do you already have an Inkbox API key?', false)
+    expect(secret).not.toHaveBeenCalled()
+  })
+
+  it('securely asks for a key only after the user chooses bring-your-own-key', async () => {
+    const confirm = vi.fn(async () => true)
+    const secret = vi.fn(async () => '  ApiKey_pasted  ')
+    await expect(selectInkboxCredential({}, undefined, { confirm, secret })).resolves.toBe('ApiKey_pasted')
+    expect(secret).toHaveBeenCalledWith('Paste your Inkbox API key (ApiKey_...)')
+  })
+
   it('offers trusted Inkbox tools by default and preserves explicit choices', async () => {
     const confirm = vi.fn(async (_label: string, fallback?: boolean) => fallback ?? false)
-    await expect(resolveToolApprovalChoice(undefined, undefined, { confirm })).resolves.toBe(true)
-    expect(confirm).toHaveBeenCalledWith(
-      'Allow this agent to run Inkbox tools without asking each time?',
-      true,
-    )
-    await expect(resolveToolApprovalChoice(undefined, false, { confirm })).resolves.toBe(false)
-    await expect(resolveToolApprovalChoice(true, false, { confirm })).resolves.toBe(true)
+    const prompt = { confirm } as unknown as SetupPrompts
+    await expect(resolveToolApprovalChoice(undefined, undefined, prompt)).resolves.toBe(true)
+    expect(confirm).not.toHaveBeenCalled()
+    await expect(resolveToolApprovalChoice(undefined, false, prompt)).resolves.toBe(false)
+    await expect(resolveToolApprovalChoice(true, false, prompt)).resolves.toBe(true)
     await expect(resolveToolApprovalChoice(undefined, undefined, undefined)).resolves.toBe(false)
   })
 
@@ -76,6 +97,47 @@ describe('setup credential and liveness behavior', () => {
 })
 
 describe('managed-service wizard parity', () => {
+  it('does not claim setup completed when the gateway failed readiness', () => {
+    const output: string[] = []
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      output.push(String(chunk))
+      return true
+    })
+    try {
+      printSummary(
+        { agentHandle: 'deepseek-agent', emailAddress: 'deepseek-agent@example.test' },
+        'inkbox_voice_ai',
+        paths('/tmp/setup-not-ready'),
+        true,
+        false,
+      )
+    } finally {
+      write.mockRestore()
+    }
+    expect(output.join('')).toContain('Setup saved for deepseek-agent, but the gateway is not ready.')
+    expect(output.join('')).not.toContain('Setup complete')
+  })
+
+  it('leaves a running gateway live when restart is declined', async () => {
+    const manage = vi.fn(async () => 'restarted')
+    const confirm = vi.fn(async () => false)
+    const result = await configureManagedService(
+      paths('/tmp/setup-live'),
+      '/tmp/workspace',
+      {},
+      { confirm },
+      {
+        isInstalled: vi.fn(async () => true),
+        isRunning: vi.fn(async () => true),
+        manage,
+        waitUntilReady: vi.fn(async () => true),
+      },
+    )
+    expect(confirm).toHaveBeenCalledWith('Restart the running gateway now?', true)
+    expect(manage).not.toHaveBeenCalled()
+    expect(result).toEqual({ installed: true, started: true, ready: true })
+  })
+
   it('offers restart for an installed service and claims readiness only after a live status', async () => {
     const manage = vi.fn(async () => 'restarted')
     const result = await configureManagedService(
@@ -85,6 +147,7 @@ describe('managed-service wizard parity', () => {
       { confirm: vi.fn(async () => true) },
       {
         isInstalled: vi.fn(async () => true),
+        isRunning: vi.fn(async () => true),
         manage,
         waitUntilReady: vi.fn(async () => true),
       },
@@ -101,6 +164,7 @@ describe('managed-service wizard parity', () => {
       undefined,
       {
         isInstalled: vi.fn(async () => false),
+        isRunning: vi.fn(async () => false),
         manage: vi.fn(async () => {
           throw new Error('service manager unavailable')
         }),
@@ -118,6 +182,7 @@ describe('managed-service wizard parity', () => {
       undefined,
       {
         isInstalled: vi.fn(async () => true),
+        isRunning: vi.fn(async () => false),
         manage: vi.fn(async () => {
           throw new Error('restart failed')
         }),

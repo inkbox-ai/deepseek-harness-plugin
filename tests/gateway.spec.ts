@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -232,6 +232,23 @@ afterEach(() => {
 })
 
 describe('gateway lifecycle and delivery', () => {
+  it('rebuilds removed local tunnel state and retries exactly once', async () => {
+    tunnel.connect.mockImplementationOnce(async (_client, options) => {
+      await mkdir(options.stateDir, { recursive: true })
+      await writeFile(join(options.stateDir, 'state.json'), '{"tunnel_id":"removed"}\n')
+      const error = new Error('cached tunnel was removed')
+      error.name = 'TunnelRemoved'
+      throw error
+    })
+
+    const { gateway, stateDir } = await harness()
+    expect(tunnel.connect).toHaveBeenCalledTimes(2)
+    await expect(readFile(join(stateDir, 'tunnel', 'state.json'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    await gateway.close()
+  })
+
   it('connects the tunnel and reconciles every configured channel', async () => {
     const { gateway, subscriptions, stateDir } = await harness()
     expect(gateway.status()).toMatchObject({ ready: true, connected: true, identity: 'deepseek-agent' })

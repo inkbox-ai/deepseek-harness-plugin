@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -6,7 +6,12 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import type { AskUserQuestionAnswer, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
-import { connect, type InkboxWebSocket, type TunnelListener } from '@inkbox/sdk/tunnels/connect'
+import {
+  type ConnectOptions,
+  connect,
+  type InkboxWebSocket,
+  type TunnelListener,
+} from '@inkbox/sdk/tunnels/connect'
 import { AgentManager } from './agent-manager.js'
 import { renderChannelEvent, resolveChannelInstruction } from './channel-instructions.js'
 import type { ResolvedConfig } from './config.js'
@@ -114,9 +119,10 @@ export class Gateway {
     const connected = new Promise<void>((resolve) => {
       connectedResolve = resolve
     })
-    this.listener = await connect(this.client, {
+    const tunnelStateDir = join(this.config.stateDir, 'tunnel')
+    const connectOptions: ConnectOptions = {
       name: this.identity.agentHandle,
-      stateDir: join(this.config.stateDir, 'tunnel'),
+      stateDir: tunnelStateDir,
       installSignalHandlers: false,
       handler: (request) => this.handleRequest(request),
       wsHandler: (ws) => this.handleWebSocket(ws),
@@ -124,7 +130,15 @@ export class Gateway {
         this.log.info(`[inkbox] tunnel ${status}`)
         if (status === 'connected') connectedResolve?.()
       },
-    })
+    }
+    try {
+      this.listener = await connect(this.client, connectOptions)
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'TunnelRemoved') throw error
+      this.log.warn('[inkbox] cached tunnel was removed; rebuilding local tunnel state')
+      await rm(tunnelStateDir, { recursive: true, force: true })
+      this.listener = await connect(this.client, connectOptions)
+    }
     this.tunnelTask = this.listener.wait()
     await Promise.race([
       connected,
