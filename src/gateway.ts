@@ -15,6 +15,7 @@ import {
 import { AgentManager } from './agent-manager.js'
 import { renderChannelEvent, resolveChannelInstruction } from './channel-instructions.js'
 import type { ResolvedConfig } from './config.js'
+import { reconcileIdentitySubscription } from './identity-subscription.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
   authenticateCallWebSocket,
@@ -569,40 +570,15 @@ export class Gateway {
     if (this.client === undefined || this.identity === undefined)
       throw new Error('Gateway client is unavailable')
     const url = `${publicUrl.replace(/\/$/, '')}/webhook`
-    const specs: Array<{
-      owner: { mailboxId?: string; phoneNumberId?: string; agentIdentityId?: string }
-      events: readonly string[]
-    }> = []
-    if (this.identity.mailbox?.id)
-      specs.push({ owner: { mailboxId: this.identity.mailbox.id }, events: EVENT_TYPES.email })
-    if (this.identity.phoneNumber?.id)
-      specs.push({ owner: { phoneNumberId: this.identity.phoneNumber.id }, events: EVENT_TYPES.sms })
-    specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.imessage })
-    specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.call })
-    specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.a2a })
-
-    for (const spec of specs) {
-      const existing = await this.client.webhooks.subscriptions.list({ ...spec.owner, url })
-      const match = existing.find((subscription) =>
-        subscription.eventTypes.some((event) => spec.events.includes(event)),
-      )
-      if (match !== undefined) {
-        const same =
-          match.eventTypes.length === spec.events.length &&
-          spec.events.every((event) => match.eventTypes.includes(event))
-        if (!same) await this.client.webhooks.subscriptions.update(match.id, { eventTypes: [...spec.events] })
-        continue
-      }
-      const created = await this.client.webhooks.subscriptions.create({
-        ...spec.owner,
-        url,
-        eventTypes: [...spec.events],
-      })
-      if (created.signingKey !== null && this.signingKey === undefined) {
-        const { credentialRef } = await import('@deepseek-ai/dsh-credentials')
-        await this.ctx.credentials.set(credentialRef(this.config.signingKeyRef), created.signingKey)
-        this.signingKey = created.signingKey
-      }
+    const result = await reconcileIdentitySubscription(
+      this.client,
+      this.identity.id,
+      url,
+      Object.values(EVENT_TYPES).flat(),
+    )
+    if (result.signingKey && this.signingKey === undefined) {
+      await this.ctx.credentials.set(credentialRef(this.config.signingKeyRef), result.signingKey)
+      this.signingKey = result.signingKey
     }
   }
 

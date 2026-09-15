@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@inkbox/sdk':
-        specifier: 0.6.4
-        version: 0.6.4
+        specifier: 0.6.12
+        version: 0.6.12
       commander:
         specifier: ^15.0.0
         version: 15.0.0
@@ -456,8 +456,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@inkbox/sdk@0.6.4':
-    resolution: {integrity: sha512-+0XrMfr2qt2dQ0NMqlumhCtG8CJsqmesAvR29Btl3fQKeSH3l9kDJ2KMcIEpNtHtziJuZCjFIql3J0i/frIJpQ==}
+  '@inkbox/sdk@0.6.12':
+    resolution: {integrity: sha512-BVhNDrEmRhV6WBgAywMdH/PHTDAIMefNMUVLabItz5fsF+sx6U4mgRFVkp6aFviNhmGkfX4RwMrjfwpyJYJlUg==}
     engines: {node: '>=22'}
 
   '@jridgewell/sourcemap-codec@1.5.5':
@@ -1235,7 +1235,7 @@ snapshots:
   '@esbuild/win32-x64@0.28.2':
     optional: true
 
-  '@inkbox/sdk@0.6.4':
+  '@inkbox/sdk@0.6.12':
     dependencies:
       '@peculiar/x509': 2.0.0
       hash-wasm: 4.12.0

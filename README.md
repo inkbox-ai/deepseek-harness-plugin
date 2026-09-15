@@ -103,7 +103,7 @@ If you did not start the background service during setup, run the gateway in the
 inkbox-deepseek run
 ```
 
-Keep the foreground process running. The gateway opens the agent tunnel, reconciles channel subscriptions,
+Keep the foreground process running. The gateway opens the agent tunnel, reconciles an identity-owned notification subscription,
 and routes inbound email, SMS, iMessage, calls, and A2A events into persistent DeepSeek Harness sessions.
 
 ## Setup Wizard
@@ -305,3 +305,11 @@ active owner; use a separate identity when testing another host concurrently.
 ## License
 
 MIT
+
+### Notification subscription upgrades
+
+New receivers use one identity-owned subscription for the notification events consumed by this gateway,
+including channels that are not enabled yet. Incoming-call control is configured separately.
+On upgrade, compatible existing subscriptions retain their IDs, event selections, and context;
+missing events are added with revision-checked updates. Other destination URLs are untouched.
+Conflicting delivery authentication or context settings require review instead of replacement.
