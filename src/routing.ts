@@ -3,6 +3,13 @@ import { createHmac } from 'node:crypto'
 export type Channel = 'email' | 'sms' | 'imessage' | 'a2a' | 'call' | 'external'
 
 export type ReplyTarget =
+  | {
+      channel: 'companion-email'
+      to: string[]
+      cc: string[]
+      conversationId: string
+      replyToMessageId: string
+    }
   | { channel: 'email'; to: string; subject: string; inReplyToMessageId?: string }
   | { channel: 'sms'; conversationId?: string; to?: string }
   | { channel: 'imessage'; conversationId: string }

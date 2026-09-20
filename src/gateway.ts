@@ -12,8 +12,10 @@ import {
   type InkboxWebSocket,
   type TunnelListener,
 } from '@inkbox/sdk/tunnels/connect'
+import lockfile from 'proper-lockfile'
 import { AgentManager } from './agent-manager.js'
 import { renderChannelEvent, resolveChannelInstruction } from './channel-instructions.js'
+import { assertCompanionSize, COMPANION_MAX_BYTES, companionJob, companionReply } from './companion.js'
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
@@ -72,6 +74,8 @@ export interface GatewayStatus {
   startedAt: string
   pid: number
   updatedAt: string
+  companionPending: number
+  companionPaused: number
 }
 
 export class Gateway {
@@ -88,6 +92,8 @@ export class Gateway {
   private readonly latestTargets = new Map<string, ReplyTarget>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
   private readonly inflight = new Set<Promise<void>>()
+  private readonly companionWorkers = new Set<string>()
+  private releaseRuntime: (() => Promise<void>) | undefined
   private readonly activeDeliveries = new Set<string>()
   private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly typingPulses = new Map<string, TypingPulse>()
@@ -105,6 +111,19 @@ export class Gateway {
 
   async start(): Promise<void> {
     await this.state.initialize()
+    this.releaseRuntime = await lockfile.lock(`${this.state.path}.gateway`, {
+      realpath: false,
+    })
+    try {
+      await this.startRuntime()
+    } catch (error) {
+      await this.releaseRuntime()
+      this.releaseRuntime = undefined
+      throw error
+    }
+  }
+
+  private async startRuntime(): Promise<void> {
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
     this.client = await this.runtime.getClient()
     this.identity = await this.runtime.getIdentity()
@@ -157,6 +176,15 @@ export class Gateway {
       )
     }
     this.resumeDeliveries()
+    await this.state.mutate((state) => {
+      for (const job of Object.values(state.companion)) {
+        if (job.status === 'submitting') {
+          job.status = 'paused'
+          job.error = 'Host submission outcome is uncertain; operator reconciliation required'
+        }
+      }
+    })
+    for (const job of Object.values(this.state.snapshot().companion)) this.resumeCompanion(job.event.routeKey)
     await this.writeStatus(true)
     void this.tunnelTask.catch((error) => {
       if (!this.closing) this.log.error('[inkbox] tunnel stopped unexpectedly', error)
@@ -181,6 +209,27 @@ export class Gateway {
     if (authenticated.outcome === 'invalid') return new Response(authenticated.detail, { status: 401 })
     if (authenticated.outcome === 'unavailable') return new Response(authenticated.detail, { status: 503 })
     if (authenticated.outcome === 'ignored') return new Response(authenticated.detail, { status: 202 })
+    if (authenticated.source === 'inkbox') {
+      try {
+        if (!this.identity) throw new Error('Gateway identity is unavailable')
+        const job = companionJob(authenticated.payload, this.identity.id)
+        if (job) {
+          try {
+            await this.state.mutate((state) => {
+              if (!Object.hasOwn(state.companion, job.event.eventId)) state.companion[job.event.eventId] = job
+            })
+          } catch {
+            return new Response('Companion durable acceptance unavailable', { status: 503 })
+          }
+          this.resumeCompanion(job.event.routeKey)
+          return new Response('Accepted', { status: 202 })
+        }
+      } catch (error) {
+        return new Response(error instanceof Error ? error.message : 'Invalid Companion event', {
+          status: 422,
+        })
+      }
+    }
     const callId = endedCallId(authenticated.payload)
     if (callId && !(await this.claimCallReconciliation(callId)))
       return new Response('Duplicate', { status: 200 })
@@ -311,7 +360,11 @@ export class Gateway {
   }
 
   status(): GatewayStatus {
+    const companionJobs = Object.values(this.state.snapshot().companion)
     return {
+      companionPending: companionJobs.filter((job) => job.status === 'pending' || job.status === 'submitting')
+        .length,
+      companionPaused: companionJobs.filter((job) => job.status === 'paused').length,
       ready: this.signingKey !== undefined && this.listener?.isConnected === true,
       ...(this.listener ? { publicUrl: this.listener.publicUrl } : {}),
       connected: this.listener?.isConnected ?? false,
@@ -338,10 +391,15 @@ export class Gateway {
       pending.reject(new Error('Gateway stopped'))
     }
     this.pendingHuman.clear()
-    await this.listener?.aclose()
-    await Promise.allSettled([...this.inflight])
-    await this.agents.close()
-    await this.writeStatus(false)
+    try {
+      await this.listener?.aclose()
+      await Promise.allSettled([...this.inflight])
+      await this.agents.close()
+      await this.writeStatus(false)
+    } finally {
+      await this.releaseRuntime?.()
+      this.releaseRuntime = undefined
+    }
   }
 
   private accept(event: RoutedEvent): void {
@@ -372,6 +430,198 @@ export class Gateway {
       const task = this.runBatch(event.routeKey, queue)
       this.track(task)
     }, this.config.batchWindowMs)
+  }
+
+  private resumeCompanion(routeKey: string): void {
+    if (this.closing || this.companionWorkers.has(routeKey)) return
+    this.companionWorkers.add(routeKey)
+    let completed = false
+    const task = this.runCompanion(routeKey)
+      .then(() => {
+        completed = true
+        return this.writeStatus(this.signingKey !== undefined && this.listener?.isConnected === true)
+      })
+      .catch((error) => this.log.error('[inkbox] Companion processing failed', error))
+      .finally(() => {
+        this.companionWorkers.delete(routeKey)
+        const next = Object.values(this.state.snapshot().companion)
+          .filter((job) => job.event.routeKey === routeKey && job.status !== 'done')
+          .sort((a, b) => a.metadata.sequence - b.metadata.sequence)[0]
+        if (completed && next?.status === 'pending') this.resumeCompanion(routeKey)
+      })
+    this.track(task)
+  }
+
+  private async runCompanion(routeKey: string): Promise<void> {
+    while (!this.closing) {
+      const jobs = Object.values(this.state.snapshot().companion)
+        .filter((job) => job.event.routeKey === routeKey && job.status !== 'done')
+        .sort((a, b) => a.metadata.sequence - b.metadata.sequence)
+      const job = jobs[0]
+      if (job?.status !== 'pending') return
+      const id = job.event.eventId
+      try {
+        if (job.identityId !== this.identity?.id) throw new Error('Companion identity changed')
+        const event = structuredClone(job.event)
+        let initializedIds = this.state.snapshot().companionInitialized[routeKey]
+        let initializing = false
+        if (job.metadata.activation_id) {
+          if (!this.client || !this.identity) throw new Error('Companion client is unavailable')
+          if (
+            typeof this.client.companion?.loadInitialization !== 'function' ||
+            typeof this.client.companion?.activationMessages !== 'function'
+          )
+            throw new Error('Companion mode requires Inkbox SDK 0.7.3 or newer')
+          if (!initializedIds) {
+            const snapshot = await this.client.companion.loadInitialization(
+              this.identity.agentHandle,
+              job.metadata.activation_id,
+              { maxBytes: COMPANION_MAX_BYTES },
+            )
+            if (
+              snapshot.scopeId !== job.metadata.scope_id ||
+              snapshot.conversationId !== job.metadata.conversation_id ||
+              snapshot.activationId !== job.metadata.activation_id ||
+              snapshot.channel !== job.metadata.channel
+            )
+              throw new Error('Companion initialization scope mismatch')
+            event.content =
+              snapshot.text +
+              (snapshot.notices.length ? `\nNotices: ${JSON.stringify(snapshot.notices)}` : '')
+            event.target = companionReply(snapshot.replyContext, job.metadata)
+            initializedIds = snapshot.entries.map((entry) => entry.id)
+            if (
+              job.metadata.phase === 'initialization' &&
+              !snapshot.entries.some((entry) => entry.id === job.sourceId && entry.isTrigger)
+            )
+              throw new Error('Companion trigger mismatch')
+            initializing = true
+          } else {
+            const current = await this.client.companion.activationMessages(
+              this.identity.agentHandle,
+              job.metadata.activation_id,
+              { limit: 1 },
+            )
+            if (
+              current.scopeId !== job.metadata.scope_id ||
+              current.conversationId !== job.metadata.conversation_id
+            )
+              throw new Error('Companion activation scope mismatch')
+            event.target = companionReply(current.replyContext, job.metadata)
+          }
+          if (
+            !initializing &&
+            (job.metadata.phase === 'initialization' || initializedIds?.includes(job.sourceId))
+          ) {
+            await this.state.mutate((state) => {
+              const current = state.companion[id]
+              if (current) current.status = 'done'
+            })
+            continue
+          }
+        }
+        if (job.metadata.channel === 'mail' && !initializing) {
+          if (!this.identity) throw new Error('Companion identity is unavailable')
+          const message = await this.identity.getMessage(job.sourceId)
+          if (
+            message.id !== job.sourceId ||
+            message.threadId !== job.metadata.conversation_id ||
+            message.fromAddress.toLowerCase() !== job.author.toLowerCase()
+          )
+            throw new Error('Companion mail source changed')
+          if (
+            (message.bodyText == null && message.bodyHtml == null && !message.attachmentMetadata?.length) ||
+            (message.hasAttachments && !message.attachmentMetadata?.length)
+          )
+            throw new Error('Companion mail body or attachments unavailable')
+          event.content = JSON.stringify({
+            id: message.id,
+            author: message.fromAddress,
+            occurredAt: message.createdAt,
+            subject: message.subject,
+            bodyText: message.bodyText,
+            bodyHtml: message.bodyHtml,
+            attachments: message.attachmentMetadata ?? [],
+          })
+          if (job.metadata.phase === 'ordinary') {
+            if (!message.replyAllRecipients || !this.identity.emailAddress)
+              throw new Error('Companion mail reply audience unavailable')
+            const excludeSelf = (addresses: string[]) =>
+              addresses.filter(
+                (address) => address.toLowerCase() !== this.identity?.emailAddress?.toLowerCase(),
+              )
+            event.target = companionReply(
+              {
+                channel: 'mail',
+                conversationId: message.threadId,
+                replyToMessageId: message.id,
+                to: excludeSelf(message.replyAllRecipients.to),
+                cc: excludeSelf(message.replyAllRecipients.cc),
+              },
+              job.metadata,
+            )
+          }
+        }
+        const prompt = renderChannelEvent(event, this.config)
+        assertCompanionSize(prompt)
+        const claimed = await this.state.mutate((state) => {
+          const current = state.companion[id]
+          if (current?.status !== 'pending') return false
+          current.status = 'submitting'
+          current.submission = event
+          return true
+        })
+        if (!claimed) return
+        const response = (
+          await this.agents.run(routeKey, prompt, async () => {
+            if (!job.metadata.activation_id) return
+            if (!this.client || !this.identity) throw new Error('Companion client is unavailable')
+            const current = await this.client.companion.activationMessages(
+              this.identity.agentHandle,
+              job.metadata.activation_id,
+              { limit: 1 },
+            )
+            if (
+              current.scopeId !== job.metadata.scope_id ||
+              current.conversationId !== job.metadata.conversation_id ||
+              JSON.stringify(companionReply(current.replyContext, job.metadata)) !==
+                JSON.stringify(event.target)
+            )
+              throw new Error('Companion reply scope changed before host submission')
+          })
+        ).trim()
+        await this.state.mutate((state) => {
+          if (initializing) state.companionInitialized[routeKey] = initializedIds ?? []
+          else if (job.metadata.activation_id) state.companionInitialized[routeKey]?.push(job.sourceId)
+          // A live-first delivery initializes first, then retains its own incremental turn.
+          const current = state.companion[id]
+          if (!current) throw new Error('Companion job is missing')
+          current.status =
+            initializing && job.metadata.phase === 'live' && !initializedIds?.includes(job.sourceId)
+              ? 'pending'
+              : 'done'
+          if (response && !isSilentResponse(response) && event.target.channel !== 'none') {
+            state.deliveries[`${id}:${initializing ? 'initialization' : 'live'}`] = {
+              eventIds: [id],
+              target: event.target,
+              response,
+              attempts: 0,
+              nextAttemptAt: Date.now(),
+            }
+          }
+        })
+        this.resumeDeliveries()
+      } catch (error) {
+        await this.state.mutate((state) => {
+          const current = state.companion[id]
+          if (current) {
+            current.status = 'paused'
+            current.error = error instanceof Error ? error.message : 'Companion processing failed'
+          }
+        })
+        return
+      }
+    }
   }
 
   private async runBatch(routeKey: string, queue: Queue): Promise<void> {
@@ -419,6 +669,38 @@ export class Gateway {
     const identity = this.identity
     if (identity === undefined) throw new Error('Gateway identity is unavailable')
     switch (target.channel) {
+      case 'companion-email': {
+        const parent = await identity.getMessage(target.replyToMessageId)
+        if (
+          parent.id !== target.replyToMessageId ||
+          parent.threadId !== target.conversationId ||
+          !parent.messageId
+        )
+          throw new Error('Companion mail reply parent changed')
+        const audience = (to: string[], cc: string[]) =>
+          [
+            ...new Set(
+              [...to, ...cc]
+                .map((address) => address.trim().toLowerCase())
+                .filter((address) => address !== identity.emailAddress?.toLowerCase()),
+            ),
+          ].sort()
+        if (
+          !parent.replyAllRecipients ||
+          JSON.stringify(audience(parent.replyAllRecipients.to, parent.replyAllRecipients.cc)) !==
+            JSON.stringify(audience(target.to, target.cc))
+        )
+          throw new Error('Companion mail reply audience changed')
+        const subject = parent.subject ?? '(no subject)'
+        await identity.sendEmail({
+          to: target.to,
+          cc: target.cc,
+          subject: /^re:/i.test(subject) ? subject : `Re: ${subject}`,
+          bodyText: response,
+          inReplyToMessageId: parent.messageId,
+        })
+        return
+      }
       case 'email':
         await identity.sendEmail({
           to: [target.to],
@@ -538,6 +820,8 @@ export class Gateway {
   ): Promise<string> {
     const routeKey = this.agents.routeForAgent(agent)
     if (routeKey === undefined) throw new Error('No active Inkbox route owns this agent')
+    if (routeKey.startsWith('companion:'))
+      throw new Error('Companion conversations cannot answer host approval or question requests')
     if (this.pendingHuman.has(routeKey))
       throw new Error('Another Inkbox interaction is already pending for this route')
     const target = this.latestTargets.get(routeKey)

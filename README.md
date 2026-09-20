@@ -302,6 +302,22 @@ active owner; use a separate identity when testing another host concurrently.
   `GET /health` plus authenticated `POST /webhook` handling through the Inkbox tunnel.
 - Current public URL and readiness state are written to `status.json` in the configured state directory.
 
+## Companion mode
+
+Version 0.2.1 requires Inkbox SDK 0.7.3. Configure Companion mode on the identity;
+installing this plugin does not enable it. Verified group activations load all
+authorized history into one conversation-scoped input before live messages run.
+Ordinary tracked traffic and each activation use separate sessions. Replies retain
+the approved email audience and parent, or the text conversation identifier.
+
+The complete rendered input is limited to 128 KiB. Oversized initialization fails
+without truncating history. Durable jobs are saved before webhook acknowledgement.
+An interrupted host submission is paused rather than automatically repeated.
+`inkbox-deepseek status` shows pending and paused job counts. Inspect `companion`
+job status/error in the private `gateway-state.json` when a conversation pauses;
+reconcile the host session before recovery. Group messages
+cannot answer host approval or question requests. Normal tool permissions apply.
+
 ## License
 
 MIT

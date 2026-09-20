@@ -70,9 +70,10 @@ export class AgentManager {
     return handle.agent
   }
 
-  async run(routeKey: string, prompt: string): Promise<string> {
+  async run(routeKey: string, prompt: string, beforeSubmit?: () => Promise<void>): Promise<string> {
     const agent = await this.get(routeKey)
     await agent.whenIdle()
+    await beforeSubmit?.()
     const firstSeq = agent.session.seq
     agent.followup(
       createUserMessage({
