@@ -19,6 +19,8 @@ jobs:
         with:
           node-version: 22.19.0
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/inkbox-sdk
+      - name: Install frozen dependencies with the unreleased SDK artifact
+        run: node tests/ci/install-sdk.mjs
       - run: pnpm check
       - run: pnpm pack:check
