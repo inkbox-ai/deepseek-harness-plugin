@@ -13,6 +13,8 @@ export interface RuntimeStatus {
   updatedAt?: string
   processRunning: boolean
   statusPath: string
+  companionPending?: number
+  companionPaused?: number
 }
 
 function isRunning(pid: number | undefined): boolean {
@@ -51,6 +53,8 @@ export async function readRuntimeStatus(paths: Paths): Promise<RuntimeStatus> {
     ...(typeof raw.updatedAt === 'string' ? { updatedAt: raw.updatedAt } : {}),
     processRunning: isRunning(pid),
     statusPath,
+    ...(typeof raw.companionPending === 'number' ? { companionPending: raw.companionPending } : {}),
+    ...(typeof raw.companionPaused === 'number' ? { companionPaused: raw.companionPaused } : {}),
   }
 }
 
@@ -64,5 +68,8 @@ export function formatRuntimeStatus(status: RuntimeStatus): string {
     `Public URL: ${status.publicUrl ?? 'unavailable'}`,
     `Started: ${status.startedAt ?? 'unknown'}`,
     `Updated: ${status.updatedAt ?? 'unknown'}`,
+    ...(status.companionPending !== undefined
+      ? [`Companion: ${status.companionPending} pending, ${status.companionPaused ?? 0} paused`]
+      : []),
   ].join('\n')
 }

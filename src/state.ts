@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import lockfile from 'proper-lockfile'
+import type { CompanionJob } from './companion.js'
 import type { ReplyTarget } from './routing.js'
 
 export interface RouteRecord {
@@ -24,6 +25,8 @@ export interface GatewayState {
   seen: Record<string, number>
   replied: Record<string, number>
   deliveries: Record<string, PendingDelivery>
+  companion: Record<string, CompanionJob>
+  companionInitialized: Record<string, string[]>
 }
 
 const EMPTY_AGE_MS = 14 * 24 * 60 * 60 * 1000
@@ -36,6 +39,8 @@ function freshState(): GatewayState {
     seen: {},
     replied: {},
     deliveries: {},
+    companion: {},
+    companionInitialized: {},
   }
 }
 
@@ -52,6 +57,8 @@ function validate(value: unknown): GatewayState {
     seen: raw.seen && typeof raw.seen === 'object' ? raw.seen : {},
     replied: raw.replied && typeof raw.replied === 'object' ? raw.replied : {},
     deliveries: validateDeliveries(raw.deliveries),
+    companion: raw.companion ?? {},
+    companionInitialized: raw.companionInitialized ?? {},
   }
 }
 
@@ -141,7 +148,19 @@ export class StateStore {
   private async write(state: GatewayState): Promise<void> {
     const temp = `${this.path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
     await writeFile(temp, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    const file = await open(temp, 'r')
+    try {
+      await file.sync()
+    } finally {
+      await file.close()
+    }
     await rename(temp, this.path)
+    const directory = await open(dirname(this.path), 'r')
+    try {
+      await directory.sync()
+    } finally {
+      await directory.close()
+    }
   }
 }
 
