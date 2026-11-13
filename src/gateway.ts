@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import type { AskUserQuestionAnswer, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
-import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
+import { type AgentIdentity, type Inkbox, InkboxAPIError } from '@inkbox/sdk'
 import {
   type ConnectOptions,
   connect,
@@ -27,12 +27,13 @@ import {
 import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } from './routing.js'
 import type { InkboxRuntime } from './runtime.js'
 import { StateStore } from './state.js'
+import { replyState } from './terminal-reply.js'
 import { authenticateWebhook } from './webhook-providers.js'
 
 interface Queue {
   buffered: RoutedEvent[]
   timer: ReturnType<typeof setTimeout> | undefined
-  active: { events: RoutedEvent[]; target: ReplyTarget } | undefined
+  active: { events: RoutedEvent[]; target: ReplyTarget; phase: 'generating' | 'finishing' } | undefined
 }
 
 interface PendingHuman {
@@ -103,7 +104,7 @@ export class Gateway {
     this.agents = new AgentManager(ctx, config, this.state)
   }
 
-  async start(): Promise<void> {
+  async initialize(): Promise<void> {
     await this.state.initialize()
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
     this.client = await this.runtime.getClient()
@@ -114,7 +115,11 @@ export class Gateway {
         await this.ctx.credentials.resolve(credentialRef(this.config.githubWebhookSecretRef))
       )?.value
     }
+  }
 
+  async start(): Promise<void> {
+    await this.initialize()
+    if (!this.client || !this.identity) throw new Error('Gateway identity is unavailable')
     let connectedResolve: (() => void) | undefined
     const connected = new Promise<void>((resolve) => {
       connectedResolve = resolve
@@ -181,13 +186,18 @@ export class Gateway {
     if (authenticated.outcome === 'invalid') return new Response(authenticated.detail, { status: 401 })
     if (authenticated.outcome === 'unavailable') return new Response(authenticated.detail, { status: 503 })
     if (authenticated.outcome === 'ignored') return new Response(authenticated.detail, { status: 202 })
-    const callId = endedCallId(authenticated.payload)
+    return this.dispatchVerified(authenticated.payload, authenticated.source)
+  }
+
+  async dispatchVerified(payload: Record<string, unknown>, source: 'inkbox' | 'github'): Promise<Response> {
+    if (this.closing) return new Response('Gateway is stopping', { status: 503 })
+    const callId = endedCallId(payload)
     if (callId && !(await this.claimCallReconciliation(callId)))
       return new Response('Duplicate', { status: 200 })
     const routed = routeWebhook(
-      authenticated.payload,
+      payload,
       this.state.snapshot().routingKey,
-      authenticated.source !== 'inkbox' || this.config.externalEvents,
+      source !== 'inkbox' || this.config.externalEvents,
     )
     if (routed === undefined) return new Response('Ignored', { status: 202 })
     const accepted = await this.state.mutate((state) => {
@@ -196,7 +206,7 @@ export class Gateway {
       return true
     })
     if (!accepted) return new Response('Duplicate', { status: 200 })
-    this.accept(routed)
+    await this.accept(routed)
     return new Response('Accepted', { status: 202 })
   }
 
@@ -322,6 +332,38 @@ export class Gateway {
     }
   }
 
+  eventState(eventId: string): 'absent' | 'pending' | 'completed' | 'failed' | 'uncertain' {
+    const state = this.state.snapshot()
+    if (state.replied[eventId] !== undefined) return 'completed'
+    for (const [id, delivery] of Object.entries(state.deliveries)) {
+      if (!delivery.eventIds.includes(eventId)) continue
+      if (delivery.state === 'rejected') return 'failed'
+      return delivery.state === 'ready' || this.activeDeliveries.has(id) ? 'pending' : 'uncertain'
+    }
+    for (const queue of this.queues.values()) {
+      if (
+        queue.buffered.some((event) => event.eventId === eventId) ||
+        queue.active?.events.some((event) => event.eventId === eventId)
+      )
+        return 'pending'
+    }
+    return state.seen[eventId] === undefined ? 'absent' : 'uncertain'
+  }
+
+  activity(): { active: number; buffered: number; deliveries: number; interactions: number } {
+    return {
+      active: this.inflight.size,
+      buffered: [...this.queues.values()].reduce((count, queue) => count + queue.buffered.length, 0),
+      deliveries: Object.keys(this.state.snapshot().deliveries).length,
+      interactions: this.pendingHuman.size,
+    }
+  }
+
+  replySource(agent: Agent): RoutedEvent | undefined {
+    const route = this.agents.routeForAgent(agent)
+    return route ? this.queues.get(route)?.active?.events.at(-1) : undefined
+  }
+
   ownsAgent(agent: Agent): boolean {
     return this.agents.routeForAgent(agent) !== undefined
   }
@@ -344,19 +386,22 @@ export class Gateway {
     await this.writeStatus(false)
   }
 
-  private accept(event: RoutedEvent): void {
+  private async accept(event: RoutedEvent): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
     const pending = this.pendingHuman.get(event.routeKey)
     if (pending !== undefined) {
       this.pendingHuman.delete(event.routeKey)
       clearTimeout(pending.timer)
       pending.resolve(event.replyText.trim())
+      await this.state.mutate((state) => {
+        state.replied[event.eventId] = Date.now()
+      })
       return
     }
     const queue = this.queues.get(event.routeKey) ?? { buffered: [], timer: undefined, active: undefined }
     this.queues.set(event.routeKey, queue)
     if (event.typingConversationId) this.startTyping(event.typingConversationId)
-    if (queue.active !== undefined) {
+    if (queue.active?.phase === 'generating') {
       queue.active.events.push(event)
       queue.active.target = event.target
       const task = this.agents
@@ -377,19 +422,32 @@ export class Gateway {
   private async runBatch(routeKey: string, queue: Queue): Promise<void> {
     if (this.closing || queue.active !== undefined || queue.buffered.length === 0) return
     const events = queue.buffered.splice(0)
-    const active = { events, target: events.at(-1)?.target ?? { channel: 'none' as const } }
+    const active: NonNullable<Queue['active']> = {
+      events,
+      target: events.at(-1)?.target ?? { channel: 'none' as const },
+      phase: 'generating',
+    }
     queue.active = active
     try {
       const prompt = events.map((event) => renderChannelEvent(event, this.config)).join('\n\n')
       const response = (await this.agents.run(routeKey, prompt)).trim()
       this.stopTypingForEvents(active.events)
-      if (queue.active === active) queue.active = undefined
+      active.phase = 'finishing'
+      const source = active.events.at(-1)
+      const terminal = this.runtime.remoteTools && source ? await replyState(this.runtime, source) : 'none'
+      if (terminal === 'uncertain') return
       const eventIds = active.events.map((event) => event.eventId)
-      if (response && !isSilentResponse(response) && active.target.channel !== 'none') {
+      if (
+        response &&
+        !isSilentResponse(response) &&
+        active.target.channel !== 'none' &&
+        terminal !== 'accepted'
+      ) {
         const deliveryId = eventIds.at(-1)
         if (deliveryId === undefined) throw new Error('Cannot persist a delivery without an event')
         await this.state.mutate((state) => {
           state.deliveries[deliveryId] = {
+            state: 'ready',
             eventIds,
             target: active.target,
             response,
@@ -485,7 +543,7 @@ export class Gateway {
     for (const conversationId of this.typingPulses.keys()) this.stopTyping(conversationId)
   }
 
-  private resumeDeliveries(): void {
+  resumeDeliveries(): void {
     for (const [deliveryId, pending] of Object.entries(this.state.snapshot().deliveries)) {
       this.scheduleDelivery(deliveryId, Math.max(0, pending.nextAttemptAt - Date.now()))
     }
@@ -504,9 +562,13 @@ export class Gateway {
   private async attemptDelivery(deliveryId: string): Promise<void> {
     if (this.closing || this.activeDeliveries.has(deliveryId)) return
     const pending = this.state.snapshot().deliveries[deliveryId]
-    if (pending === undefined) return
+    if (pending === undefined || pending.state !== 'ready') return
     this.activeDeliveries.add(deliveryId)
     try {
+      await this.state.mutate((state) => {
+        const current = state.deliveries[deliveryId]
+        if (current) current.state = 'submitted'
+      })
       await this.deliver(pending.target, pending.response)
       await this.state.mutate((state) => {
         const current = state.deliveries[deliveryId]
@@ -516,11 +578,23 @@ export class Gateway {
         delete state.deliveries[deliveryId]
       })
     } catch (error) {
-      this.log.warn('[inkbox] delivery failed; retry scheduled', error)
+      const retryable = error instanceof InkboxAPIError && error.statusCode === 429
+      const rejected =
+        error instanceof InkboxAPIError &&
+        error.statusCode >= 400 &&
+        error.statusCode < 500 &&
+        ![408, 409].includes(error.statusCode)
+      this.log.warn(
+        retryable
+          ? '[inkbox] delivery rejected; retry scheduled'
+          : '[inkbox] delivery outcome requires attention',
+      )
       const next = await this.state.mutate((state) => {
         const current = state.deliveries[deliveryId]
         if (current === undefined) return undefined
+        current.state = retryable ? 'ready' : rejected ? 'rejected' : 'uncertain'
         current.attempts += 1
+        if (!retryable) return undefined
         current.nextAttemptAt = Date.now() + deliveryRetryDelay(current.attempts)
         return current.nextAttemptAt
       })

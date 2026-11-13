@@ -96,11 +96,23 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
         env: { ...process.env, DSH_HOME: paths.dshHome },
       })
     }
-    await run(paths.dshBin, ['plugin', '--profile', PROFILE_NAME, 'add', '--force', pluginSpec], {
-      cwd: workspace,
-      env: { ...process.env, DSH_HOME: paths.dshHome },
-      stdio: 'inherit',
-    })
+    await run(
+      paths.dshBin,
+      [
+        'plugin',
+        '--profile',
+        PROFILE_NAME,
+        'add',
+        '--force',
+        pluginSpec,
+        '@deepseek-ai/cordis-plugin-hmr@1.0.16',
+      ],
+      {
+        cwd: workspace,
+        env: { ...process.env, DSH_HOME: paths.dshHome },
+        stdio: 'inherit',
+      },
+    )
     const launcher = await installLauncher(paths)
     if (!launcher.installed) {
       process.stdout.write(`CLI launcher not installed at ${launcher.path}: ${launcher.reason}.\n`)

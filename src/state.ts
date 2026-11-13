@@ -10,6 +10,7 @@ export interface RouteRecord {
 }
 
 export interface PendingDelivery {
+  state?: 'ready' | 'submitted' | 'uncertain' | 'rejected'
   eventIds: string[]
   target: ReplyTarget
   response: string

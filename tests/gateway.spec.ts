@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
+import { type AgentIdentity, type Inkbox, InkboxAPIError } from '@inkbox/sdk'
 import type { TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ResolvedConfig } from '../src/config.js'
@@ -36,7 +36,8 @@ const liveCall = vi.hoisted(() => ({
   }),
 }))
 
-vi.mock('@inkbox/sdk', () => ({
+vi.mock('@inkbox/sdk', async (original) => ({
+  ...(await original<typeof import('@inkbox/sdk')>()),
   verifyWebhook: vi.fn(() => tunnel.verify),
 }))
 
@@ -512,8 +513,11 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.handleRequest(email('event-after-1', 'First'))
     await vi.waitFor(() => expect(releaseDelivery).toBeTypeOf('function'))
     await gateway.handleRequest(email('event-after-2', 'Second'))
-    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+    expect(run).toHaveBeenCalledTimes(1)
+    expect(gateway.eventState('event-after-1')).toBe('pending')
+    expect(gateway.eventState('event-after-2')).toBe('pending')
     releaseDelivery?.()
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
     await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(2))
     await vi.waitFor(() =>
       expect(gateway.state.snapshot().replied).toMatchObject({
@@ -562,7 +566,7 @@ describe('gateway lifecycle and delivery', () => {
   it('persists a failed delivery and retries without rerunning the agent', async () => {
     const { gateway, identity } = await harness()
     const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('Retry this response')
-    identity.sendEmail.mockRejectedValueOnce(new Error('temporary delivery failure'))
+    identity.sendEmail.mockRejectedValueOnce(new InkboxAPIError(429, 'Synthetic rate limit'))
     await gateway.handleRequest(email('event-9'))
     await vi.waitFor(() => expect(gateway.state.snapshot().deliveries['event-9']).toBeDefined())
     expect(gateway.state.snapshot().replied['event-9']).toBeUndefined()
@@ -572,4 +576,33 @@ describe('gateway lifecycle and delivery', () => {
     expect(run).toHaveBeenCalledOnce()
     await gateway.close()
   })
+})
+
+it('retains uncertain delivery and per-event ownership after a lost response', async () => {
+  const { gateway, identity } = await harness()
+  vi.spyOn(gateway.agents, 'run').mockResolvedValue('Synthetic final reply')
+  identity.sendEmail.mockRejectedValueOnce(new Error('Synthetic lost response'))
+  await gateway.handleRequest(email('uncertain-event'))
+  expect(gateway.eventState('uncertain-event')).toBe('pending')
+  await vi.waitFor(() => expect(gateway.eventState('uncertain-event')).toBe('uncertain'))
+  expect(gateway.state.snapshot().replied['uncertain-event']).toBeUndefined()
+  gateway.resumeDeliveries()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(identity.sendEmail).toHaveBeenCalledOnce()
+  expect(gateway.activity().deliveries).toBe(1)
+  await gateway.close()
+})
+
+it('distinguishes accepted, completed and lost native event ownership', async () => {
+  const { gateway } = await harness(50)
+  vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+  expect(gateway.eventState('event-state')).toBe('absent')
+  await gateway.handleRequest(email('event-state'))
+  expect(gateway.eventState('event-state')).toBe('pending')
+  await vi.waitFor(() => expect(gateway.eventState('event-state')).toBe('completed'))
+  await gateway.state.mutate((state) => {
+    state.seen.lost = Date.now()
+  })
+  expect(gateway.eventState('lost')).toBe('uncertain')
+  await gateway.close()
 })
