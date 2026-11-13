@@ -55,7 +55,7 @@ it('reconciles the same terminal operation and keeps unrelated sources independe
     if (calls.length === 1) throw new Error('Synthetic lost response')
     return {
       content: [],
-      structuredContent: { id: 'accepted', direction: 'outbound', remote_phone_number: '+15550000001' },
+      structuredContent: { message_id: 'accepted', delivery_status: 'sent', recipients: ['+15550000001'] },
     }
   }
   await expect(terminalReply(remote, runtime, event, 'Finished', () => {}, execute)).rejects.toThrow(
@@ -86,9 +86,39 @@ it('permits a different operation after rejection before execution', async () =>
     submit()
     return {
       content: [],
-      structuredContent: { id: 'accepted', direction: 'outbound', remote_phone_number: '+15550000001' },
+      structuredContent: { message_id: 'accepted', delivery_status: 'sent', recipients: ['+15550000001'] },
     }
   }
   await terminalReply(remote, runtime, event, 'Second', () => {}, accepted)
   expect(await replyState(runtime, event)).toBe('accepted')
+})
+
+it.each([
+  { delivery_status: 'blocked_spam_filter' },
+  { delivery_status: 'sending_failed' },
+  { message_id: '' },
+  { recipients: ['+15550000002'] },
+  { error: 'synthetic_failure' },
+])('requires canonical accepted SMS receipt %j', async (changes) => {
+  const { remote, runtime, event } = await setup()
+  const execute = async (
+    _name: string,
+    _args: Record<string, unknown>,
+    _operation: string,
+    _path: string,
+    submit: () => void | Promise<void>,
+  ): Promise<RemoteToolResult> => {
+    await submit()
+    return {
+      content: [],
+      structuredContent: {
+        message_id: 'accepted',
+        recipients: ['+15550000001'],
+        delivery_status: 'queued',
+        ...changes,
+      },
+    }
+  }
+  await expect(terminalReply(remote, runtime, event, 'Finished', () => {}, execute)).rejects.toThrow()
+  expect(await replyState(runtime, event)).toBe('uncertain')
 })

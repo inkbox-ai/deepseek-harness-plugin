@@ -106,28 +106,26 @@ export async function terminalReply(
       return result
     }
     const receipt = result.structuredContent
-    if (
-      !receipt ||
-      typeof receipt.id !== 'string' ||
-      receipt.direction !== 'outbound' ||
-      receipt.is_blocked === true
-    )
+    if (!receipt) throw new Error('The terminal reply outcome is unconfirmed')
+    const email = event.channel === 'email'
+    const acceptedId = email ? receipt.id : receipt.message_id
+    const accepted = email
+      ? receipt.direction === 'outbound' && receipt.is_blocked !== true
+      : ['queued', 'sent', 'delivered'].includes(String(receipt.delivery_status)) && !receipt.error
+    if (!accepted || typeof acceptedId !== 'string' || !acceptedId)
       throw new Error('The terminal reply outcome is unconfirmed')
-    const equal = (a: unknown, b: string[], email = false) =>
-      Array.isArray(a) &&
-      JSON.stringify([...new Set(a.map((value) => (email ? String(value).toLowerCase() : value)))].sort()) ===
-        JSON.stringify([...new Set(b.map((value) => (email ? value.toLowerCase() : value)))].sort())
-    const actual =
-      Array.isArray(receipt.recipients) && receipt.recipients.length
-        ? receipt.recipients.map((item) => (item as Record<string, unknown>).recipient_phone_number)
-        : [receipt.remote_phone_number]
+    const equal = (actual: unknown, expected: string[], email = false) =>
+      Array.isArray(actual) &&
+      actual.every((value) => typeof value === 'string') &&
+      JSON.stringify([...new Set(actual.map((value) => (email ? value.toLowerCase() : value)))].sort()) ===
+        JSON.stringify([...new Set(expected.map((value) => (email ? value.toLowerCase() : value)))].sort())
     if (
-      event.channel === 'email'
+      email
         ? !equal(receipt.to_addresses, to, true) || !equal(receipt.cc_addresses ?? [], cc, true)
-        : !equal(actual, to)
+        : !equal(receipt.recipients, to)
     )
       throw new Error('The terminal reply destination is unconfirmed')
-    journal.accept(source, operation, receipt.id)
+    journal.accept(source, operation, acceptedId)
     return result
   } catch (error) {
     const current = journal.lookup(source)
