@@ -25,6 +25,7 @@ supported on Linux and macOS.
 
 - **An installed DeepSeek Harness `0.1.1-rc.2`.** The `dsh` command must be on `PATH`. Install the currently
   supported Harness version with `npm install --global @deepseek-ai/dsh@0.1.1-rc.2`.
+  Setup also installs the compatible HMR package in the Inkbox profile; existing profiles should rerun setup when upgrading.
 - **A configured DeepSeek Harness.** `DEEPSEEK_API_KEY` can already be stored in the Harness home, inherited
   from the environment, or set in `~/.env`.
 - **Node.js 22.19 or newer and `pnpm`.** The existing Harness uses `pnpm` to install the Inkbox bundle into
