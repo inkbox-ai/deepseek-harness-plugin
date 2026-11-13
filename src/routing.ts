@@ -10,6 +10,9 @@ export type ReplyTarget =
 
 export interface RoutedEvent {
   eventId: string
+  messageId?: string
+  sender?: string
+  group?: boolean
   routeKey: string
   channel: Channel
   context: string
@@ -76,6 +79,8 @@ export function routeWebhook(
     const marker = `[inkbox:email from=${from} thread_id=${text(message.thread_id) ?? 'unknown'}]`
     return {
       eventId,
+      ...(text(message.id) ? { messageId: text(message.id)! } : {}),
+      sender: from,
       routeKey: contactRoute(data, from, routingKey),
       channel: 'email',
       context: marker,
@@ -101,6 +106,9 @@ export function routeWebhook(
       isGroup && conversationId ? `group:sms:${conversationId}` : contactRoute(data, sender, routingKey)
     return {
       eventId,
+      ...(text(message.id) ? { messageId: text(message.id)! } : {}),
+      sender,
+      group: isGroup,
       routeKey,
       channel: 'sms',
       context: `[inkbox:${isGroup ? 'group_sms' : 'sms'} from=${sender} conversation_id=${conversationId ?? 'unknown'}]`,

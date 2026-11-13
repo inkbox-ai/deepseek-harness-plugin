@@ -4,13 +4,16 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@inkbox/sdk': github:inkbox-ai/inkbox#5ebde74b33bd560e9c9818f675ff0c5c6f1cb962&path:/sdk/typescript
+
 importers:
 
   .:
     dependencies:
       '@inkbox/sdk':
-        specifier: 0.6.4
-        version: 0.6.4
+        specifier: github:inkbox-ai/inkbox#5ebde74b33bd560e9c9818f675ff0c5c6f1cb962&path:/sdk/typescript
+        version: https://codeload.github.com/inkbox-ai/inkbox/tar.gz/5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#path:/sdk/typescript
       commander:
         specifier: ^15.0.0
         version: 15.0.0
@@ -456,8 +459,9 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@inkbox/sdk@0.6.4':
-    resolution: {integrity: sha512-+0XrMfr2qt2dQ0NMqlumhCtG8CJsqmesAvR29Btl3fQKeSH3l9kDJ2KMcIEpNtHtziJuZCjFIql3J0i/frIJpQ==}
+  '@inkbox/sdk@https://codeload.github.com/inkbox-ai/inkbox/tar.gz/5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#path:/sdk/typescript':
+    resolution: {path: /sdk/typescript, tarball: https://codeload.github.com/inkbox-ai/inkbox/tar.gz/5ebde74b33bd560e9c9818f675ff0c5c6f1cb962}
+    version: 0.7.38
     engines: {node: '>=22'}
 
   '@jridgewell/sourcemap-codec@1.5.5':
@@ -691,6 +695,9 @@ packages:
   '@vitest/utils@3.2.7':
     resolution: {integrity: sha512-x6BDOd7dyo3PFLY3I9/HJ25X/6OurhGXk2/B9gOZNPF7XDVjeBK4k01lQE5uvDpbuheErh91qYuE1E2OEjK3Rw==}
 
+  ajv@8.20.0:
+    resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
+
   asn1js@3.0.10:
     resolution: {integrity: sha512-S2s3aOytiKdFRdulw2qPE51MzjzVOisppcVv7jVFR+Kw0kxwvFrDcYA0h7Ndqbmj0HkMIXYWaoj7fli8kgx1eg==}
     engines: {node: '>=12.0.0'}
@@ -747,6 +754,12 @@ packages:
     resolution: {integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==}
     engines: {node: '>=12.0.0'}
 
+  fast-deep-equal@3.1.3:
+    resolution: {integrity: sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==}
+
+  fast-uri@3.1.9:
+    resolution: {integrity: sha512-hS/0Wt3Ya043oKXs0sIxrMpKQITXhMLIrVAKKXi4gozGC9v7YRWVnXIZzjNPTO02M9BdxLCWqK1yRXgNziVyJQ==}
+
   fdir@6.5.0:
     resolution: {integrity: sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==}
     engines: {node: '>=12.0.0'}
@@ -769,6 +782,9 @@ packages:
 
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
+
+  json-schema-traverse@1.0.0:
+    resolution: {integrity: sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug==}
 
   loupe@3.2.1:
     resolution: {integrity: sha512-CdzqowRJCeLU72bHvWqwRBBlLcMEtIvGrlvef74kMnV2AolS9Y8xUv1I0U/MNAWMhBlKIoyuEgoJ0t/bbwHbLQ==}
@@ -818,6 +834,10 @@ packages:
 
   reflect-metadata@0.2.2:
     resolution: {integrity: sha512-urBwgfrvVP/eAyXx4hluJivBKzuEbSQs9rKWCrCkbSxNv8mxPcUZKeuoF3Uy4mJl3Lwprp6yy5/39VWigZ4K6Q==}
+
+  require-from-string@2.0.2:
+    resolution: {integrity: sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw==}
+    engines: {node: '>=0.10.0'}
 
   retry@0.12.0:
     resolution: {integrity: sha512-9LkiTwjUh6rT555DtE9rTX+BKByPfrMzEAtnlEtdEwr3Nkffwiihqe2bWADg+OQRjt9gl6ICdmB/ZFDCGAtSow==}
@@ -1235,9 +1255,10 @@ snapshots:
   '@esbuild/win32-x64@0.28.2':
     optional: true
 
-  '@inkbox/sdk@0.6.4':
+  '@inkbox/sdk@https://codeload.github.com/inkbox-ai/inkbox/tar.gz/5ebde74b33bd560e9c9818f675ff0c5c6f1cb962#path:/sdk/typescript':
     dependencies:
       '@peculiar/x509': 2.0.0
+      ajv: 8.20.0
       hash-wasm: 4.12.0
       reflect-metadata: 0.2.2
       undici: 7.29.0
@@ -1478,6 +1499,13 @@ snapshots:
       loupe: 3.2.1
       tinyrainbow: 2.0.0
 
+  ajv@8.20.0:
+    dependencies:
+      fast-deep-equal: 3.1.3
+      fast-uri: 3.1.9
+      json-schema-traverse: 1.0.0
+      require-from-string: 2.0.2
+
   asn1js@3.0.10:
     dependencies:
       pvtsutils: 1.3.6
@@ -1545,6 +1573,10 @@ snapshots:
 
   expect-type@1.4.0: {}
 
+  fast-deep-equal@3.1.3: {}
+
+  fast-uri@3.1.9: {}
+
   fdir@6.5.0(picomatch@4.0.7):
     optionalDependencies:
       picomatch: 4.0.7
@@ -1557,6 +1589,8 @@ snapshots:
   hash-wasm@4.12.0: {}
 
   js-tokens@9.0.1: {}
+
+  json-schema-traverse@1.0.0: {}
 
   loupe@3.2.1: {}
 
@@ -1597,6 +1631,8 @@ snapshots:
   qrcode-terminal@0.12.0: {}
 
   reflect-metadata@0.2.2: {}
+
+  require-from-string@2.0.2: {}
 
   retry@0.12.0: {}
 

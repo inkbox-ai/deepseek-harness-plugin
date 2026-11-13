@@ -5,8 +5,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { type AgentIdentity, CallMode, type CallOrigin, Inkbox, type VoicemailDetection } from '@inkbox/sdk'
 import type { ResolvedConfig } from './config.js'
+import type { RemoteTools } from './remote-tools.js'
 
 export class InkboxRuntime {
+  remoteTools?: RemoteTools
+
   constructor(
     private readonly ctx: Context,
     readonly config: ResolvedConfig,

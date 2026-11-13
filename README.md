@@ -106,6 +106,17 @@ inkbox-deepseek run
 Keep the foreground process running. The gateway opens the agent tunnel, reconciles channel subscriptions,
 and routes inbound email, SMS, iMessage, calls, and A2A events into persistent DeepSeek Harness sessions.
 
+## Remote tools
+
+Claimed identities discover the current Inkbox MCP catalog at the start of each native turn.
+Use `inkbox_remote_tools` to read full schemas and `inkbox_remote_call` to execute a discovered tool.
+Catalog changes do not require a plugin update. Native approval still applies to interactive turns;
+verified incoming communication uses its own delivery context.
+
+`inkbox_reply_current` sends a final reply to the admitted email or direct SMS and prevents a second
+automatic reply. Unconfirmed sends remain uncertain instead of being sent again automatically.
+See [remote tool behavior](REMOTE_TOOLS.md) for retained local capabilities and recovery details.
+
 ## Setup Wizard
 
 `inkbox-deepseek setup` walks through the complete Inkbox configuration:
