@@ -229,6 +229,15 @@ export class RemoteTools {
     }
   }
 
+  readOnly(agent: Agent, name: string): boolean | undefined {
+    const turn = this.turns.get(agent)
+    if (!turn || turn.signal.aborted) return undefined
+    const annotations = turn.catalog.find((tool) => tool.name === name)?.annotations as
+      | Record<string, unknown>
+      | undefined
+    return typeof annotations?.readOnlyHint === 'boolean' ? annotations.readOnlyHint : undefined
+  }
+
   close(): void {
     for (const dispose of this.dispose.splice(0).reverse()) dispose()
   }
