@@ -2,13 +2,14 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RemoteMcp, type RemoteToolResult } from '@inkbox/sdk/remote-mcp'
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import type { RoutedEvent } from '../src/routing.js'
 import type { InkboxRuntime } from '../src/runtime.js'
 import { replyState, terminalReply } from '../src/terminal-reply.js'
 
 const roots: string[] = []
 afterEach(async () => {
+  vi.unstubAllGlobals()
   await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
@@ -121,4 +122,57 @@ it.each([
   }
   await expect(terminalReply(remote, runtime, event, 'Finished', () => {}, execute)).rejects.toThrow()
   expect(await replyState(runtime, event)).toBe('uncertain')
+})
+
+it('submits terminal SMS through the real SDK schema and durable continuation', async () => {
+  const { remote, runtime, event } = await setup()
+  const calls: Record<string, unknown>[] = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_url, options) => {
+      const request = JSON.parse(options.body)
+      let result: unknown
+      if (request.method === 'server/discover') result = { supportedVersions: ['2026-07-28'] }
+      else if (request.method === 'tools/list')
+        result = {
+          tools: [
+            {
+              name: 'inkbox_text_send',
+              inputSchema: {
+                type: 'object',
+                properties: { to: { type: 'array' }, text: { type: 'string' } },
+                required: ['to', 'text'],
+                additionalProperties: false,
+              },
+            },
+          ],
+        }
+      else {
+        calls.push(request.params)
+        result = request.params.requestState
+          ? {
+              content: [],
+              structuredContent: {
+                message_id: 'accepted',
+                recipients: ['+15550000001'],
+                delivery_status: 'queued',
+              },
+            }
+          : { resultType: 'input_required', requestState: 'prepared' }
+      }
+      return Response.json({ jsonrpc: '2.0', id: request.id, result })
+    }),
+  )
+  await remote.refresh()
+  const execute = (
+    name: string,
+    args: Record<string, unknown>,
+    operation: string,
+    path: string,
+    submit: () => void | Promise<void>,
+  ) => remote.call(name, args, { callIdentity: operation, journalPath: path, beforeSubmit: submit })
+  await terminalReply(remote, runtime, event, 'Done', () => {}, execute)
+  expect(calls).toHaveLength(2)
+  expect(calls[0]?.arguments).toEqual({ to: ['+15550000001'], text: 'Done' })
+  expect(calls[1]?.requestState).toBe('prepared')
 })

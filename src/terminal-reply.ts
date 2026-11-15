@@ -96,6 +96,8 @@ export async function terminalReply(
   }
   validate()
   journal.reserve(source, operation, hash([name, args]))
+  // Preserve existing receipt fingerprints; execution identity travels separately.
+  delete args.idempotency_key
   try {
     const result = await call(name, args, operation, path, () => {
       validate()

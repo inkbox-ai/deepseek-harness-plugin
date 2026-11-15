@@ -183,24 +183,19 @@ describe('native remote tool relay', () => {
     h.remote.close()
   })
 
-  it('keeps labeled contact fields and stable idempotency', () => {
+  it('keeps labeled contact fields without execution metadata', () => {
     expect(
-      contactArguments(
-        'inkbox_update_contact',
-        {
-          contactId: 'contact',
-          givenName: 'Example',
-          phones: [{ value: '+15550000001', label: 'work', isPrimary: true }],
-        },
-        'operation',
-      ),
+      contactArguments('inkbox_update_contact', {
+        contactId: 'contact',
+        givenName: 'Example',
+        phones: [{ value: '+15550000001', label: 'work', isPrimary: true }],
+      }),
     ).toEqual({
       contact_id: 'contact',
       patch: {
         given_name: 'Example',
         phones: [{ value_e164: '+15550000001', label: 'work', is_primary: true }],
       },
-      idempotency_key: 'operation',
     })
   })
 })

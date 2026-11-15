@@ -222,10 +222,9 @@ export class RemoteTools {
     if (!names[name]) return { handled: false }
     const turn = this.current(exec)
     if (turn.held) return { handled: false }
-    const operation = hash([exec.agent?.session.id, turn.number, exec.callId])
     return {
       handled: true,
-      value: await this.call(names[name], contactArguments(name, args, operation), exec),
+      value: await this.call(names[name], contactArguments(name, args), exec),
     }
   }
 
@@ -243,16 +242,11 @@ export class RemoteTools {
   }
 }
 
-export function contactArguments(
-  name: string,
-  args: Record<string, unknown>,
-  operation: string,
-): Record<string, unknown> {
+export function contactArguments(name: string, args: Record<string, unknown>): Record<string, unknown> {
   const snake = (key: string) => key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)
   const values = Object.fromEntries(Object.entries(args).map(([key, value]) => [snake(key), value]))
   if (name === 'inkbox_lookup_contact' && Object.values(values).filter(Boolean).length !== 1)
     throw new Error('Specify one contact lookup criterion')
-  if (name === 'inkbox_delete_contact') return { ...values, idempotency_key: operation }
   if (name !== 'inkbox_create_contact' && name !== 'inkbox_update_contact') return values
   const { contact_id, ...fields } = values
   for (const key of ['emails', 'phones']) {
@@ -269,6 +263,5 @@ export function contactArguments(
   }
   return {
     ...(name === 'inkbox_create_contact' ? { contact: fields } : { contact_id, patch: fields }),
-    idempotency_key: operation,
   }
 }
