@@ -317,3 +317,15 @@ active owner; use a separate identity when testing another host concurrently.
 ## License
 
 MIT
+
+### Managed diagnostics
+
+When `INKBOX_HOSTED_MODE=1`, doctor reads the secret-free report named by
+`INKBOX_DIAGNOSTICS_FILE`. Reports must match the identity and harness, belong to
+this user, have private file permissions, and be no more than 60 seconds old.
+Missing, stale, or unhealthy reports do not establish readiness. With
+`INKBOX_DIAGNOSTIC_CONTEXT=terminal`, the signing key is checked in the runtime
+report; the key itself is not needed in the terminal. Runtime processes still
+require their own signing key. Managed delivery does not require ordinary webhook
+subscriptions. Standalone diagnostics are unchanged. These checks do not send
+messages or prove end-to-end delivery.
