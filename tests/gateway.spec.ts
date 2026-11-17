@@ -589,7 +589,8 @@ it('retains uncertain delivery and per-event ownership after a lost response', a
   gateway.resumeDeliveries()
   await new Promise((resolve) => setTimeout(resolve, 50))
   expect(identity.sendEmail).toHaveBeenCalledOnce()
-  expect(gateway.activity().deliveries).toBe(1)
+  expect(gateway.activity().deliveries).toBe(0)
+  expect(gateway.activity().uncertain).toBe(1)
   await gateway.close()
 })
 
@@ -604,5 +605,37 @@ it('distinguishes accepted, completed and lost native event ownership', async ()
     state.seen.lost = Date.now()
   })
   expect(gateway.eventState('lost')).toBe('uncertain')
+  await gateway.close()
+})
+
+it('does not count rejected replies as running work', async () => {
+  const { gateway } = await harness()
+  await gateway.state.mutate((state) => {
+    state.deliveries.rejected = {
+      state: 'rejected',
+      eventIds: ['rejected'],
+      target: { channel: 'none' },
+      response: '',
+      attempts: 1,
+      nextAttemptAt: 0,
+    }
+  })
+  expect(gateway.eventState('rejected')).toBe('failed')
+  expect(gateway.activity()).toMatchObject({ deliveries: 0, uncertain: 0 })
+  await gateway.close()
+})
+
+it('quarantines lost replies without retrying them', async () => {
+  const { gateway, identity } = await harness()
+  vi.spyOn(gateway.agents, 'run').mockResolvedValue('Synthetic final reply')
+  identity.sendEmail.mockRejectedValueOnce(new Error('Synthetic lost response'))
+  await gateway.handleRequest(email('quarantine-event'))
+  await vi.waitFor(() => expect(gateway.eventState('quarantine-event')).toBe('uncertain'))
+  await gateway.quarantineDelivery('quarantine-event')
+  expect(gateway.eventState('quarantine-event')).toBe('failed')
+  expect(gateway.activity()).toMatchObject({ deliveries: 0, uncertain: 0 })
+  gateway.resumeDeliveries()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(identity.sendEmail).toHaveBeenCalledOnce()
   await gateway.close()
 })

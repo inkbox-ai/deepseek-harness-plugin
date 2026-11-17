@@ -4,6 +4,8 @@
 
 ### Changed
 - Require Inkbox SDK 0.7.39 for durable messaging and remote tool handling.
+- Count pending reply deliveries separately from retained uncertain outcomes.
+- Report the current package version in the CLI.
 
 ## 0.2.3
 

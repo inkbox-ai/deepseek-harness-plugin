@@ -337,7 +337,7 @@ export class Gateway {
     if (state.replied[eventId] !== undefined) return 'completed'
     for (const [id, delivery] of Object.entries(state.deliveries)) {
       if (!delivery.eventIds.includes(eventId)) continue
-      if (delivery.state === 'rejected') return 'failed'
+      if (delivery.state === 'rejected' || delivery.state === 'quarantined') return 'failed'
       return delivery.state === 'ready' || this.activeDeliveries.has(id) ? 'pending' : 'uncertain'
     }
     for (const queue of this.queues.values()) {
@@ -350,11 +350,42 @@ export class Gateway {
     return state.seen[eventId] === undefined ? 'absent' : 'uncertain'
   }
 
-  activity(): { active: number; buffered: number; deliveries: number; interactions: number } {
+  async quarantineDelivery(eventId: string): Promise<void> {
+    if (
+      [...this.queues.values()].some(
+        (queue) =>
+          queue.active?.events.some((event) => event.eventId === eventId) ||
+          queue.buffered.some((event) => event.eventId === eventId),
+      )
+    )
+      throw new Error('Delivery still has active work')
+    await this.state.mutate((state) => {
+      for (const [id, delivery] of Object.entries(state.deliveries)) {
+        if (!delivery.eventIds.includes(eventId)) continue
+        if (this.activeDeliveries.has(id) || delivery.state === 'ready')
+          throw new Error('Delivery still has active work')
+        delivery.state = 'quarantined'
+      }
+    })
+  }
+
+  activity(): {
+    active: number
+    buffered: number
+    deliveries: number
+    uncertain: number
+    interactions: number
+  } {
+    const deliveries = Object.entries(this.state.snapshot().deliveries)
     return {
       active: this.inflight.size,
       buffered: [...this.queues.values()].reduce((count, queue) => count + queue.buffered.length, 0),
-      deliveries: Object.keys(this.state.snapshot().deliveries).length,
+      deliveries: deliveries.filter(([id, item]) => item.state === 'ready' || this.activeDeliveries.has(id))
+        .length,
+      uncertain: deliveries.filter(
+        ([id, item]) =>
+          !['ready', 'rejected', 'quarantined'].includes(item.state ?? '') && !this.activeDeliveries.has(id),
+      ).length,
       interactions: this.pendingHuman.size,
     }
   }
