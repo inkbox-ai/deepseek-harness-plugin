@@ -1,6 +1,6 @@
 {
   "name": "@inkbox/deepseek-harness-plugin",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Give DeepSeek Harness agents persistent email, SMS, iMessage, voice, contacts, and agent-to-agent communication.",
   "license": "MIT",
   "packageManager": "pnpm@10.28.0",
@@ -72,7 +72,7 @@
     "agent"
   ],
   "dependencies": {
-    "@inkbox/sdk": ">=0.7.38 <1.0.0",
+    "@inkbox/sdk": ">=0.7.39 <1.0.0",
     "commander": "^15.0.0",
     "dotenv": "^17.2.3",
     "proper-lockfile": "^4.1.2",
@@ -115,7 +115,7 @@
   },
   "pnpm": {
     "overrides": {
-      "@inkbox/sdk": "github:inkbox-ai/inkbox#b465550e4563ae3b75443ab44d269d15a6238132&path:/sdk/typescript"
+      "@inkbox/sdk": "github:inkbox-ai/inkbox#84386f5ea022a9594fb901894f927ee444c2cf91&path:/sdk/typescript"
     }
   }
 }
