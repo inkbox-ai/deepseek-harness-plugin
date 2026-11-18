@@ -25,6 +25,7 @@ supported on Linux and macOS.
 
 - **An installed DeepSeek Harness `0.1.1-rc.2`.** The `dsh` command must be on `PATH`. Install the currently
   supported Harness version with `npm install --global @deepseek-ai/dsh@0.1.1-rc.2`.
+  Setup also installs the compatible HMR package in the Inkbox profile; existing profiles should rerun setup when upgrading.
 - **A configured DeepSeek Harness.** `DEEPSEEK_API_KEY` can already be stored in the Harness home, inherited
   from the environment, or set in `~/.env`.
 - **Node.js 22.19 or newer and `pnpm`.** The existing Harness uses `pnpm` to install the Inkbox bundle into
@@ -105,6 +106,17 @@ inkbox-deepseek run
 
 Keep the foreground process running. The gateway opens the agent tunnel, reconciles channel subscriptions,
 and routes inbound email, SMS, iMessage, calls, and A2A events into persistent DeepSeek Harness sessions.
+
+## Remote tools
+
+Claimed identities discover the current Inkbox MCP catalog at the start of each native turn.
+Use `inkbox_remote_tools` to read full schemas and `inkbox_remote_call` to execute a discovered tool.
+Catalog changes do not require a plugin update. Native approval still applies to interactive turns;
+verified incoming communication uses its own delivery context.
+
+`inkbox_reply_current` sends a final reply to the admitted email or direct SMS and prevents a second
+automatic reply. Unconfirmed sends remain uncertain instead of being sent again automatically.
+See [remote tool behavior](REMOTE_TOOLS.md) for retained local capabilities and recovery details.
 
 ## Setup Wizard
 
@@ -305,3 +317,15 @@ active owner; use a separate identity when testing another host concurrently.
 ## License
 
 MIT
+
+### Managed diagnostics
+
+When `INKBOX_HOSTED_MODE=1`, doctor reads the secret-free report named by
+`INKBOX_DIAGNOSTICS_FILE`. Reports must match the identity and harness, belong to
+this user, have private file permissions, and be no more than 60 seconds old.
+Missing, stale, or unhealthy reports do not establish readiness. With
+`INKBOX_DIAGNOSTIC_CONTEXT=terminal`, the signing key is checked in the runtime
+report; the key itself is not needed in the terminal. Runtime processes still
+require their own signing key. Managed delivery does not require ordinary webhook
+subscriptions. Standalone diagnostics are unchanged. These checks do not send
+messages or prove end-to-end delivery.

@@ -538,6 +538,8 @@ export function registerTools(ctx: Context, runtime: InkboxRuntime): void {
         ...(readNames.has(entry.name) ? { isConcurrencySafe: () => true } : {}),
         async execute(rawArgs, exec) {
           const args = rawArgs as Args
+          const remote = await runtime.remoteTools?.compatibility(entry.name, args, exec)
+          if (remote?.handled) return json(remote.value)
           if (entry.approval !== undefined && !runtime.config.autoApproveInkboxTools)
             await approve(ctx, exec, entry.name, entry.approval(args))
           if (exec.signal.aborted) throw exec.signal.reason ?? new Error('Tool call cancelled')

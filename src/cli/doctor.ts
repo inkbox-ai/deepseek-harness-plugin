@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Inkbox } from '@inkbox/sdk'
+import { hostedDiagnostics } from '../hosted-diagnostics.js'
 import { readYaml } from './files.js'
 import { validateHarness } from './harness.js'
 import type { Paths } from './paths.js'
@@ -14,6 +15,9 @@ export interface Check {
 }
 
 export async function doctor(paths: Paths): Promise<Check[]> {
+  const hosted = hostedDiagnostics(process.env.INKBOX_IDENTITY, 'deepseek', process.env.INKBOX_SIGNING_KEY)
+  if (hosted) return hosted.checks
+
   const checks: Check[] = []
   const add = (name: string, ok: boolean, detail: string) => {
     checks.push({ name, ok, detail })

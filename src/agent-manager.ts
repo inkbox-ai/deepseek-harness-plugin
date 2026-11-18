@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto'
+import { setImmediate } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   type Agent,
@@ -80,7 +81,7 @@ export class AgentManager {
         source: { kind: 'plugin', plugin: 'inkbox' },
       }),
     )
-    await agent.whenIdle()
+    await settleAgent(this.ctx, agent)
     await this.ctx.sessions.flush(agent.session)
     return summarize(agent.session.events, firstSeq)
   }
@@ -133,4 +134,26 @@ export function summarize(events: readonly SessionEvent[], firstSeq: number): st
     if (candidate) text = candidate
   }
   return text
+}
+
+interface OwnerJobs {
+  list(agent: Agent): { id: string; ownerSession?: string; status: string }[]
+  wait(id: string, timeoutMs: number, agent: Agent): Promise<unknown>
+}
+
+export async function settleAgent(ctx: Context, agent: Agent): Promise<void> {
+  const jobs = (ctx as Context & { jobs?: OwnerJobs }).jobs
+  for (;;) {
+    await agent.whenIdle()
+    await setImmediate()
+    await agent.whenIdle()
+    const pending =
+      jobs
+        ?.list(agent)
+        .filter(
+          (job) => job.ownerSession === agent.session.id && ['running', 'stopping'].includes(job.status),
+        ) ?? []
+    if (!pending.length) return
+    await Promise.all(pending.map((job) => jobs!.wait(job.id, 1000, agent)))
+  }
 }

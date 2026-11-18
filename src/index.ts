@@ -11,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-user-questions'
 import type z from '@deepseek-ai/schemastery'
 import { Config, type Config as PluginConfig, resolveConfig } from './config.js'
 import { Gateway } from './gateway.js'
+import { RemoteTools } from './remote-tools.js'
 import { InkboxRuntime } from './runtime.js'
 import { registerSkills } from './skills.js'
 import { registerTools } from './tools.js'
@@ -38,14 +39,25 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<() => P
   })
   const resolved = resolveConfig(scope.get())
   const runtime = new InkboxRuntime(ctx, resolved)
+  const gateway = new Gateway(ctx, runtime, resolved)
+  const remote = new RemoteTools(
+    ctx,
+    runtime,
+    (agent) => gateway.ownsAgent(agent),
+    (agent) => gateway.replySource(agent),
+  )
+  runtime.remoteTools = remote
+  remote.register()
   registerTools(ctx, runtime)
   registerSkills(ctx)
-  if (!resolved.enabled) return async () => {}
-
-  const gateway = new Gateway(ctx, runtime, resolved)
+  if (!resolved.enabled)
+    return async () => {
+      remote.close()
+    }
   try {
     await gateway.start()
   } catch (error) {
+    remote.close()
     await gateway.close().catch(() => {})
     throw error
   }
@@ -61,6 +73,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<() => P
   return async () => {
     disposeApproval()
     disposeQuestions()
+    remote.close()
     await gateway.close()
   }
 }
