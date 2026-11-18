@@ -28,7 +28,7 @@ import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } fro
 import type { InkboxRuntime } from './runtime.js'
 import { StateStore } from './state.js'
 import { replyState } from './terminal-reply.js'
-import { pollVoiceNote, VoiceNoteInbox } from './voice-notes.js'
+import { pollVoiceNote, TRANSCRIPTION_FINISHED, VoiceNoteInbox } from './voice-notes.js'
 import { authenticateWebhook } from './webhook-providers.js'
 
 interface Queue {
@@ -54,23 +54,15 @@ export const IMESSAGE_TYPING_MAX_MS = 600_000
 
 const EVENT_TYPES = {
   email: ['message.received', 'message.sent', 'message.delivered', 'message.bounced', 'message.failed'],
-  sms: [
-    'text.received',
-    'text.transcription_finished',
-    'text.sent',
-    'text.delivered',
-    'text.delivery_failed',
-    'text.delivery_unconfirmed',
-  ],
+  sms: ['text.received', 'text.sent', 'text.delivered', 'text.delivery_failed', 'text.delivery_unconfirmed'],
   imessage: [
     'imessage.received',
-    'imessage.transcription_finished',
     'imessage.reaction_received',
     'imessage.sent',
     'imessage.delivered',
     'imessage.delivery_failed',
   ],
-  whatsapp: ['whatsapp.received', 'whatsapp.transcription_finished'],
+  whatsapp: ['whatsapp.received'],
   call: ['call.ended'],
   a2a: ['a2a.task.created', 'a2a.task.message', 'a2a.task.canceled', 'a2a.sent_task.updated'],
 } as const
@@ -728,17 +720,24 @@ export class Gateway {
       specs.push({ owner: { mailboxId: this.identity.mailbox.id }, events: EVENT_TYPES.email })
     if (this.identity.phoneNumber?.id)
       specs.push({ owner: { phoneNumberId: this.identity.phoneNumber.id }, events: EVENT_TYPES.sms })
+    specs.push({ owner: { agentIdentityId: this.identity.id }, events: [TRANSCRIPTION_FINISHED] })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.imessage })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.whatsapp })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.call })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.a2a })
 
     for (const spec of specs) {
-      const existing = await this.client.webhooks.subscriptions.list({ ...spec.owner, url })
+      const transcription = spec.events.includes(TRANSCRIPTION_FINISHED)
+      const existing = await this.client.webhooks.subscriptions.list({
+        ...spec.owner,
+        url,
+        ...(transcription ? { scope: 'identity' as const } : {}),
+      })
       const match = existing.find((subscription) =>
         subscription.eventTypes.some((event) => spec.events.includes(event)),
       )
       if (match !== undefined) {
+        if (transcription) continue // Preserve other events on a shared receiver.
         const same =
           match.eventTypes.length === spec.events.length &&
           spec.events.every((event) => match.eventTypes.includes(event))

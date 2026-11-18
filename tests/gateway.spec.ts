@@ -253,7 +253,7 @@ describe('gateway lifecycle and delivery', () => {
   it('connects the tunnel and reconciles every configured channel', async () => {
     const { gateway, subscriptions, stateDir } = await harness()
     expect(gateway.status()).toMatchObject({ ready: true, connected: true, identity: 'deepseek-agent' })
-    expect(subscriptions.create).toHaveBeenCalledTimes(6)
+    expect(subscriptions.create).toHaveBeenCalledTimes(7)
     await gateway.close()
     expect(tunnel.aclose).toHaveBeenCalledOnce()
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
@@ -654,19 +654,19 @@ describe('authenticated voice-note dispatch', () => {
     }
     const original = { id: 'received-voice', event_type: 'imessage.received', data: { message } }
     try {
-      for (const family of ['text', 'imessage', 'whatsapp']) {
-        expect(subscriptions.create).toHaveBeenCalledWith(
-          expect.objectContaining({
-            eventTypes: expect.arrayContaining([`${family}.transcription_finished`]),
-          }),
-        )
-      }
+      const completionRows = subscriptions.create.mock.calls.filter(([row]) =>
+        row.eventTypes.includes('message.transcription_finished'),
+      )
+      expect(completionRows).toHaveLength(1)
+      expect(completionRows[0][0].agentIdentityId).toBeTruthy()
       expect((await gateway.dispatchVerified(original, 'inkbox')).status).toBe(202)
       expect(run).not.toHaveBeenCalled()
       const finished = {
         id: 'finished-voice',
-        event_type: 'imessage.transcription_finished',
+        event_type: 'message.transcription_finished',
         data: {
+          channel: 'imessage',
+          message_id: message.id,
           message: {
             ...message,
             media: [
