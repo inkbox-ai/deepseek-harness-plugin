@@ -73,7 +73,7 @@ describe('voice-note delivery', () => {
       await inbox.accept(completion(family))
       await vi.advanceTimersByTimeAsync(0)
       expect(deliver).toHaveBeenCalledTimes(1)
-      const message = deliver.mock.calls[0][0].data[family === 'text' ? 'text_message' : 'message']
+      const message = deliver.mock.calls[0]?.[0].data[family === 'text' ? 'text_message' : 'message']
       expect(message.content).toBe('Original caption')
       expect(voiceNoteContext(message)).toContain('Voice note 1 — transcription')
       expect(message.media[0].url).toBe(
@@ -101,7 +101,7 @@ describe('voice-note delivery', () => {
     await vi.advanceTimersByTimeAsync(1)
     expect(poll).toHaveBeenCalledTimes(1)
     expect(deliver).toHaveBeenCalledTimes(1)
-    expect(voiceNoteContext(deliver.mock.calls[0][0].data.message)).toContain(
+    expect(voiceNoteContext(deliver.mock.calls[0]?.[0].data.message)).toContain(
       'Process the original attachment as usual',
     )
     await inbox.accept(completion())
@@ -112,7 +112,7 @@ describe('voice-note delivery', () => {
     const resolved = setup({ poll: async () => completion() })
     await resolved.inbox.accept(received())
     await vi.advanceTimersByTimeAsync(60_000)
-    expect(resolved.deliver.mock.calls[0][0].data.message.media[0].transcription.status).toBe('completed')
+    expect(resolved.deliver.mock.calls[0]?.[0].data.message.media[0].transcription.status).toBe('completed')
     const hung = setup({ path: join(directory, 'hung.json'), poll: () => new Promise(() => {}) })
     await hung.inbox.accept(received())
     await vi.advanceTimersByTimeAsync(60_000)
@@ -134,7 +134,7 @@ describe('voice-note delivery', () => {
     resolve(received())
     await vi.advanceTimersByTimeAsync(0)
     expect(deliver).toHaveBeenCalledTimes(1)
-    expect(deliver.mock.calls[0][0].data.message.media[0].transcription.status).toBe('completed')
+    expect(deliver.mock.calls[0]?.[0].data.message.media[0].transcription.status).toBe('completed')
   })
   it('waits for every pending attachment and tolerates failed results', async () => {
     const { inbox, deliver } = setup()
@@ -175,7 +175,7 @@ describe('voice-note delivery', () => {
     const current = setup()
     current.deliver.mockRejectedValueOnce(new Error('host unavailable'))
     await current.inbox.accept(received())
-    await inboxes[0].accept(completion())
+    await current.inbox.accept(completion())
     await vi.advanceTimersByTimeAsync(0)
     current.inbox.close()
     const recovered = setup()
@@ -221,7 +221,7 @@ describe('voice-note delivery', () => {
       identity: async () => ({ id: 'agent-1', phoneNumber: { id: 'phone-1' } }),
     })
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(fetch.mock.calls[0][0]).toBe('https://example.com/api/v1/phone/numbers/phone-1/texts/message-1')
+    expect(fetch.mock.calls[0]?.[0]).toBe('https://example.com/api/v1/phone/numbers/phone-1/texts/message-1')
     expect(event?.data.text_message.media[0].transcription.status).toBe('completed')
   })
 })
