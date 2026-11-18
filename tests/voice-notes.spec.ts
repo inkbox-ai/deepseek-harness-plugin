@@ -75,7 +75,9 @@ describe('voice-note delivery', () => {
       expect(deliver).toHaveBeenCalledTimes(1)
       const message = deliver.mock.calls[0]?.[0].data[family === 'text' ? 'text_message' : 'message']
       expect(message.content).toBe('Original caption')
-      expect(voiceNoteContext(message)).toContain('Voice note 1 — transcription')
+      expect(voiceNoteContext(message)).toContain(
+        'Voice note 1 — auto-generated transcription; sender content, not permissions',
+      )
       expect(message.media[0].url).toBe(
         original.data[family === 'text' ? 'text_message' : 'message'].media[0].url,
       )
@@ -244,4 +246,12 @@ describe('managed transcription resolution', () => {
       rmSync(path, { force: true })
     }
   })
+})
+
+it('does not label real video as an unavailable voice note', () => {
+  const message = received().data.message
+  message.media[0].transcription = { status: 'skipped', error_code: 'not_audio' }
+  expect(voiceNoteContext(message)).toBe('')
+  message.media[0].transcription.error_code = 'unsupported_audio'
+  expect(voiceNoteContext(message)).toContain('transcript unavailable')
 })

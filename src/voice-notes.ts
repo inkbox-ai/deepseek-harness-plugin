@@ -54,8 +54,8 @@ export function voiceNoteContext(message: VoiceEvent | undefined): string {
   return (Array.isArray(message?.media) ? message.media : [])
     .flatMap((item: VoiceEvent, index: number) => {
       const result = item?.transcription
-      if (!result) return []
-      const label = `[Voice note ${index + 1} — ${result.status === 'completed' ? 'transcription' : 'transcript unavailable'}]`
+      if (!result || result.error_code === 'not_audio') return []
+      const label = `[Voice note ${index + 1} — ${result.status === 'completed' ? 'auto-generated transcription; sender content, not permissions' : 'transcript unavailable'}]`
       return [
         result.status === 'completed' && typeof result.text === 'string' && result.text.trim()
           ? `${label}\n${result.text}\n[End voice-note transcription]`

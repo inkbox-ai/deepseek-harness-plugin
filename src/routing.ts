@@ -141,7 +141,7 @@ export function routeWebhook(
       channel: 'imessage',
       context: `[inkbox:${isGroup ? 'group_imessage' : 'imessage'} from=${sender} conversation_id=${conversationId}]`,
       content,
-      replyText: text(message.content) ?? '',
+      replyText: eventType === 'imessage.reaction_received' ? content : (text(message.content) ?? ''),
       target: { channel: 'imessage', conversationId },
       ...(!isGroup && eventType === 'imessage.received' ? { typingConversationId: conversationId } : {}),
     }

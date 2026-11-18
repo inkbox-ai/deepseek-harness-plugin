@@ -169,6 +169,7 @@ describe('webhook routing', () => {
     )
     expect(routed?.routeKey).toBe('contact:contact-2')
     expect(routed?.content).toContain('Reaction like')
+    expect(routed?.replyText).toBe('Reaction like to message msg-1')
   })
 
   it('keeps A2A work in its context and suppresses automatic channel replies', () => {

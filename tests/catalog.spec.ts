@@ -1,9 +1,15 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { SKILL_NAMES, TOOL_NAMES } from '../src/constants.js'
+import { PLUGIN_VERSION, SKILL_NAMES, TOOL_NAMES } from '../src/constants.js'
 import { loadPackagedSkills } from '../src/skills.js'
 import { TOOL_CATALOG } from '../src/tools.js'
 
 describe('communication capability catalog', () => {
+  it('reports the same CLI and package version', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    expect(PLUGIN_VERSION).toBe(manifest.version)
+  })
+
   it('registers exactly the 33 social-tier tools', () => {
     expect(TOOL_CATALOG.map((tool) => tool.name)).toEqual([...TOOL_NAMES])
     expect(new Set(TOOL_NAMES).size).toBe(33)
