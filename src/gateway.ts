@@ -463,7 +463,7 @@ export class Gateway {
   private async accept(event: RoutedEvent): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
     const pending = this.pendingHuman.get(event.routeKey)
-    if (pending !== undefined) {
+    if (pending !== undefined && event.replyText.trim()) {
       this.pendingHuman.delete(event.routeKey)
       clearTimeout(pending.timer)
       pending.resolve(event.replyText.trim())

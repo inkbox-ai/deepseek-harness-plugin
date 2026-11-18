@@ -692,3 +692,37 @@ describe('authenticated voice-note dispatch', () => {
     }
   })
 })
+
+it('keeps an attachment-only voice note instead of consuming an empty approval answer', async () => {
+  const { gateway, identity } = await harness(30_000)
+  vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+  await gateway.handleRequest(email('permission-request', 'Initial request'))
+  const approval = gateway.askApproval({} as Agent, 'Send the requested message')
+  let settled = false
+  void approval.then(() => {
+    settled = true
+  })
+  await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledOnce())
+  await gateway.dispatchVerified(
+    {
+      id: 'voice-during-approval',
+      event_type: 'text.received',
+      data: {
+        text_message: {
+          id: 'voice-source',
+          conversation_id: 'sms-voice',
+          sender_phone_number: '+15550001111',
+          text: '',
+          media: [{ id: 'voice-audio', transcription: { status: 'completed', text: 'YES approved' } }],
+        },
+        contacts: [{ id: 'contact-1' }],
+      },
+    },
+    'inkbox',
+  )
+  expect(settled).toBe(false)
+  expect(gateway.eventState('voice-during-approval')).toBe('pending')
+  await gateway.handleRequest(email('typed-approval', 'YES, approved'))
+  await expect(approval).resolves.toBe('allowed-once')
+  await gateway.close()
+})
