@@ -639,3 +639,56 @@ it('quarantines lost replies without retrying them', async () => {
   expect(identity.sendEmail).toHaveBeenCalledOnce()
   await gateway.close()
 })
+
+describe('authenticated voice-note dispatch', () => {
+  it('routes one labeled turn from the original after completion and registers every completion family', async () => {
+    const { gateway, subscriptions } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    const message = {
+      id: 'voice-message',
+      conversation_id: 'imessage-voice',
+      sender_number: '+15555550123',
+      content: 'Original caption',
+      direction: 'inbound',
+      media: [{ id: 'audio-1', transcription: { status: 'pending' } }],
+    }
+    const original = { id: 'received-voice', event_type: 'imessage.received', data: { message } }
+    try {
+      for (const family of ['text', 'imessage', 'whatsapp']) {
+        expect(subscriptions.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            eventTypes: expect.arrayContaining([`${family}.transcription_finished`]),
+          }),
+        )
+      }
+      expect((await gateway.dispatchVerified(original, 'inkbox')).status).toBe(202)
+      expect(run).not.toHaveBeenCalled()
+      const finished = {
+        id: 'finished-voice',
+        event_type: 'imessage.transcription_finished',
+        data: {
+          message: {
+            ...message,
+            media: [
+              {
+                id: 'audio-1',
+                transcription: { status: 'completed', text: 'Move the meeting to Thursday.' },
+              },
+            ],
+          },
+        },
+      }
+      await gateway.dispatchVerified(finished, 'inkbox')
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      expect(run).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('Move the meeting to Thursday.'),
+      )
+      expect(run).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Voice note'))
+      await gateway.dispatchVerified(finished, 'inkbox')
+      expect(run).toHaveBeenCalledTimes(1)
+    } finally {
+      await gateway.close()
+    }
+  })
+})

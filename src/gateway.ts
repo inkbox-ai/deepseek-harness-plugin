@@ -233,9 +233,12 @@ export class Gateway {
     this.voiceNotes = new VoiceNoteInbox({
       path: join(this.config.stateDir, 'voice-notes.json'),
       poll: async (event) => {
-        const credential = await this.ctx.credentials.resolve(credentialRef(this.config.credentialRef))
-        if (!credential || !this.identity) return undefined
-        return pollVoiceNote(event, { apiKey: credential.value, identity: async () => this.identity! })
+        if (!this.client || !this.identity) return undefined
+        return pollVoiceNote(event, {
+          apiKey: this.client._apiKey,
+          baseUrl: this.client._baseUrl,
+          identity: async () => this.identity!,
+        })
       },
       deliver: async (event) => {
         const response = await this.dispatchVerified(event, 'inkbox', true)
