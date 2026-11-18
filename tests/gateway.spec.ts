@@ -657,8 +657,14 @@ describe('authenticated voice-note dispatch', () => {
       const completionRows = subscriptions.create.mock.calls.filter(([row]) =>
         row.eventTypes.includes('message.transcription_finished'),
       )
-      expect(completionRows).toHaveLength(1)
-      expect(completionRows[0][0].agentIdentityId).toBeTruthy()
+      expect(completionRows).toEqual([
+        [
+          expect.objectContaining({
+            agentIdentityId: 'identity-1',
+            eventTypes: ['message.transcription_finished'],
+          }),
+        ],
+      ])
       expect((await gateway.dispatchVerified(original, 'inkbox')).status).toBe(202)
       expect(run).not.toHaveBeenCalled()
       const finished = {
