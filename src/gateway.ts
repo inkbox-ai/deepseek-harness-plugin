@@ -231,7 +231,10 @@ export class Gateway {
   private voiceNoteInbox(): VoiceNoteInbox {
     if (this.voiceNotes) return this.voiceNotes
     this.voiceNotes = new VoiceNoteInbox({
-      path: join(this.config.stateDir, 'voice-notes.json'),
+      path: join(
+        this.config.stateDir,
+        `voice-notes-${encodeURIComponent(this.identity?.id ?? 'uninitialized')}.json`,
+      ),
       poll: async (event) => {
         if (!this.client || !this.identity) return undefined
         return pollVoiceNote(event, {
