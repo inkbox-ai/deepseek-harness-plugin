@@ -1,6 +1,6 @@
 {
   "name": "@inkbox/deepseek-harness-plugin",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Give DeepSeek Harness agents persistent email, SMS, iMessage, voice, contacts, and agent-to-agent communication.",
   "license": "MIT",
   "packageManager": "pnpm@10.28.0",

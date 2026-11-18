@@ -253,7 +253,7 @@ describe('gateway lifecycle and delivery', () => {
   it('connects the tunnel and reconciles every configured channel', async () => {
     const { gateway, subscriptions, stateDir } = await harness()
     expect(gateway.status()).toMatchObject({ ready: true, connected: true, identity: 'deepseek-agent' })
-    expect(subscriptions.create).toHaveBeenCalledTimes(5)
+    expect(subscriptions.create).toHaveBeenCalledTimes(6)
     await gateway.close()
     expect(tunnel.aclose).toHaveBeenCalledOnce()
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({

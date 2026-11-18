@@ -28,6 +28,7 @@ import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } fro
 import type { InkboxRuntime } from './runtime.js'
 import { StateStore } from './state.js'
 import { replyState } from './terminal-reply.js'
+import { pollVoiceNote, VoiceNoteInbox } from './voice-notes.js'
 import { authenticateWebhook } from './webhook-providers.js'
 
 interface Queue {
@@ -53,14 +54,23 @@ export const IMESSAGE_TYPING_MAX_MS = 600_000
 
 const EVENT_TYPES = {
   email: ['message.received', 'message.sent', 'message.delivered', 'message.bounced', 'message.failed'],
-  sms: ['text.received', 'text.sent', 'text.delivered', 'text.delivery_failed', 'text.delivery_unconfirmed'],
+  sms: [
+    'text.received',
+    'text.transcription_finished',
+    'text.sent',
+    'text.delivered',
+    'text.delivery_failed',
+    'text.delivery_unconfirmed',
+  ],
   imessage: [
     'imessage.received',
+    'imessage.transcription_finished',
     'imessage.reaction_received',
     'imessage.sent',
     'imessage.delivered',
     'imessage.delivery_failed',
   ],
+  whatsapp: ['whatsapp.received', 'whatsapp.transcription_finished'],
   call: ['call.ended'],
   a2a: ['a2a.task.created', 'a2a.task.message', 'a2a.task.canceled', 'a2a.sent_task.updated'],
 } as const
@@ -85,6 +95,7 @@ export class Gateway {
   private signingKey: string | undefined
   private githubWebhookSecret: string | undefined
   private closing = false
+  private voiceNotes: VoiceNoteInbox | undefined
   private readonly queues = new Map<string, Queue>()
   private readonly latestTargets = new Map<string, ReplyTarget>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
@@ -162,6 +173,7 @@ export class Gateway {
       )
     }
     this.resumeDeliveries()
+    this.voiceNoteInbox().recover()
     await this.writeStatus(true)
     void this.tunnelTask.catch((error) => {
       if (!this.closing) this.log.error('[inkbox] tunnel stopped unexpectedly', error)
@@ -189,8 +201,14 @@ export class Gateway {
     return this.dispatchVerified(authenticated.payload, authenticated.source)
   }
 
-  async dispatchVerified(payload: Record<string, unknown>, source: 'inkbox' | 'github'): Promise<Response> {
+  async dispatchVerified(
+    payload: Record<string, unknown>,
+    source: 'inkbox' | 'github',
+    resolvedVoiceNote = false,
+  ): Promise<Response> {
     if (this.closing) return new Response('Gateway is stopping', { status: 503 })
+    if (source === 'inkbox' && !resolvedVoiceNote && (await this.voiceNoteInbox().accept(payload)))
+      return new Response('Accepted', { status: 202 })
     const callId = endedCallId(payload)
     if (callId && !(await this.claimCallReconciliation(callId)))
       return new Response('Duplicate', { status: 200 })
@@ -208,6 +226,24 @@ export class Gateway {
     if (!accepted) return new Response('Duplicate', { status: 200 })
     await this.accept(routed)
     return new Response('Accepted', { status: 202 })
+  }
+
+  private voiceNoteInbox(): VoiceNoteInbox {
+    if (this.voiceNotes) return this.voiceNotes
+    this.voiceNotes = new VoiceNoteInbox({
+      path: join(this.config.stateDir, 'voice-notes.json'),
+      poll: async (event) => {
+        const credential = await this.ctx.credentials.resolve(credentialRef(this.config.credentialRef))
+        if (!credential || !this.identity) return undefined
+        return pollVoiceNote(event, { apiKey: credential.value, identity: async () => this.identity! })
+      },
+      deliver: async (event) => {
+        const response = await this.dispatchVerified(event, 'inkbox', true)
+        if (!response.ok) throw new Error('Voice-note delivery was not accepted')
+      },
+      warn: () => this.log.warn('[inkbox] voice-note delivery will retry'),
+    })
+    return this.voiceNotes
   }
 
   async handleWebSocket(ws: InkboxWebSocket): Promise<void> {
@@ -400,6 +436,7 @@ export class Gateway {
   }
 
   async close(): Promise<void> {
+    this.voiceNotes?.close()
     if (this.closing) return
     this.closing = true
     for (const queue of this.queues.values()) if (queue.timer !== undefined) clearTimeout(queue.timer)
@@ -531,6 +568,9 @@ export class Gateway {
         })
         return
       }
+      case 'whatsapp':
+        await identity.sendWhatsApp({ conversationId: target.conversationId, text: response })
+        return
       case 'none':
         return
     }
@@ -683,6 +723,7 @@ export class Gateway {
     if (this.identity.phoneNumber?.id)
       specs.push({ owner: { phoneNumberId: this.identity.phoneNumber.id }, events: EVENT_TYPES.sms })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.imessage })
+    specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.whatsapp })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.call })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.a2a })
 
