@@ -728,27 +728,38 @@ export class Gateway {
 
     for (const spec of specs) {
       const transcription = spec.events.includes(TRANSCRIPTION_FINISHED)
-      const existing = await this.client.webhooks.subscriptions.list({
+      const whatsapp = spec.events === EVENT_TYPES.whatsapp
+      const filter = {
         ...spec.owner,
         url,
-        ...(transcription || spec.events.includes('whatsapp.received') ? { scope: 'identity' as const } : {}),
-      })
+        ...(transcription || whatsapp ? { scope: 'identity' as const } : {}),
+      }
+      const subscriptions = this.client.webhooks.subscriptions
+      const existing = await subscriptions.list(filter)
       const match = existing.find((subscription) =>
         subscription.eventTypes.some((event) => spec.events.includes(event)),
       )
       if (match !== undefined) {
-        if (transcription) continue // Preserve other events on a shared receiver.
+        if (transcription || whatsapp) continue // Preserve other events on a shared receiver.
         const same =
           match.eventTypes.length === spec.events.length &&
           spec.events.every((event) => match.eventTypes.includes(event))
         if (!same) await this.client.webhooks.subscriptions.update(match.id, { eventTypes: [...spec.events] })
         continue
       }
-      const created = await this.client.webhooks.subscriptions.create({
-        ...spec.owner,
-        url,
-        eventTypes: [...spec.events],
-      })
+      const created = await subscriptions
+        .create({
+          ...spec.owner,
+          url,
+          eventTypes: [...spec.events],
+        })
+        .catch(async (error: unknown) => {
+          if (!whatsapp || !(error instanceof InkboxAPIError) || error.statusCode !== 409) throw error
+          const rows = await subscriptions.list(filter)
+          if (!rows.some((row) => row.eventTypes.includes('whatsapp.received'))) throw error
+          return undefined
+        })
+      if (!created) continue
       if (created.signingKey !== null && this.signingKey === undefined) {
         const { credentialRef } = await import('@deepseek-ai/dsh-credentials')
         await this.ctx.credentials.set(credentialRef(this.config.signingKeyRef), created.signingKey)

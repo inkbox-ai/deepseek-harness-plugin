@@ -79,10 +79,15 @@ async function harness(
   batchWindowMs = 0,
   voiceStack: ResolvedConfig['voiceStack'] = 'inkbox_voice_ai',
   channelInstructions: Record<string, string> = {},
+  sharedEvents: string[] = [],
 ): Promise<Harness> {
   const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
   const subscriptions = {
-    list: vi.fn(async () => []),
+    list: vi.fn(async (filter: { scope?: string; url: string }) =>
+      filter.scope === 'identity' && sharedEvents.length
+        ? [{ id: 'shared', url: filter.url, eventTypes: sharedEvents }]
+        : [],
+    ),
     create: vi.fn(async () => ({ signingKey: null })),
     update: vi.fn(async () => ({})),
   }
@@ -262,6 +267,18 @@ describe('gateway lifecycle and delivery', () => {
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
       ready: false,
     })
+  })
+
+  it('keeps an existing shared WhatsApp receiver intact across two starts', async () => {
+    const shared = ['whatsapp.received', 'whatsapp.future']
+    for (let start = 0; start < 2; start++) {
+      const { gateway, subscriptions } = await harness(0, 'inkbox_voice_ai', {}, shared)
+      expect(
+        subscriptions.create.mock.calls.some(([row]) => row.eventTypes.includes('whatsapp.received')),
+      ).toBe(false)
+      expect(subscriptions.update).not.toHaveBeenCalled()
+      await gateway.close()
+    }
   })
 
   it('attaches authenticated Realtime calls to the same contact-scoped Harness agent', async () => {
