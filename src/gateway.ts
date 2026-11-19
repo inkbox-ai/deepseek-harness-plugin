@@ -731,7 +731,7 @@ export class Gateway {
       const existing = await this.client.webhooks.subscriptions.list({
         ...spec.owner,
         url,
-        ...(transcription ? { scope: 'identity' as const } : {}),
+        ...(transcription || spec.events.includes('whatsapp.received') ? { scope: 'identity' as const } : {}),
       })
       const match = existing.find((subscription) =>
         subscription.eventTypes.some((event) => spec.events.includes(event)),

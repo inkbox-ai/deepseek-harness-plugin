@@ -254,6 +254,9 @@ describe('gateway lifecycle and delivery', () => {
     const { gateway, subscriptions, stateDir } = await harness()
     expect(gateway.status()).toMatchObject({ ready: true, connected: true, identity: 'deepseek-agent' })
     expect(subscriptions.create).toHaveBeenCalledTimes(7)
+    // WhatsApp and transcription are excluded from the legacy unscoped list.
+    const identityLookups = subscriptions.list.mock.calls.filter(([query]) => query.scope === 'identity')
+    expect(identityLookups).toHaveLength(2)
     await gateway.close()
     expect(tunnel.aclose).toHaveBeenCalledOnce()
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
