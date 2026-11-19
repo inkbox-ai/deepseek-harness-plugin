@@ -313,6 +313,13 @@ active owner; use a separate identity when testing another host concurrently.
 - The gateway verifies signed webhooks before dispatch, stores durable delivery and session state, and exposes
   `GET /health` plus authenticated `POST /webhook` handling through the Inkbox tunnel.
 - Current public URL and readiness state are written to `status.json` in the configured state directory.
+- With `INKBOX_DELIVERY_MODE=local`, the gateway opens no tunnel and registers no webhook URL; the host passes
+  signed requests (up to 2 MiB) to its webhook handler. In this mode, `inbound.received` events are handled:
+  `agent` handlers start a turn in a per-source session, and `script` handlers run `/bin/sh -c <command>` in the
+  workspace with the event as JSON on stdin (120 s limit). Empty output finishes the event, other output is
+  passed to the agent, and a failing script runs at most 5 times (retries after 10 s, 30 s, 2 min, 10 min) before
+  the failure is reported. Retries of one delivery are deduplicated by `delivery_id` (or `event_id`); a replay
+  runs again. Bodies over 64 KiB are cut and marked `(truncated)` in agent messages; scripts get the full body.
 
 ## License
 

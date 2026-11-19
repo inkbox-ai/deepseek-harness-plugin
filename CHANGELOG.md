@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6
+
+- Add local delivery (`INKBOX_DELIVERY_MODE=local`): the gateway opens no tunnel, registers no webhook URL, and handles signed requests passed to it by the host. Identities without a tunnel are supported in this mode.
+- Handle `inbound.received` events in local delivery: `agent` handlers run one untrusted-content turn per source; `script` handlers run the command with the event on stdin, pass non-empty output to the agent, and run a failing script at most 5 times (retries after 10 s, 30 s, 2 min, 10 min) before reporting the failure. Events are deduplicated by delivery ID (event ID when absent), so a replay runs again. Request bodies in agent messages are capped at 64 KiB. Other modes ignore these events.
+- Require `@inkbox/sdk` 0.7.41 or later.
+
 ## 0.2.5
 
 - Deliver incoming voice-note transcripts with a bounded wait, one message read on timeout, and original-attachment fallback.

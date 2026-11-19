@@ -17,6 +17,16 @@ import { renderChannelEvent, resolveChannelInstruction } from './channel-instruc
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
+  INBOUND_RETRY_DELAYS_MS,
+  type InboundEvent,
+  inboundBody,
+  inboundRoutedEvent,
+  parseInbound,
+  runInboundScript,
+  scriptInput,
+  truncateInboundBody,
+} from './inbound.js'
+import {
   authenticateCallWebSocket,
   awaitRealtimeReady,
   connectOpenAIRealtime,
@@ -95,6 +105,10 @@ export class Gateway {
   private readonly activeDeliveries = new Set<string>()
   private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly typingPulses = new Map<string, TypingPulse>()
+  private readonly inboundScripts = new Set<string>()
+  private readonly inboundTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
+  private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
 
   constructor(
@@ -123,6 +137,13 @@ export class Gateway {
   async start(): Promise<void> {
     await this.initialize()
     if (!this.client || !this.identity) throw new Error('Gateway identity is unavailable')
+    if (this.localDelivery) {
+      if (this.signingKey === undefined) throw new Error('Webhook signing key is unavailable')
+      this.resumeDeliveries()
+      this.voiceNoteInbox().recover()
+      await this.writeStatus(true)
+      return
+    }
     let connectedResolve: (() => void) | undefined
     const connected = new Promise<void>((resolve) => {
       connectedResolve = resolve
@@ -175,7 +196,9 @@ export class Gateway {
   async handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'GET' && url.pathname === '/health') {
-      return Response.json(this.status(), { status: this.listener?.isConnected ? 200 : 503 })
+      return Response.json(this.status(), {
+        status: this.localDelivery || this.listener?.isConnected ? 200 : 503,
+      })
     }
     if (request.method !== 'POST' || url.pathname !== '/webhook')
       return new Response('Not found', { status: 404 })
@@ -202,6 +225,10 @@ export class Gateway {
       if (resolvedVoiceNote) throw new VoiceNoteNotAdmitted('Gateway is stopping')
       return new Response('Gateway is stopping', { status: 503 })
     }
+    if (payload.event_type === 'inbound.received')
+      return source === 'inkbox' && this.localDelivery
+        ? this.acceptInbound(payload)
+        : new Response('Ignored', { status: 202 })
     if (source === 'inkbox' && !resolvedVoiceNote && (await this.voiceNoteInbox().accept(payload)))
       return new Response('Accepted', { status: 202 })
     const callId = endedCallId(payload)
@@ -231,6 +258,99 @@ export class Gateway {
     }
     await this.accept(routed)
     return new Response('Accepted', { status: 202 })
+  }
+
+  private async acceptInbound(payload: Record<string, unknown>): Promise<Response> {
+    const event = parseInbound(payload)
+    if (event === undefined) return new Response('Ignored', { status: 202 })
+    // The host tracks the envelope id; deduplication uses the delivery id.
+    const trackingId = typeof payload.id === 'string' && payload.id ? payload.id : event.deliveryKey
+    const accepted = await this.state.mutate((state) => {
+      const now = Date.now()
+      const key = `inbound-delivery:${event.deliveryKey}`
+      if (state.seen[key] !== undefined) {
+        if (state.seen[trackingId] === undefined) state.replied[trackingId] = now
+        return false
+      }
+      state.seen[key] = now
+      state.seen[trackingId] = now
+      return true
+    })
+    if (!accepted) return new Response('Duplicate', { status: 200 })
+    if (event.handler.type === 'agent') {
+      await this.accept(inboundRoutedEvent(trackingId, event, inboundBody(event)))
+    } else {
+      this.inboundScripts.add(trackingId)
+      this.track(this.runInboundScript(trackingId, event, 0))
+    }
+    return new Response('Accepted', { status: 202 })
+  }
+
+  private async runInboundScript(trackingId: string, event: InboundEvent, attempt: number): Promise<void> {
+    if (event.handler.type !== 'script') return
+    try {
+      const result = await runInboundScript(event.handler.command, this.config.workspace, scriptInput(event))
+      if (result.ok) {
+        const output = result.stdout.trim()
+        if (output) await this.accept(inboundRoutedEvent(trackingId, event, truncateInboundBody(output)))
+        else
+          await this.state.mutate((state) => {
+            state.replied[trackingId] = Date.now()
+          })
+        this.inboundScripts.delete(trackingId)
+        return
+      }
+      const delay = INBOUND_RETRY_DELAYS_MS[attempt]
+      if (delay !== undefined) {
+        if (this.closing) return
+        this.log.warn('[inkbox] inbound script failed; retry scheduled')
+        this.inboundTimers.set(
+          trackingId,
+          setTimeout(() => {
+            this.inboundTimers.delete(trackingId)
+            this.track(this.runInboundScript(trackingId, event, attempt + 1))
+          }, delay),
+        )
+        return
+      }
+      this.log.warn('[inkbox] inbound script failed after every retry')
+      await this.reportInboundFailure(event, result.error)
+      await this.state.mutate((state) => {
+        state.replied[trackingId] = Date.now()
+      })
+      this.inboundScripts.delete(trackingId)
+    } catch (error) {
+      this.inboundScripts.delete(trackingId)
+      this.log.error('[inkbox] inbound event handling failed', error)
+    }
+  }
+
+  private async reportInboundFailure(event: InboundEvent, error: string): Promise<void> {
+    const inbound = (
+      this.client as
+        | {
+            inbound?: {
+              reportInboundEventResult?: (
+                handle: string,
+                sourceId: string,
+                eventId: string,
+                result: { status: 'failed'; error: string },
+              ) => Promise<unknown>
+            }
+          }
+        | undefined
+    )?.inbound
+    // Older SDK releases cannot report results; the failure is then only logged.
+    if (typeof inbound?.reportInboundEventResult !== 'function' || !this.identity) {
+      this.log.warn('[inkbox] inbound event result reporting is unavailable')
+      return
+    }
+    await inbound
+      .reportInboundEventResult(this.identity.agentHandle, event.sourceId, event.eventId, {
+        status: 'failed',
+        error,
+      })
+      .catch((cause) => this.log.warn('[inkbox] inbound event result report failed', cause))
   }
 
   private voiceNoteInbox(): VoiceNoteInbox {
@@ -368,7 +488,7 @@ export class Gateway {
 
   status(): GatewayStatus {
     return {
-      ready: this.signingKey !== undefined && this.listener?.isConnected === true,
+      ready: this.signingKey !== undefined && (this.localDelivery || this.listener?.isConnected === true),
       ...(this.listener ? { publicUrl: this.listener.publicUrl } : {}),
       connected: this.listener?.isConnected ?? false,
       identity: this.identity?.agentHandle ?? this.config.agentHandle ?? 'unconfigured',
@@ -381,6 +501,7 @@ export class Gateway {
   eventState(eventId: string): 'absent' | 'pending' | 'completed' | 'failed' | 'uncertain' {
     const state = this.state.snapshot()
     if (state.replied[eventId] !== undefined) return 'completed'
+    if (this.inboundScripts.has(eventId)) return 'pending'
     for (const [id, delivery] of Object.entries(state.deliveries)) {
       if (!delivery.eventIds.includes(eventId)) continue
       if (delivery.state === 'rejected' || delivery.state === 'quarantined') return 'failed'
@@ -424,7 +545,7 @@ export class Gateway {
   } {
     const deliveries = Object.entries(this.state.snapshot().deliveries)
     return {
-      active: this.inflight.size,
+      active: this.inflight.size + this.inboundTimers.size,
       buffered: [...this.queues.values()].reduce((count, queue) => count + queue.buffered.length, 0),
       deliveries: deliveries.filter(([id, item]) => item.state === 'ready' || this.activeDeliveries.has(id))
         .length,
@@ -452,6 +573,8 @@ export class Gateway {
     for (const queue of this.queues.values()) if (queue.timer !== undefined) clearTimeout(queue.timer)
     for (const timer of this.deliveryTimers.values()) clearTimeout(timer)
     this.deliveryTimers.clear()
+    for (const timer of this.inboundTimers.values()) clearTimeout(timer)
+    this.inboundTimers.clear()
     this.stopAllTyping()
     for (const pending of this.pendingHuman.values()) {
       clearTimeout(pending.timer)
