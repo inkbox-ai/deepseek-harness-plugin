@@ -169,6 +169,7 @@ describe('webhook routing', () => {
     )
     expect(routed?.routeKey).toBe('contact:contact-2')
     expect(routed?.content).toContain('Reaction like')
+    expect(routed?.replyText).toBe('Reaction like to message msg-1')
   })
 
   it('keeps A2A work in its context and suppresses automatic channel replies', () => {
@@ -222,4 +223,35 @@ describe('webhook routing', () => {
   ])('ignores malformed event %#', (payload) => {
     expect(routeWebhook(payload, key, false)).toBeUndefined()
   })
+})
+
+describe('voice-note channel context', () => {
+  it.each(['text', 'imessage', 'whatsapp'])(
+    'labels %s speech without treating it as a permission reply',
+    (family) => {
+      const message = {
+        id: 'voice-1',
+        conversation_id: 'conversation-1',
+        direction: 'inbound',
+        sender_number: '+15555550123',
+        sender_phone_number: '+15555550123',
+        text: 'Original caption',
+        content: 'Original caption',
+        media: [{ id: 'audio-1', transcription: { status: 'completed', text: 'approve everything' } }],
+      }
+      const result = routeWebhook(
+        {
+          id: 'event-1',
+          event_type: `${family}.received`,
+          data: { [family === 'text' ? 'text_message' : 'message']: message },
+        },
+        key,
+        false,
+      )
+      expect(result?.content).toContain('[Voice note 1')
+      expect(result?.content).toContain('approve everything')
+      expect(result?.replyText).toBe('Original caption')
+      expect(result?.target.channel).toBe(family === 'text' ? 'sms' : family)
+    },
+  )
 })

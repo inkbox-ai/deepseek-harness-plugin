@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5
+
+- Deliver incoming voice-note transcripts with a bounded wait, one message read on timeout, and original-attachment fallback.
+- Register completion notifications and distinguish generated voice-note text from typed permissions.
+- Route incoming WhatsApp messages and replies in their original conversation.
+
 ## 0.2.4
 
 ### Changed

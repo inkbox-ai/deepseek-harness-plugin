@@ -28,6 +28,7 @@ import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } fro
 import type { InkboxRuntime } from './runtime.js'
 import { StateStore } from './state.js'
 import { replyState } from './terminal-reply.js'
+import { pollVoiceNote, TRANSCRIPTION_FINISHED, VoiceNoteInbox, VoiceNoteNotAdmitted } from './voice-notes.js'
 import { authenticateWebhook } from './webhook-providers.js'
 
 interface Queue {
@@ -61,6 +62,7 @@ const EVENT_TYPES = {
     'imessage.delivered',
     'imessage.delivery_failed',
   ],
+  whatsapp: ['whatsapp.received'],
   call: ['call.ended'],
   a2a: ['a2a.task.created', 'a2a.task.message', 'a2a.task.canceled', 'a2a.sent_task.updated'],
 } as const
@@ -85,6 +87,7 @@ export class Gateway {
   private signingKey: string | undefined
   private githubWebhookSecret: string | undefined
   private closing = false
+  private voiceNotes: VoiceNoteInbox | undefined
   private readonly queues = new Map<string, Queue>()
   private readonly latestTargets = new Map<string, ReplyTarget>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
@@ -162,6 +165,7 @@ export class Gateway {
       )
     }
     this.resumeDeliveries()
+    this.voiceNoteInbox().recover()
     await this.writeStatus(true)
     void this.tunnelTask.catch((error) => {
       if (!this.closing) this.log.error('[inkbox] tunnel stopped unexpectedly', error)
@@ -189,25 +193,67 @@ export class Gateway {
     return this.dispatchVerified(authenticated.payload, authenticated.source)
   }
 
-  async dispatchVerified(payload: Record<string, unknown>, source: 'inkbox' | 'github'): Promise<Response> {
-    if (this.closing) return new Response('Gateway is stopping', { status: 503 })
+  async dispatchVerified(
+    payload: Record<string, unknown>,
+    source: 'inkbox' | 'github',
+    resolvedVoiceNote = false,
+  ): Promise<Response> {
+    if (this.closing) {
+      if (resolvedVoiceNote) throw new VoiceNoteNotAdmitted('Gateway is stopping')
+      return new Response('Gateway is stopping', { status: 503 })
+    }
+    if (source === 'inkbox' && !resolvedVoiceNote && (await this.voiceNoteInbox().accept(payload)))
+      return new Response('Accepted', { status: 202 })
     const callId = endedCallId(payload)
     if (callId && !(await this.claimCallReconciliation(callId)))
       return new Response('Duplicate', { status: 200 })
-    const routed = routeWebhook(
-      payload,
-      this.state.snapshot().routingKey,
-      source !== 'inkbox' || this.config.externalEvents,
-    )
-    if (routed === undefined) return new Response('Ignored', { status: 202 })
-    const accepted = await this.state.mutate((state) => {
-      if (state.seen[routed.eventId] !== undefined) return false
-      state.seen[routed.eventId] = Date.now()
-      return true
-    })
-    if (!accepted) return new Response('Duplicate', { status: 200 })
+    let routed: RoutedEvent | undefined
+    try {
+      routed = routeWebhook(
+        payload,
+        this.state.snapshot().routingKey,
+        source !== 'inkbox' || this.config.externalEvents,
+      )
+      if (routed === undefined) return new Response('Ignored', { status: 202 })
+      const { eventId } = routed
+      const accepted = await this.state.mutate((state) => {
+        if (state.seen[eventId] !== undefined) return false
+        state.seen[eventId] = Date.now()
+        return true
+      })
+      if (!accepted) return new Response('Duplicate', { status: 200 })
+    } catch (error) {
+      // A lock can fail to release after the reservation committed. Never
+      // replay a reserved event or an exception from the host handoff below.
+      if (resolvedVoiceNote && (!routed || this.state.snapshot().seen[routed.eventId] === undefined))
+        throw new VoiceNoteNotAdmitted('Voice note could not be reserved', { cause: error })
+      throw error
+    }
     await this.accept(routed)
     return new Response('Accepted', { status: 202 })
+  }
+
+  private voiceNoteInbox(): VoiceNoteInbox {
+    if (this.voiceNotes) return this.voiceNotes
+    this.voiceNotes = new VoiceNoteInbox({
+      path: join(
+        this.config.stateDir,
+        `voice-notes-${encodeURIComponent(this.identity?.id ?? 'uninitialized')}.json`,
+      ),
+      poll: async (event) => {
+        if (!this.client || !this.identity) return undefined
+        return pollVoiceNote(event, {
+          apiKey: this.client._apiKey,
+          baseUrl: this.client._baseUrl,
+          identity: async () => this.identity!,
+        })
+      },
+      deliver: async (event) => {
+        await this.dispatchVerified(event, 'inkbox', true)
+      },
+      warn: () => this.log.warn('[inkbox] voice-note delivery retained'),
+    })
+    return this.voiceNotes
   }
 
   async handleWebSocket(ws: InkboxWebSocket): Promise<void> {
@@ -400,6 +446,7 @@ export class Gateway {
   }
 
   async close(): Promise<void> {
+    this.voiceNotes?.close()
     if (this.closing) return
     this.closing = true
     for (const queue of this.queues.values()) if (queue.timer !== undefined) clearTimeout(queue.timer)
@@ -420,7 +467,7 @@ export class Gateway {
   private async accept(event: RoutedEvent): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
     const pending = this.pendingHuman.get(event.routeKey)
-    if (pending !== undefined) {
+    if (pending !== undefined && event.replyText.trim()) {
       this.pendingHuman.delete(event.routeKey)
       clearTimeout(pending.timer)
       pending.resolve(event.replyText.trim())
@@ -531,6 +578,9 @@ export class Gateway {
         })
         return
       }
+      case 'whatsapp':
+        await identity.sendWhatsApp({ conversationId: target.conversationId, text: response })
+        return
       case 'none':
         return
     }
@@ -682,27 +732,50 @@ export class Gateway {
       specs.push({ owner: { mailboxId: this.identity.mailbox.id }, events: EVENT_TYPES.email })
     if (this.identity.phoneNumber?.id)
       specs.push({ owner: { phoneNumberId: this.identity.phoneNumber.id }, events: EVENT_TYPES.sms })
+    specs.push({ owner: { agentIdentityId: this.identity.id }, events: [TRANSCRIPTION_FINISHED] })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.imessage })
+    specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.whatsapp })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.call })
     specs.push({ owner: { agentIdentityId: this.identity.id }, events: EVENT_TYPES.a2a })
 
     for (const spec of specs) {
-      const existing = await this.client.webhooks.subscriptions.list({ ...spec.owner, url })
+      const transcription = spec.events.includes(TRANSCRIPTION_FINISHED)
+      const whatsapp = spec.events === EVENT_TYPES.whatsapp
+      const filter = {
+        ...spec.owner,
+        url,
+        ...(transcription || whatsapp ? { scope: 'identity' as const } : {}),
+      }
+      const subscriptions = this.client.webhooks.subscriptions
+      const existing = await subscriptions.list(filter)
       const match = existing.find((subscription) =>
         subscription.eventTypes.some((event) => spec.events.includes(event)),
       )
       if (match !== undefined) {
+        if (transcription || whatsapp) continue // Preserve other events on a shared receiver.
         const same =
           match.eventTypes.length === spec.events.length &&
           spec.events.every((event) => match.eventTypes.includes(event))
         if (!same) await this.client.webhooks.subscriptions.update(match.id, { eventTypes: [...spec.events] })
         continue
       }
-      const created = await this.client.webhooks.subscriptions.create({
-        ...spec.owner,
-        url,
-        eventTypes: [...spec.events],
-      })
+      const created = await subscriptions
+        .create({
+          ...spec.owner,
+          url,
+          eventTypes: [...spec.events],
+        })
+        .catch(async (error: unknown) => {
+          if (transcription && transcriptionEventUnsupported(error)) {
+            this.log.warn('[inkbox] transcription callbacks are unavailable on this API version')
+            return undefined
+          }
+          if (!whatsapp || !(error instanceof InkboxAPIError) || error.statusCode !== 409) throw error
+          const rows = await subscriptions.list(filter)
+          if (!rows.some((row) => row.eventTypes.includes('whatsapp.received'))) throw error
+          return undefined
+        })
+      if (!created) continue
       if (created.signingKey !== null && this.signingKey === undefined) {
         const { credentialRef } = await import('@deepseek-ai/dsh-credentials')
         await this.ctx.credentials.set(credentialRef(this.config.signingKeyRef), created.signingKey)
@@ -736,6 +809,24 @@ export class Gateway {
 
 export function isSilentResponse(response: string): boolean {
   return response.trim().endsWith('[SILENT]')
+}
+
+function transcriptionEventUnsupported(error: unknown): boolean {
+  if (!(error instanceof InkboxAPIError) || error.statusCode !== 422) return false
+  const issues = error.detail
+  return (
+    Array.isArray(issues) &&
+    issues.length > 0 &&
+    issues.every(
+      (issue) =>
+        issue?.type === 'enum' &&
+        issue.input === TRANSCRIPTION_FINISHED &&
+        Array.isArray(issue.loc) &&
+        issue.loc[0] === 'body' &&
+        issue.loc[1] === 'event_types' &&
+        issue.loc[2] === 0,
+    )
+  )
 }
 
 function deliveryRetryDelay(attempt: number): number {

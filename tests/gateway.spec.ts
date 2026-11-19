@@ -14,6 +14,7 @@ import {
   isSilentResponse,
 } from '../src/gateway.js'
 import type { InkboxRuntime } from '../src/runtime.js'
+import { VoiceNoteNotAdmitted } from '../src/voice-notes.js'
 
 const tunnel = vi.hoisted(() => ({
   connected: true,
@@ -79,11 +80,29 @@ async function harness(
   batchWindowMs = 0,
   voiceStack: ResolvedConfig['voiceStack'] = 'inkbox_voice_ai',
   channelInstructions: Record<string, string> = {},
+  sharedEvents: string[] = [],
+  unsupportedTranscription = false,
 ): Promise<Harness> {
   const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
   const subscriptions = {
-    list: vi.fn(async () => []),
-    create: vi.fn(async () => ({ signingKey: null })),
+    list: vi.fn(async (filter: { scope?: string; url: string }) =>
+      filter.scope === 'identity' && sharedEvents.length
+        ? [{ id: 'shared', url: filter.url, eventTypes: sharedEvents }]
+        : [],
+    ),
+    create: vi.fn(async (row: { eventTypes: string[] }) => {
+      if (unsupportedTranscription && row.eventTypes.includes('message.transcription_finished'))
+        throw Object.assign(new InkboxAPIError(422, 'Unknown event'), {
+          detail: [
+            {
+              type: 'enum',
+              loc: ['body', 'event_types', 0, 'MailWebhookEventType'],
+              input: 'message.transcription_finished',
+            },
+          ],
+        })
+      return { signingKey: null }
+    }),
     update: vi.fn(async () => ({})),
   }
   const client = { webhooks: { subscriptions } }
@@ -253,12 +272,39 @@ describe('gateway lifecycle and delivery', () => {
   it('connects the tunnel and reconciles every configured channel', async () => {
     const { gateway, subscriptions, stateDir } = await harness()
     expect(gateway.status()).toMatchObject({ ready: true, connected: true, identity: 'deepseek-agent' })
-    expect(subscriptions.create).toHaveBeenCalledTimes(5)
+    expect(subscriptions.create).toHaveBeenCalledTimes(7)
+    // WhatsApp and transcription are excluded from the legacy unscoped list.
+    const identityLookups = subscriptions.list.mock.calls.filter(([query]) => query.scope === 'identity')
+    expect(identityLookups).toHaveLength(2)
     await gateway.close()
     expect(tunnel.aclose).toHaveBeenCalledOnce()
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
       ready: false,
     })
+  })
+
+  it('starts on an API without transcription callbacks and still registers WhatsApp', async () => {
+    const { gateway, subscriptions } = await harness(0, 'inkbox_voice_ai', {}, [], true)
+    try {
+      expect(gateway.status().ready).toBe(true)
+      expect(subscriptions.create).toHaveBeenCalledWith(
+        expect.objectContaining({ eventTypes: ['whatsapp.received'] }),
+      )
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('keeps an existing shared WhatsApp receiver intact across two starts', async () => {
+    const shared = ['whatsapp.received', 'whatsapp.future']
+    for (let start = 0; start < 2; start++) {
+      const { gateway, subscriptions } = await harness(0, 'inkbox_voice_ai', {}, shared)
+      expect(
+        subscriptions.create.mock.calls.some(([row]) => row.eventTypes.includes('whatsapp.received')),
+      ).toBe(false)
+      expect(subscriptions.update).not.toHaveBeenCalled()
+      await gateway.close()
+    }
   })
 
   it('attaches authenticated Realtime calls to the same contact-scoped Harness agent', async () => {
@@ -639,3 +685,163 @@ it('quarantines lost replies without retrying them', async () => {
   expect(identity.sendEmail).toHaveBeenCalledOnce()
   await gateway.close()
 })
+
+describe('authenticated voice-note dispatch', () => {
+  it('routes one labeled turn from the original after completion and registers every completion family', async () => {
+    const { gateway, subscriptions } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    const message = {
+      id: 'voice-message',
+      conversation_id: 'imessage-voice',
+      sender_number: '+15555550123',
+      content: 'Original caption',
+      direction: 'inbound',
+      media: [{ id: 'audio-1', transcription: { status: 'pending' } }],
+    }
+    const original = { id: 'received-voice', event_type: 'imessage.received', data: { message } }
+    try {
+      const completionRows = subscriptions.create.mock.calls.filter(([row]) =>
+        row.eventTypes.includes('message.transcription_finished'),
+      )
+      expect(completionRows).toEqual([
+        [
+          expect.objectContaining({
+            agentIdentityId: 'identity-1',
+            eventTypes: ['message.transcription_finished'],
+          }),
+        ],
+      ])
+      expect((await gateway.dispatchVerified(original, 'inkbox')).status).toBe(202)
+      expect(run).not.toHaveBeenCalled()
+      const finished = {
+        id: 'finished-voice',
+        event_type: 'message.transcription_finished',
+        data: {
+          channel: 'imessage',
+          message_id: message.id,
+          message: {
+            ...message,
+            media: [
+              {
+                id: 'audio-1',
+                transcription: { status: 'completed', text: 'Move the meeting to Thursday.' },
+              },
+            ],
+          },
+        },
+      }
+      await gateway.dispatchVerified(finished, 'inkbox')
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      expect(run).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining('Move the meeting to Thursday.'),
+      )
+      expect(run).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Voice note'))
+      await gateway.dispatchVerified(finished, 'inkbox')
+      expect(run).toHaveBeenCalledTimes(1)
+    } finally {
+      await gateway.close()
+    }
+  })
+})
+
+it('keeps an attachment-only voice note instead of consuming an empty approval answer', async () => {
+  const { gateway, identity } = await harness(30_000)
+  vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+  await gateway.handleRequest(email('permission-request', 'Initial request'))
+  const approval = gateway.askApproval({} as Agent, 'Send the requested message')
+  let settled = false
+  void approval.then(() => {
+    settled = true
+  })
+  await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledOnce())
+  await gateway.dispatchVerified(
+    {
+      id: 'voice-during-approval',
+      event_type: 'text.received',
+      data: {
+        text_message: {
+          id: 'voice-source',
+          conversation_id: 'sms-voice',
+          sender_phone_number: '+15550001111',
+          text: '',
+          media: [{ id: 'voice-audio', transcription: { status: 'completed', text: 'YES approved' } }],
+        },
+        contacts: [{ id: 'contact-1' }],
+      },
+    },
+    'inkbox',
+  )
+  expect(settled).toBe(false)
+  expect(gateway.eventState('voice-during-approval')).toBe('pending')
+  await gateway.handleRequest(email('typed-approval', 'YES, approved'))
+  await expect(approval).resolves.toBe('allowed-once')
+  await gateway.close()
+})
+
+it('refuses a resolved voice note before reserving its event when the gateway has stopped', async () => {
+  const { gateway } = await harness()
+  await gateway.close()
+  const event = { event_type: 'text.received', id: 'voice-while-stopped' }
+  await expect(gateway.dispatchVerified(event, 'inkbox', true)).rejects.toBeInstanceOf(VoiceNoteNotAdmitted)
+  expect(gateway.state.snapshot().seen[event.id]).toBeUndefined()
+})
+
+it.each(['ignored', 'not-reserved', 'reserved'] as const)(
+  'classifies voice-note handoff at the reservation boundary (%s)',
+  async (outcome) => {
+    const { gateway, stateDir } = await harness()
+    try {
+      const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+      const message = {
+        id: 'note',
+        conversation_id: 'thread',
+        ...(outcome === 'ignored' ? {} : { sender_number: '+15555550123' }),
+        media: [{ id: 'audio', transcription: { status: 'pending' } }],
+      }
+      await gateway.dispatchVerified(
+        { id: 'original', event_type: 'imessage.received', data: { message } },
+        'inkbox',
+      )
+      if (outcome === 'not-reserved') {
+        vi.spyOn(gateway.state, 'mutate').mockRejectedValueOnce(new Error('Store unavailable'))
+      } else if (outcome === 'reserved') {
+        const mutate = gateway.state.mutate.bind(gateway.state)
+        vi.spyOn(gateway.state, 'mutate').mockImplementationOnce(async (change) => {
+          await mutate(change)
+          throw new Error('Lock release failed after commit')
+        })
+      }
+      await gateway.dispatchVerified(
+        {
+          id: 'completion',
+          event_type: 'message.transcription_finished',
+          data: {
+            channel: 'imessage',
+            message_id: 'note',
+            message: {
+              ...message,
+              media: [{ id: 'audio', transcription: { status: 'completed', text: 'Hello' } }],
+            },
+          },
+        },
+        'inkbox',
+      )
+      await vi.waitFor(async () => {
+        const receipt = JSON.parse(await readFile(join(stateDir, 'voice-notes-identity-1.json'), 'utf8'))
+        if (outcome === 'ignored') {
+          expect(receipt.done['imessage:note']).toBeDefined()
+          expect(receipt.pending['imessage:note']).toBeUndefined()
+        } else {
+          expect(receipt.pending['imessage:note'].handoff).toBe(
+            outcome === 'reserved' ? 'attempting' : 'retry',
+          )
+          expect(gateway.state.snapshot().seen.original !== undefined).toBe(outcome === 'reserved')
+        }
+      })
+      expect(run).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  },
+)

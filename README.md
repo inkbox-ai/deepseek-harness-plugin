@@ -329,3 +329,7 @@ report; the key itself is not needed in the terminal. Runtime processes still
 require their own signing key. Managed delivery does not require ordinary webhook
 subscriptions. Standalone diagnostics are unchanged. These checks do not send
 messages or prove end-to-end delivery.
+
+### Incoming voice notes
+
+Incoming audio waits up to 60 seconds for its completion notification, then reads the original message once. Available transcripts are labeled as voice-note speech, never typed permission replies. Failed or unavailable transcripts retain the original attachment handling. Completion notifications are registered automatically and never create another turn. Managed delivery resolves the same wait before starting the agent.

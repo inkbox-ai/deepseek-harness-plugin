@@ -1,11 +1,13 @@
 import { createHmac } from 'node:crypto'
+import { voiceNoteContext } from './voice-notes.js'
 
-export type Channel = 'email' | 'sms' | 'imessage' | 'a2a' | 'call' | 'external'
+export type Channel = 'email' | 'sms' | 'imessage' | 'whatsapp' | 'a2a' | 'call' | 'external'
 
 export type ReplyTarget =
   | { channel: 'email'; to: string; subject: string; inReplyToMessageId?: string }
   | { channel: 'sms'; conversationId?: string; to?: string }
   | { channel: 'imessage'; conversationId: string }
+  | { channel: 'whatsapp'; conversationId: string }
   | { channel: 'none' }
 
 export interface RoutedEvent {
@@ -112,7 +114,9 @@ export function routeWebhook(
       routeKey,
       channel: 'sms',
       context: `[inkbox:${isGroup ? 'group_sms' : 'sms'} from=${sender} conversation_id=${conversationId ?? 'unknown'}]`,
-      content: text(message.text) ?? '(media message)',
+      content: [text(message.text) ?? '(media message)', voiceNoteContext(message)]
+        .filter(Boolean)
+        .join('\n\n'),
       replyText: text(message.text) ?? '',
       target: { channel: 'sms', ...(conversationId ? { conversationId } : { to: sender }) },
     }
@@ -130,16 +134,38 @@ export function routeWebhook(
     const content =
       eventType === 'imessage.reaction_received'
         ? `Reaction ${text(reaction.reaction) ?? 'unknown'} to message ${text(reaction.target_message_id) ?? 'unknown'}`
-        : (text(message.content) ?? '(media message)')
+        : [text(message.content) ?? '(media message)', voiceNoteContext(message)].filter(Boolean).join('\n\n')
     return {
       eventId,
       routeKey,
       channel: 'imessage',
       context: `[inkbox:${isGroup ? 'group_imessage' : 'imessage'} from=${sender} conversation_id=${conversationId}]`,
       content,
-      replyText: content,
+      replyText: eventType === 'imessage.reaction_received' ? content : (text(message.content) ?? ''),
       target: { channel: 'imessage', conversationId },
       ...(!isGroup && eventType === 'imessage.received' ? { typingConversationId: conversationId } : {}),
+    }
+  }
+
+  if (eventType === 'whatsapp.received') {
+    const message = record(data.message)
+    const sender = text(message.sender_number) ?? text(message.sender_phone_number)
+    const conversationId = text(message.conversation_id)
+    if (!sender || !conversationId) return undefined
+    const group = message.is_group === true
+    return {
+      eventId,
+      ...(text(message.id) ? { messageId: text(message.id)! } : {}),
+      sender,
+      group,
+      routeKey: group ? `group:whatsapp:${conversationId}` : contactRoute(data, sender, routingKey),
+      channel: 'whatsapp',
+      context: `[inkbox:whatsapp from=${sender} conversation_id=${conversationId}]`,
+      content: [text(message.content) ?? '(media message)', voiceNoteContext(message)]
+        .filter(Boolean)
+        .join('\n\n'),
+      replyText: text(message.content) ?? '',
+      target: { channel: 'whatsapp', conversationId },
     }
   }
 
