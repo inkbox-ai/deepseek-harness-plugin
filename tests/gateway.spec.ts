@@ -14,7 +14,12 @@ import {
   IMESSAGE_TYPING_REFRESH_MS,
   isSilentResponse,
 } from '../src/gateway.js'
-import { INBOUND_BODY_MAX_BYTES, InboundStore, parseInbound } from '../src/inbound.js'
+import {
+  INBOUND_BODY_MAX_BYTES,
+  INBOUND_TURN_TIMEOUT_MS,
+  InboundStore,
+  parseInbound,
+} from '../src/inbound.js'
 import type { InkboxRuntime } from '../src/runtime.js'
 import { VoiceNoteNotAdmitted } from '../src/voice-notes.js'
 
@@ -1294,6 +1299,32 @@ describe('local delivery', () => {
         SOURCE_ID,
         'inbev_agentfail',
         expect.objectContaining({ status: 'failed', error: 'model unavailable' }),
+      )
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('reports an agent turn that does not finish within 30 minutes', async () => {
+    const { gateway, stateDir, client } = await harness()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(() => new Promise(() => {}))
+    try {
+      await gateway.handleRequest(inbound('inbev_stuck'))
+      await vi.advanceTimersByTimeAsync(0)
+      await until(() => run.mock.calls.length === 1)
+      await vi.advanceTimersByTimeAsync(INBOUND_TURN_TIMEOUT_MS - 1)
+      expect(client.inbound?.reportInboundEventResult).not.toHaveBeenCalled()
+      expect(gateway.activity().active).toBeGreaterThan(0)
+      await vi.advanceTimersByTimeAsync(1)
+      await until(() => scheduled(gateway) === 1)
+      await vi.advanceTimersByTimeAsync(0)
+      await until(async () => (await queued(stateDir)) === 0)
+      expect(client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
+        'deepseek-agent',
+        SOURCE_ID,
+        'inbev_stuck',
+        expect.objectContaining({ status: 'failed', error: 'Agent turn did not finish within 30 minutes' }),
       )
     } finally {
       await gateway.close()

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { RoutedEvent } from './routing.js'
 
 export const INBOUND_SCRIPT_TIMEOUT_MS = 120_000
+export const INBOUND_TURN_TIMEOUT_MS = 30 * 60_000
 export const INBOUND_RETRY_DELAYS_MS = [10_000, 30_000, 120_000, 600_000]
 export const INBOUND_BODY_MAX_BYTES = 64 * 1024
 export const INBOUND_STDERR_TAIL_BYTES = 4 * 1024

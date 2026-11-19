@@ -19,6 +19,7 @@ import { toIMessagePlainText } from './imessage.js'
 import {
   INBOUND_REPORT_ERROR_MAX_CHARS,
   INBOUND_RETRY_DELAYS_MS,
+  INBOUND_TURN_TIMEOUT_MS,
   InboundStore,
   inboundBody,
   inboundRoutedEvent,
@@ -350,10 +351,25 @@ export class Gateway {
       await this.inboundStore.save({ ...item, turnStarted: true })
       item.turnStarted = true
       const routed = inboundRoutedEvent(item.trackingId, event, item.output ?? inboundBody(event))
+      let bound: ReturnType<typeof setTimeout> | undefined
       try {
-        await this.agents.run(routed.routeKey, renderChannelEvent(routed, this.config), { failOnError: true })
+        await Promise.race([
+          this.agents.run(routed.routeKey, renderChannelEvent(routed, this.config), { failOnError: true }),
+          new Promise<never>((_, reject) => {
+            bound = setTimeout(
+              () =>
+                reject(
+                  new Error(`Agent turn did not finish within ${INBOUND_TURN_TIMEOUT_MS / 60_000} minutes`),
+                ),
+              INBOUND_TURN_TIMEOUT_MS,
+            )
+            bound.unref?.()
+          }),
+        ])
       } catch (error) {
         return await this.reportInbound(item, error instanceof Error ? error.message : String(error))
+      } finally {
+        clearTimeout(bound)
       }
       await this.finishInbound(key)
     } catch (error) {
