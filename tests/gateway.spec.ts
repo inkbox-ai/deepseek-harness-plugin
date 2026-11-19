@@ -14,6 +14,7 @@ import {
   isSilentResponse,
 } from '../src/gateway.js'
 import type { InkboxRuntime } from '../src/runtime.js'
+import { VoiceNoteNotAdmitted } from '../src/voice-notes.js'
 
 const tunnel = vi.hoisted(() => ({
   connected: true,
@@ -751,4 +752,12 @@ it('keeps an attachment-only voice note instead of consuming an empty approval a
   await gateway.handleRequest(email('typed-approval', 'YES, approved'))
   await expect(approval).resolves.toBe('allowed-once')
   await gateway.close()
+})
+
+it('refuses a resolved voice note before reserving its event when the gateway has stopped', async () => {
+  const { gateway } = await harness()
+  await gateway.close()
+  const event = { event_type: 'text.received', id: 'voice-while-stopped' }
+  await expect(gateway.dispatchVerified(event, 'inkbox', true)).rejects.toBeInstanceOf(VoiceNoteNotAdmitted)
+  expect(gateway.state.snapshot().seen[event.id]).toBeUndefined()
 })

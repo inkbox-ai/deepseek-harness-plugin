@@ -3,8 +3,16 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { dirname } from 'node:path'
 
 export type VoiceEvent = Record<string, any>
-type Pending = { event: VoiceEvent; deadline: number; polled?: boolean; retryAt?: number }
-type Saved = { pending: Record<string, Pending>; done: Record<string, number> }
+export class VoiceNoteNotAdmitted extends Error {}
+
+type Pending = {
+  event: VoiceEvent
+  deadline: number
+  polled?: boolean
+  handoff?: 'attempting' | 'retry'
+  retryAt?: number
+}
+type Saved = { handoffVersion?: number; pending: Record<string, Pending>; done: Record<string, number> }
 const FAMILIES = new Set(['text', 'imessage', 'whatsapp'])
 
 export const TRANSCRIPTION_FINISHED = 'message.transcription_finished'
@@ -90,6 +98,15 @@ export class VoiceNoteInbox {
     },
   ) {
     if (existsSync(options.path)) this.saved = JSON.parse(readFileSync(options.path, 'utf8'))
+    if (this.saved.handoffVersion !== 1) {
+      // Older receipts that reached delivery had no pre-call checkpoint.
+      for (const entry of Object.values(this.saved.pending)) {
+        if (entry.polled || entry.retryAt || !pending(source(entry.event))) {
+          entry.handoff = 'attempting'
+        }
+      }
+      this.saved.handoffVersion = 1
+    }
   }
   private persist(): void {
     const now = Date.now()
@@ -115,6 +132,7 @@ export class VoiceNoteInbox {
       if (this.saved.done[id]) return true
       const entry = this.saved.pending[id]
       if (entry) {
+        if (entry.handoff) return true
         entry.event = merge(entry.event, event)
         this.persist()
         if (!pending(source(entry.event))) this.launch(id, false)
@@ -152,7 +170,7 @@ export class VoiceNoteInbox {
   private schedule(id: string): void {
     if (this.stopped || this.timers.has(id) || this.running.has(id)) return
     const entry = this.saved.pending[id]
-    if (!entry) return
+    if (!entry || entry.handoff === 'attempting') return
     const delay =
       entry.retryAt !== undefined
         ? Math.max(0, entry.retryAt - Date.now())
@@ -174,7 +192,7 @@ export class VoiceNoteInbox {
       .then(() => this.finish(id, poll))
       .catch(() => {
         const entry = this.saved.pending[id]
-        if (entry) {
+        if (entry && entry.handoff !== 'attempting') {
           entry.retryAt = Date.now() + 5_000
           try {
             this.persist()
@@ -196,7 +214,7 @@ export class VoiceNoteInbox {
     if (!entry || this.stopped) return
     clearTimeout(this.timers.get(id))
     this.timers.delete(id)
-    if (poll && pending(source(entry.event)) && !entry.polled) {
+    if (!entry.handoff && poll && pending(source(entry.event)) && !entry.polled) {
       entry.polled = true
       this.persist()
       try {
@@ -215,7 +233,16 @@ export class VoiceNoteInbox {
     if (this.stopped || this.saved.pending[id] !== entry) return
     delete entry.retryAt
     this.persist()
-    await this.options.deliver(entry.event)
+    // Persist before calling the host: a crash or generic exception does not
+    // prove that the turn was refused.
+    entry.handoff = 'attempting'
+    this.persist()
+    try {
+      await this.options.deliver(entry.event)
+    } catch (error) {
+      if (error instanceof VoiceNoteNotAdmitted) entry.handoff = 'retry'
+      throw error
+    }
     delete this.saved.pending[id]
     this.saved.done[id] = Date.now()
     this.persist()

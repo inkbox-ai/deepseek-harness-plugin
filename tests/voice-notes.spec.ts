@@ -3,7 +3,13 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { pollVoiceNote, type VoiceEvent, VoiceNoteInbox, voiceNoteContext } from '../src/voice-notes.js'
+import {
+  pollVoiceNote,
+  type VoiceEvent,
+  VoiceNoteInbox,
+  VoiceNoteNotAdmitted,
+  voiceNoteContext,
+} from '../src/voice-notes.js'
 
 const received = (family = 'imessage', statuses = ['pending']): VoiceEvent => ({
   id: 'event-received',
@@ -176,7 +182,7 @@ describe('voice-note delivery', () => {
     expect(second.poll).toHaveBeenCalledTimes(1)
     expect(second.deliver).toHaveBeenCalledTimes(1)
   })
-  it('retains a failed delivery for recovery rather than recording it as done', async () => {
+  it('does not replay an ambiguous handoff after restart', async () => {
     const current = setup()
     current.deliver.mockRejectedValueOnce(new Error('host unavailable'))
     await current.inbox.accept(received())
@@ -186,11 +192,11 @@ describe('voice-note delivery', () => {
     const recovered = setup()
     recovered.inbox.recover()
     await vi.advanceTimersByTimeAsync(60_000)
-    expect(recovered.deliver).toHaveBeenCalledTimes(1)
+    expect(recovered.deliver).not.toHaveBeenCalled()
   })
   it('retries a transient host admission failure without polling a second time', async () => {
     const { inbox, deliver, poll } = setup()
-    deliver.mockRejectedValueOnce(new Error('host temporarily unavailable'))
+    deliver.mockRejectedValueOnce(new VoiceNoteNotAdmitted('host temporarily unavailable'))
     await inbox.accept(received())
     await vi.advanceTimersByTimeAsync(60_000)
     expect(deliver).toHaveBeenCalledTimes(1)
@@ -205,7 +211,7 @@ describe('voice-note delivery', () => {
   it('retains the one-poll decision across restart after failed admission', async () => {
     const path = join(directory, 'poll-recovery.json')
     const first = setup({ path })
-    first.deliver.mockRejectedValueOnce(new Error('host temporarily unavailable'))
+    first.deliver.mockRejectedValueOnce(new VoiceNoteNotAdmitted('host temporarily unavailable'))
     await first.inbox.accept(received())
     await vi.advanceTimersByTimeAsync(60_000)
     expect(first.poll).toHaveBeenCalledTimes(1)

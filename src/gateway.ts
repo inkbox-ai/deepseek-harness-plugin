@@ -28,7 +28,7 @@ import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } fro
 import type { InkboxRuntime } from './runtime.js'
 import { StateStore } from './state.js'
 import { replyState } from './terminal-reply.js'
-import { pollVoiceNote, TRANSCRIPTION_FINISHED, VoiceNoteInbox } from './voice-notes.js'
+import { pollVoiceNote, TRANSCRIPTION_FINISHED, VoiceNoteInbox, VoiceNoteNotAdmitted } from './voice-notes.js'
 import { authenticateWebhook } from './webhook-providers.js'
 
 interface Queue {
@@ -198,7 +198,10 @@ export class Gateway {
     source: 'inkbox' | 'github',
     resolvedVoiceNote = false,
   ): Promise<Response> {
-    if (this.closing) return new Response('Gateway is stopping', { status: 503 })
+    if (this.closing) {
+      if (resolvedVoiceNote) throw new VoiceNoteNotAdmitted('Gateway is stopping')
+      return new Response('Gateway is stopping', { status: 503 })
+    }
     if (source === 'inkbox' && !resolvedVoiceNote && (await this.voiceNoteInbox().accept(payload)))
       return new Response('Accepted', { status: 202 })
     const callId = endedCallId(payload)
@@ -237,9 +240,9 @@ export class Gateway {
       },
       deliver: async (event) => {
         const response = await this.dispatchVerified(event, 'inkbox', true)
-        if (!response.ok) throw new Error('Voice-note delivery was not accepted')
+        if (!response.ok) throw new Error('Voice-note admission is unconfirmed')
       },
-      warn: () => this.log.warn('[inkbox] voice-note delivery will retry'),
+      warn: () => this.log.warn('[inkbox] voice-note delivery retained'),
     })
     return this.voiceNotes
   }
