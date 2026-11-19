@@ -1,14 +1,19 @@
 import { spawn } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
+import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { RoutedEvent } from './routing.js'
 
 export const INBOUND_SCRIPT_TIMEOUT_MS = 120_000
 export const INBOUND_RETRY_DELAYS_MS = [10_000, 30_000, 120_000, 600_000]
 export const INBOUND_BODY_MAX_BYTES = 64 * 1024
+export const INBOUND_STDERR_TAIL_BYTES = 4 * 1024
+export const INBOUND_REPORT_WINDOW_MS = 24 * 60 * 60 * 1000
 
 export interface InboundEvent {
   eventId: string
   // Stable across retries of one delivery and new per replay, so a replay runs again.
-  deliveryKey: string
+  deliveryId: string
   sourceId: string
   sourceName: string
   instructions?: string
@@ -36,9 +41,10 @@ export function parseInbound(payload: Json): InboundEvent | undefined {
   const handler = record(data.handler)
   const request = record(data.request)
   const eventId = text(data.event_id)
+  const deliveryId = text(data.delivery_id)
   const sourceId = text(source.id)
   const sourceName = text(source.name)
-  if (!eventId || !sourceId || !sourceName) return undefined
+  if (!eventId || !deliveryId || !sourceId || !sourceName) return undefined
   const command = text(handler.command)
   const parsedHandler =
     handler.type === 'agent'
@@ -55,7 +61,7 @@ export function parseInbound(payload: Json): InboundEvent | undefined {
   const instructions = text(source.instructions)
   return {
     eventId,
-    deliveryKey: text(data.delivery_id) ?? eventId,
+    deliveryId,
     sourceId,
     sourceName,
     ...(instructions ? { instructions } : {}),
@@ -115,8 +121,9 @@ export function runInboundScript(
   return new Promise((resolve) => {
     // A separate process group lets a timeout kill everything the shell started.
     const child = spawn('/bin/sh', ['-c', command], { cwd, detached: true, stdio: 'pipe' })
-    const stdout: Buffer[] = []
-    let stderr = ''
+    // One byte past the cap is enough for truncateInboundBody to mark the cut.
+    let stdout = Buffer.alloc(0)
+    let stderr = Buffer.alloc(0)
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true
@@ -124,9 +131,12 @@ export function runInboundScript(
         if (child.pid) process.kill(-child.pid, 'SIGKILL')
       } catch {}
     }, timeoutMs)
-    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (stdout.length <= INBOUND_BODY_MAX_BYTES)
+        stdout = Buffer.concat([stdout, chunk]).subarray(0, INBOUND_BODY_MAX_BYTES + 1)
+    })
     child.stderr.on('data', (chunk: Buffer) => {
-      stderr = (stderr + chunk.toString('utf8')).slice(-500)
+      stderr = Buffer.concat([stderr, chunk]).subarray(-INBOUND_STDERR_TAIL_BYTES)
     })
     child.stdin.on('error', () => {})
     child.on('error', (error) => {
@@ -135,15 +145,67 @@ export function runInboundScript(
     })
     child.on('close', (code, signal) => {
       clearTimeout(timer)
-      if (code === 0 && !timedOut) resolve({ ok: true, stdout: Buffer.concat(stdout).toString('utf8') })
-      else
+      if (code === 0 && !timedOut) {
+        resolve({ ok: true, stdout: truncateInboundBody(stdout.toString('utf8')) })
+      } else
         resolve({
           ok: false,
           error: timedOut
             ? `Timed out after ${timeoutMs / 1000} s`
-            : stderr.trim() || `Exited with ${signal ?? `code ${code}`}`,
+            : stderr.toString('utf8').trim() || `Exited with ${signal ?? `code ${code}`}`,
         })
     })
     child.stdin.end(input)
   })
+}
+
+export interface PendingInbound {
+  // Envelope id the host tracks this delivery by.
+  trackingId: string
+  event: InboundEvent
+  // Script stdout once the script succeeded; the agent turn then uses it as the body.
+  output?: string
+  attempts: number
+  dueAt: number
+  report?: { error: string; attempts: number; dueAt: number; until: number }
+}
+
+// One file per delivery keeps large bodies out of the shared gateway state.
+export class InboundStore {
+  constructor(readonly dir: string) {}
+
+  async load(): Promise<PendingInbound[]> {
+    await mkdir(this.dir, { recursive: true, mode: 0o700 })
+    const items: PendingInbound[] = []
+    for (const name of await readdir(this.dir)) {
+      if (!name.endsWith('.json')) continue
+      try {
+        const item = JSON.parse(await readFile(join(this.dir, name), 'utf8')) as PendingInbound
+        if (typeof item?.event?.deliveryId === 'string' && typeof item.attempts === 'number') items.push(item)
+      } catch {}
+    }
+    return items
+  }
+
+  async save(item: PendingInbound): Promise<void> {
+    await mkdir(this.dir, { recursive: true, mode: 0o700 })
+    const path = this.path(item.event.deliveryId)
+    const temp = `${path}.${randomBytes(6).toString('hex')}.tmp`
+    const handle = await open(temp, 'wx', 0o600)
+    try {
+      await handle.writeFile(JSON.stringify(item), 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await rename(temp, path)
+  }
+
+  async remove(deliveryId: string): Promise<void> {
+    await rm(this.path(deliveryId), { force: true })
+  }
+
+  private path(deliveryId: string): string {
+    return join(this.dir, `${createHash('sha256').update(deliveryId).digest('hex')}.json`)
+  }
 }

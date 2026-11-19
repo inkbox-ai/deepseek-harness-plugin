@@ -17,14 +17,15 @@ import { renderChannelEvent, resolveChannelInstruction } from './channel-instruc
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
+  INBOUND_REPORT_WINDOW_MS,
   INBOUND_RETRY_DELAYS_MS,
-  type InboundEvent,
+  InboundStore,
   inboundBody,
   inboundRoutedEvent,
+  type PendingInbound,
   parseInbound,
   runInboundScript,
   scriptInput,
-  truncateInboundBody,
 } from './inbound.js'
 import {
   authenticateCallWebSocket,
@@ -105,8 +106,10 @@ export class Gateway {
   private readonly activeDeliveries = new Set<string>()
   private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly typingPulses = new Map<string, TypingPulse>()
-  private readonly inboundScripts = new Set<string>()
+  private readonly inboundStore: InboundStore
+  private readonly inbound = new Map<string, PendingInbound>()
   private readonly inboundTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly inboundLanes = new Map<string, Promise<void>>()
   // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
   private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
@@ -118,12 +121,15 @@ export class Gateway {
     private readonly log: Pick<Console, 'info' | 'warn' | 'error'> = console,
   ) {
     this.state = new StateStore(join(config.stateDir, 'gateway-state.json'))
+    this.inboundStore = new InboundStore(join(config.stateDir, 'inbound'))
     this.agents = new AgentManager(ctx, config, this.state)
   }
 
   async initialize(): Promise<void> {
     await this.state.initialize()
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
+    for (const item of await this.inboundStore.load())
+      if (!this.inbound.has(item.event.deliveryId)) this.inbound.set(item.event.deliveryId, item)
     this.client = await this.runtime.getClient()
     this.identity = await this.runtime.getIdentity()
     this.signingKey = await this.runtime.resolveSigningKey()
@@ -264,93 +270,158 @@ export class Gateway {
     const event = parseInbound(payload)
     if (event === undefined) return new Response('Ignored', { status: 202 })
     // The host tracks the envelope id; deduplication uses the delivery id.
-    const trackingId = typeof payload.id === 'string' && payload.id ? payload.id : event.deliveryKey
-    const accepted = await this.state.mutate((state) => {
-      const now = Date.now()
-      const key = `inbound-delivery:${event.deliveryKey}`
-      if (state.seen[key] !== undefined) {
-        if (state.seen[trackingId] === undefined) state.replied[trackingId] = now
-        return false
-      }
-      state.seen[key] = now
-      state.seen[trackingId] = now
-      return true
-    })
-    if (!accepted) return new Response('Duplicate', { status: 200 })
-    if (event.handler.type === 'agent') {
-      await this.accept(inboundRoutedEvent(trackingId, event, inboundBody(event)))
-    } else {
-      this.inboundScripts.add(trackingId)
-      this.track(this.runInboundScript(trackingId, event, 0))
+    const trackingId = typeof payload.id === 'string' && payload.id ? payload.id : event.deliveryId
+    const marker = `inbound-delivery:${event.deliveryId}`
+    if (this.inbound.has(event.deliveryId) || this.state.snapshot().seen[marker] !== undefined) {
+      await this.state.mutate((state) => {
+        state.replied[trackingId] ??= Date.now()
+      })
+      return new Response('Duplicate', { status: 200 })
     }
+    const item: PendingInbound = { trackingId, event, attempts: 0, dueAt: Date.now() }
+    this.inbound.set(event.deliveryId, item)
+    try {
+      await this.inboundStore.save(item)
+    } catch (error) {
+      this.inbound.delete(event.deliveryId)
+      throw error
+    }
+    // Persisted work completes the managed delivery; handling continues from the local queue.
+    await this.state.mutate((state) => {
+      const now = Date.now()
+      state.seen[marker] = now
+      state.replied[trackingId] = now
+    })
+    this.scheduleInbound(item)
     return new Response('Accepted', { status: 202 })
   }
 
-  private async runInboundScript(trackingId: string, event: InboundEvent, attempt: number): Promise<void> {
-    if (event.handler.type !== 'script') return
+  private scheduleInbound(item: PendingInbound): void {
+    const key = item.event.deliveryId
+    if (this.closing || this.inboundTimers.has(key)) return
+    const dueAt = item.report?.dueAt ?? item.dueAt
+    const timer = setTimeout(
+      () => {
+        this.inboundTimers.delete(key)
+        // Handler work runs one event at a time per source; reports run independently.
+        const lane = item.report ? `report:${key}` : `source:${item.event.sourceId}`
+        const run = (this.inboundLanes.get(lane) ?? Promise.resolve()).then(() => this.stepInbound(key))
+        this.inboundLanes.set(lane, run)
+        void run.finally(() => {
+          if (this.inboundLanes.get(lane) === run) this.inboundLanes.delete(lane)
+        })
+        this.track(run)
+      },
+      Math.max(0, dueAt - Date.now()),
+    )
+    this.inboundTimers.set(key, timer)
+  }
+
+  private async stepInbound(key: string): Promise<void> {
+    const item = this.inbound.get(key)
+    if (item === undefined || this.closing) return
     try {
-      const result = await runInboundScript(event.handler.command, this.config.workspace, scriptInput(event))
-      if (result.ok) {
-        const output = result.stdout.trim()
-        if (output) await this.accept(inboundRoutedEvent(trackingId, event, truncateInboundBody(output)))
-        else
-          await this.state.mutate((state) => {
-            state.replied[trackingId] = Date.now()
-          })
-        this.inboundScripts.delete(trackingId)
-        return
-      }
-      const delay = INBOUND_RETRY_DELAYS_MS[attempt]
-      if (delay !== undefined) {
-        if (this.closing) return
-        this.log.warn('[inkbox] inbound script failed; retry scheduled')
-        this.inboundTimers.set(
-          trackingId,
-          setTimeout(() => {
-            this.inboundTimers.delete(trackingId)
-            this.track(this.runInboundScript(trackingId, event, attempt + 1))
-          }, delay),
+      if (item.report) return await this.sendInboundReport(item)
+      const { event } = item
+      item.attempts += 1
+      await this.inboundStore.save(item)
+      if (event.handler.type === 'script' && item.output === undefined) {
+        const result = await runInboundScript(
+          event.handler.command,
+          this.config.workspace,
+          scriptInput(event),
         )
-        return
+        if (!result.ok) return await this.retryInbound(item, result.error)
+        const output = result.stdout.trim()
+        if (!output) return await this.finishInbound(key)
+        item.output = output
+        item.attempts = 1
+        await this.inboundStore.save(item)
       }
-      this.log.warn('[inkbox] inbound script failed after every retry')
-      await this.reportInboundFailure(event, result.error)
-      await this.state.mutate((state) => {
-        state.replied[trackingId] = Date.now()
-      })
-      this.inboundScripts.delete(trackingId)
+      const routed = inboundRoutedEvent(item.trackingId, event, item.output ?? inboundBody(event))
+      try {
+        await this.agents.run(routed.routeKey, renderChannelEvent(routed, this.config), { failOnError: true })
+      } catch (error) {
+        return await this.retryInbound(item, error instanceof Error ? error.message : String(error))
+      }
+      await this.finishInbound(key)
     } catch (error) {
-      this.inboundScripts.delete(trackingId)
       this.log.error('[inkbox] inbound event handling failed', error)
+      if (item.report) item.report.dueAt = Date.now() + 10_000
+      else item.dueAt = Date.now() + 10_000
+      this.scheduleInbound(item)
     }
   }
 
-  private async reportInboundFailure(event: InboundEvent, error: string): Promise<void> {
-    const inbound = (
-      this.client as
-        | {
-            inbound?: {
-              reportInboundEventResult?: (
-                handle: string,
-                sourceId: string,
-                eventId: string,
-                result: { status: 'failed'; error: string },
-              ) => Promise<unknown>
-            }
-          }
-        | undefined
-    )?.inbound
-    // Older SDK releases cannot report results; the failure is then only logged.
-    if (typeof inbound?.reportInboundEventResult !== 'function' || !this.identity) {
-      this.log.warn('[inkbox] inbound event result reporting is unavailable')
-      return
+  private async retryInbound(item: PendingInbound, error: string): Promise<void> {
+    const delay = INBOUND_RETRY_DELAYS_MS[item.attempts - 1]
+    const now = Date.now()
+    if (delay !== undefined) {
+      this.log.warn('[inkbox] inbound event handling failed; retry scheduled')
+      item.dueAt = now + delay
+    } else {
+      this.log.warn('[inkbox] inbound event handling failed after every retry')
+      item.report = {
+        error: error.slice(-2000),
+        attempts: 0,
+        dueAt: now,
+        until: now + INBOUND_REPORT_WINDOW_MS,
+      }
     }
-    await inbound
-      .reportInboundEventResult(this.identity.agentHandle, event.sourceId, event.eventId, {
+    await this.inboundStore.save(item)
+    this.scheduleInbound(item)
+  }
+
+  private async sendInboundReport(item: PendingInbound): Promise<void> {
+    const report = item.report
+    if (report === undefined) return
+    if (this.identity === undefined) throw new Error('Gateway identity is unavailable')
+    const { event } = item
+    const inbound = (
+      this.client as unknown as {
+        inbound?: {
+          reportInboundEventResult?: (
+            handle: string,
+            sourceId: string,
+            eventId: string,
+            result: { status: 'failed'; error: string; deliveryId: string },
+          ) => Promise<unknown>
+        }
+      }
+    ).inbound
+    if (typeof inbound?.reportInboundEventResult !== 'function') {
+      this.log.warn('[inkbox] inbound event result reporting is unavailable')
+      return await this.finishInbound(event.deliveryId)
+    }
+    try {
+      await inbound.reportInboundEventResult(this.identity.agentHandle, event.sourceId, event.eventId, {
         status: 'failed',
-        error,
+        error: report.error,
+        deliveryId: event.deliveryId,
       })
-      .catch((cause) => this.log.warn('[inkbox] inbound event result report failed', cause))
+    } catch (error) {
+      // 4xx is final: 409 stale_delivery means a newer delivery owns the event.
+      const final =
+        error instanceof InkboxAPIError &&
+        error.statusCode >= 400 &&
+        error.statusCode < 500 &&
+        ![408, 429].includes(error.statusCode)
+      report.attempts += 1
+      const dueAt = Date.now() + deliveryRetryDelay(report.attempts)
+      if (!final && dueAt <= report.until) {
+        report.dueAt = dueAt
+        await this.inboundStore.save(item)
+        this.scheduleInbound(item)
+        return
+      }
+      if (!final) this.log.warn('[inkbox] inbound failure report abandoned', error)
+    }
+    await this.finishInbound(event.deliveryId)
+  }
+
+  private async finishInbound(key: string): Promise<void> {
+    await this.inboundStore.remove(key)
+    this.inbound.delete(key)
   }
 
   private voiceNoteInbox(): VoiceNoteInbox {
@@ -501,7 +572,6 @@ export class Gateway {
   eventState(eventId: string): 'absent' | 'pending' | 'completed' | 'failed' | 'uncertain' {
     const state = this.state.snapshot()
     if (state.replied[eventId] !== undefined) return 'completed'
-    if (this.inboundScripts.has(eventId)) return 'pending'
     for (const [id, delivery] of Object.entries(state.deliveries)) {
       if (!delivery.eventIds.includes(eventId)) continue
       if (delivery.state === 'rejected' || delivery.state === 'quarantined') return 'failed'
@@ -545,7 +615,7 @@ export class Gateway {
   } {
     const deliveries = Object.entries(this.state.snapshot().deliveries)
     return {
-      active: this.inflight.size + this.inboundTimers.size,
+      active: this.inflight.size + this.inbound.size,
       buffered: [...this.queues.values()].reduce((count, queue) => count + queue.buffered.length, 0),
       deliveries: deliveries.filter(([id, item]) => item.state === 'ready' || this.activeDeliveries.has(id))
         .length,
@@ -751,6 +821,7 @@ export class Gateway {
     for (const [deliveryId, pending] of Object.entries(this.state.snapshot().deliveries)) {
       this.scheduleDelivery(deliveryId, Math.max(0, pending.nextAttemptAt - Date.now()))
     }
+    for (const item of this.inbound.values()) this.scheduleInbound(item)
   }
 
   private scheduleDelivery(deliveryId: string, delay: number): void {

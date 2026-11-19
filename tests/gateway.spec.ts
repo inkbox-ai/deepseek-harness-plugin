@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -84,8 +85,9 @@ async function harness(
   channelInstructions: Record<string, string> = {},
   sharedEvents: string[] = [],
   unsupportedTranscription = false,
+  existingStateDir?: string,
 ): Promise<Harness> {
-  const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
+  const stateDir = existingStateDir ?? (await mkdtemp(join(tmpdir(), 'inkbox-gateway-')))
   const subscriptions = {
     list: vi.fn(async (filter: { scope?: string; url: string }) =>
       filter.scope === 'identity' && sharedEvents.length
@@ -851,45 +853,69 @@ it.each(['ignored', 'not-reserved', 'reserved'] as const)(
   },
 )
 
+const ACTIVATION_ID = '0b9f3c1e-5d0a-4c55-9d43-6f1f8f5f2a10'
+
+function envelopeId(deliveryId: string): string {
+  return `evt_${createHash('sha256').update(`inbound:${deliveryId}`).digest('hex')}`
+}
+
+// The signed envelope a hosted agent receives: the event payload plus `id` and `hosted_delivery`.
 function inbound(
   eventId: string,
   handler: Record<string, unknown> = { type: 'agent' },
   request: Record<string, unknown> = { body: '{"type":"charge.succeeded"}', body_encoding: 'utf8' },
-  envelopeId = `envelope-${eventId}`,
-  deliveryId: string | null = `inbdlv-${eventId}`,
+  deliveryId: string | null = `1d6b3c3e-0000-4000-8000-${eventId.slice(-12).padStart(12, '0')}`,
 ): Request {
+  const id = envelopeId(deliveryId ?? eventId)
   return new Request('http://127.0.0.1/webhook', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
     body: JSON.stringify({
-      id: envelopeId,
-      event_type: 'inbound.received',
-      timestamp: '2026-11-19T00:00:00Z',
       data: {
-        event_id: eventId,
         ...(deliveryId === null ? {} : { delivery_id: deliveryId }),
-        received_at: '2026-11-19T00:00:00Z',
-        source: { id: 'inbsrc_1', name: 'payments', instructions: 'Record every successful charge.' },
+        event_id: eventId,
         handler,
-        signature_verified: true,
+        received_at: '2026-11-19T00:00:00+00:00',
         request: {
+          body_encoding: 'utf8',
+          content_type: 'application/json',
+          headers: { 'content-type': 'application/json' },
           method: 'POST',
           query: {},
-          headers: { 'content-type': 'application/json' },
-          content_type: 'application/json',
           ...request,
         },
+        signature_verified: true,
+        source: {
+          id: 'inbsrc_5a2f7c9e-1b3d-4e6f-8a9b-0c1d2e3f4a5b',
+          instructions: 'Record every successful charge.',
+          name: 'payments',
+        },
       },
+      event_type: 'inbound.received',
+      hosted_delivery: { activation_id: ACTIVATION_ID, event_id: id, starts_agent: true, version: 1 },
+      id,
+      timestamp: '2026-11-19T00:00:00+00:00',
     }),
   })
 }
+
+function trackingId(request: Request): Promise<string> {
+  return request
+    .clone()
+    .json()
+    .then((body: { id: string }) => body.id)
+}
+
+const SOURCE_ID = 'inbsrc_5a2f7c9e-1b3d-4e6f-8a9b-0c1d2e3f4a5b'
 
 it('ignores inbound events outside local delivery', async () => {
   const { gateway } = await harness()
   const run = vi.spyOn(gateway.agents, 'run')
   try {
-    expect((await gateway.handleRequest(inbound('inbev_ignored'))).status).toBe(202)
-    expect(gateway.eventState('envelope-inbev_ignored')).toBe('absent')
+    const request = inbound('inbev_ignored')
+    const id = await trackingId(request)
+    expect((await gateway.handleRequest(request)).status).toBe(202)
+    expect(gateway.eventState(id)).toBe('absent')
     expect(run).not.toHaveBeenCalled()
   } finally {
     await gateway.close()
@@ -897,12 +923,21 @@ it('ignores inbound events outside local delivery', async () => {
 })
 
 // vi.waitFor advances fake timers while polling, which would shift the retry schedule.
-async function until(condition: () => boolean): Promise<void> {
-  const deadline = Date.now() + 5_000
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error('Condition not met')
+async function until(condition: () => boolean | Promise<boolean>): Promise<void> {
+  const deadline = performance.now() + 5_000
+  while (!(await condition())) {
+    if (performance.now() > deadline) throw new Error('Condition not met')
     await new Promise((resolve) => setImmediate(resolve))
   }
+}
+
+function scheduled(gateway: Gateway): number {
+  return (gateway as unknown as { inboundTimers: Map<string, unknown> }).inboundTimers.size
+}
+
+async function queued(stateDir: string): Promise<number> {
+  return (await readdir(join(stateDir, 'inbound')).catch(() => [])).filter((name) => name.endsWith('.json'))
+    .length
 }
 
 describe('local delivery', () => {
@@ -916,6 +951,7 @@ describe('local delivery', () => {
 
   it('opens no tunnel, registers no URL and accepts bodies up to 2 MiB', async () => {
     const { gateway, subscriptions } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
     try {
       expect(tunnel.connect).not.toHaveBeenCalled()
       expect(subscriptions.list).not.toHaveBeenCalled()
@@ -934,20 +970,30 @@ describe('local delivery', () => {
       tunnel.verify = false
       expect((await gateway.handleRequest(inbound('inbev_unsigned'))).status).toBe(401)
     } finally {
+      tunnel.verify = true
       await gateway.close()
     }
   })
 
-  it('runs one deduplicated untrusted agent turn per source without replying', async () => {
-    const { gateway, identity } = await harness()
-    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('Recorded')
+  it('completes the delivery once persisted and runs one untrusted agent turn per delivery id', async () => {
+    const { gateway, identity, stateDir } = await harness()
+    let finish: (value: string) => void = () => {}
+    const run = vi
+      .spyOn(gateway.agents, 'run')
+      .mockImplementation(() => new Promise((resolve) => (finish = resolve)))
     try {
-      expect((await gateway.handleRequest(inbound('inbev_1'))).status).toBe(202)
-      expect((await gateway.handleRequest(inbound('inbev_1', undefined, undefined, 'retried'))).status).toBe(
-        200,
-      )
-      await vi.waitFor(() => expect(gateway.eventState('envelope-inbev_1')).toBe('completed'))
-      expect(gateway.eventState('retried')).toBe('completed')
+      const request = inbound('inbev_1')
+      const id = await trackingId(request)
+      expect((await gateway.handleRequest(request)).status).toBe(202)
+      expect(gateway.eventState(id)).toBe('completed')
+      expect(await queued(stateDir)).toBe(1)
+      expect((await gateway.handleRequest(inbound('inbev_1'))).status).toBe(200)
+      await until(() => run.mock.calls.length === 1)
+      expect(gateway.activity().active).toBeGreaterThan(0)
+      finish('Recorded')
+      await until(async () => (await queued(stateDir)) === 0)
+      await until(() => gateway.activity().active === 0)
+      expect((await gateway.handleRequest(inbound('inbev_1'))).status).toBe(200)
       expect(run).toHaveBeenCalledOnce()
       const [route, prompt = ''] = run.mock.calls[0] ?? []
       expect(route).toBe('inbound:payments')
@@ -968,28 +1014,22 @@ describe('local delivery', () => {
     const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
     try {
       expect((await gateway.handleRequest(inbound('inbev_r'))).status).toBe(202)
-      await vi.waitFor(() => expect(gateway.eventState('envelope-inbev_r')).toBe('completed'))
-      const replay = inbound('inbev_r', undefined, undefined, 'replay', 'inbdlv-replay')
+      await until(() => run.mock.calls.length === 1)
+      const replay = inbound('inbev_r', undefined, undefined, '1d6b3c3e-0000-4000-8000-00000000beef')
       expect((await gateway.handleRequest(replay)).status).toBe(202)
-      await vi.waitFor(() => expect(gateway.eventState('replay')).toBe('completed'))
-      expect(run).toHaveBeenCalledTimes(2)
+      await until(() => run.mock.calls.length === 2)
     } finally {
       await gateway.close()
     }
   })
 
-  it('deduplicates on the event id when there is no delivery id', async () => {
-    const { gateway } = await harness()
-    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+  it('ignores an inbound event without a delivery id', async () => {
+    const { gateway, stateDir } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run')
     try {
-      expect((await gateway.handleRequest(inbound('inbev_n', undefined, undefined, 'a', null))).status).toBe(
-        202,
-      )
-      expect((await gateway.handleRequest(inbound('inbev_n', undefined, undefined, 'b', null))).status).toBe(
-        200,
-      )
-      await vi.waitFor(() => expect(gateway.eventState('a')).toBe('completed'))
-      expect(run).toHaveBeenCalledOnce()
+      expect((await gateway.handleRequest(inbound('inbev_n', undefined, undefined, null))).status).toBe(202)
+      expect(await queued(stateDir)).toBe(0)
+      expect(run).not.toHaveBeenCalled()
     } finally {
       await gateway.close()
     }
@@ -1050,7 +1090,7 @@ describe('local delivery', () => {
       expect((await gateway.handleRequest(inbound('inbev_quiet', { type: 'script', command }))).status).toBe(
         202,
       )
-      await vi.waitFor(() => expect(gateway.eventState('envelope-inbev_quiet')).toBe('completed'))
+      await until(async () => (await queued(stateDir)) === 0)
       expect(JSON.parse(await readFile(join(stateDir, 'input.json'), 'utf8'))).toEqual({
         source: 'payments',
         event_id: 'inbev_quiet',
@@ -1071,11 +1111,11 @@ describe('local delivery', () => {
       await gateway.handleRequest(
         inbound('inbev_out', { type: 'script', command: 'echo "charge from $(pwd)"' }),
       )
-      await vi.waitFor(() => expect(gateway.eventState('envelope-inbev_out')).toBe('completed'))
-      expect(run).toHaveBeenCalledOnce()
+      await until(() => run.mock.calls.length === 1)
       expect(run.mock.calls[0]?.[0]).toBe('inbound:payments')
       expect(run.mock.calls[0]?.[1]).toMatch(/\[untrusted incoming content\]\ncharge from \//)
       expect(run.mock.calls[0]?.[1]).toContain('Record every successful charge.')
+      expect(run.mock.calls[0]?.[2]).toEqual({ failOnError: true })
     } finally {
       await gateway.close()
     }
@@ -1090,29 +1130,35 @@ describe('local delivery', () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
       try {
         const command = 'echo run >> attempts; echo boom >&2; exit 3'
-        expect((await gateway.handleRequest(inbound('inbev_fail', { type: 'script', command }))).status).toBe(
-          202,
-        )
+        const request = inbound('inbev_fail', { type: 'script', command })
+        const id = await trackingId(request)
+        const deliveryId = JSON.parse(await request.clone().text()).data.delivery_id
+        expect((await gateway.handleRequest(request)).status).toBe(202)
+        expect(gateway.eventState(id)).toBe('completed')
+        await vi.advanceTimersByTimeAsync(0)
         const attempts = async () =>
           (await readFile(join(stateDir, 'attempts'), 'utf8').catch(() => '')).split('\n').length - 1
         for (const [index, delay] of [10_000, 30_000, 120_000, 600_000].entries()) {
-          const scheduled = (gateway as unknown as { inboundTimers: Map<string, unknown> }).inboundTimers
-          await until(() => scheduled.size === 1)
+          await until(async () => (await attempts()) === index + 1)
+          await until(() => scheduled(gateway) === 1)
           expect(gateway.activity().active).toBe(1)
-          expect(await attempts()).toBe(index + 1)
-          expect(gateway.eventState('envelope-inbev_fail')).toBe('pending')
           await vi.advanceTimersByTimeAsync(delay - 1)
           expect(await attempts()).toBe(index + 1)
           await vi.advanceTimersByTimeAsync(1)
         }
-        await until(() => gateway.eventState('envelope-inbev_fail') === 'completed')
+        await until(async () => (await attempts()) === 5)
+        await until(() => scheduled(gateway) === 1)
+        await vi.advanceTimersByTimeAsync(0)
+        await until(async () => (await queued(stateDir)) === 0)
         expect(await attempts()).toBe(5)
         await vi.advanceTimersByTimeAsync(3_600_000)
         expect(await attempts()).toBe(5)
+        expect(gateway.activity().active).toBe(0)
         if (reporting)
-          expect(report).toHaveBeenCalledWith('deepseek-agent', 'inbsrc_1', 'inbev_fail', {
+          expect(report).toHaveBeenCalledWith('deepseek-agent', SOURCE_ID, 'inbev_fail', {
             status: 'failed',
             error: 'boom',
+            deliveryId,
           })
         else expect(report).not.toHaveBeenCalled()
       } finally {
@@ -1121,4 +1167,87 @@ describe('local delivery', () => {
       }
     },
   )
+
+  it('reports agent turn failures after every retry', async () => {
+    const { gateway, stateDir, client } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('model unavailable'))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      await gateway.handleRequest(inbound('inbev_agentfail'))
+      await vi.advanceTimersByTimeAsync(0)
+      for (const [index, delay] of [10_000, 30_000, 120_000, 600_000].entries()) {
+        await until(() => run.mock.calls.length === index + 1)
+        await until(() => scheduled(gateway) === 1)
+        await vi.advanceTimersByTimeAsync(delay)
+      }
+      await until(() => run.mock.calls.length === 5)
+      await until(() => scheduled(gateway) === 1)
+      await vi.advanceTimersByTimeAsync(0)
+      await until(async () => (await queued(stateDir)) === 0)
+      expect(run).toHaveBeenCalledTimes(5)
+      expect(client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
+        'deepseek-agent',
+        SOURCE_ID,
+        'inbev_agentfail',
+        expect.objectContaining({ status: 'failed', error: 'model unavailable' }),
+      )
+    } finally {
+      vi.useRealTimers()
+      await gateway.close()
+    }
+  })
+
+  it('resumes queued work and pending reports after a restart without running a finished script again', async () => {
+    const first = await harness()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const command = 'echo run >> attempts; exit 1'
+    const request = inbound('inbev_restart', { type: 'script', command })
+    const deliveryId = JSON.parse(await request.clone().text()).data.delivery_id
+    expect((await first.gateway.handleRequest(request)).status).toBe(202)
+    await vi.advanceTimersByTimeAsync(0)
+    const attempts = async () =>
+      (await readFile(join(first.stateDir, 'attempts'), 'utf8').catch(() => '')).split('\n').length - 1
+    await until(async () => (await attempts()) === 1)
+    await until(() => scheduled(first.gateway) === 1)
+    await first.gateway.close()
+
+    let second = await harness(0, 'inkbox_voice_ai', {}, [], false, first.stateDir)
+    try {
+      expect(
+        (await second.gateway.handleRequest(inbound('inbev_restart', { type: 'script', command }))).status,
+      ).toBe(200)
+      expect(second.gateway.activity().active).toBe(1)
+      second.client.inbound?.reportInboundEventResult.mockRejectedValue(
+        new InkboxAPIError(503, 'unavailable'),
+      )
+      for (const [index, delay] of [10_000, 30_000, 120_000, 600_000].entries()) {
+        await vi.advanceTimersByTimeAsync(delay)
+        await until(async () => (await attempts()) === index + 2)
+        await until(() => scheduled(second.gateway) === 1)
+      }
+      await vi.advanceTimersByTimeAsync(0)
+      await until(() => (second.client.inbound?.reportInboundEventResult.mock.calls.length ?? 0) === 1)
+      await until(() => scheduled(second.gateway) === 1)
+      expect(await attempts()).toBe(5)
+      expect(await queued(first.stateDir)).toBe(1)
+      await second.gateway.close()
+
+      second = await harness(0, 'inkbox_voice_ai', {}, [], false, first.stateDir)
+      second.client.inbound?.reportInboundEventResult.mockRejectedValue(
+        new InkboxAPIError(409, 'stale_delivery'),
+      )
+      await vi.advanceTimersByTimeAsync(3_600_000)
+      await until(async () => (await queued(first.stateDir)) === 0)
+      expect(second.client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
+        'deepseek-agent',
+        SOURCE_ID,
+        'inbev_restart',
+        { status: 'failed', error: 'Exited with code 1', deliveryId },
+      )
+      expect(await attempts()).toBe(5)
+    } finally {
+      vi.useRealTimers()
+      await second.gateway.close()
+    }
+  })
 })
