@@ -17,7 +17,7 @@ import { renderChannelEvent, resolveChannelInstruction } from './channel-instruc
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
-  INBOUND_REPORT_WINDOW_MS,
+  INBOUND_REPORT_ERROR_MAX_CHARS,
   INBOUND_RETRY_DELAYS_MS,
   InboundStore,
   inboundBody,
@@ -110,6 +110,7 @@ export class Gateway {
   private readonly inbound = new Map<string, PendingInbound>()
   private readonly inboundTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly inboundLanes = new Map<string, Promise<void>>()
+  private readonly inboundPersisting = new Map<string, Promise<void>>()
   // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
   private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
@@ -272,6 +273,9 @@ export class Gateway {
     // The host tracks the envelope id; deduplication uses the delivery id.
     const trackingId = typeof payload.id === 'string' && payload.id ? payload.id : event.deliveryId
     const marker = `inbound-delivery:${event.deliveryId}`
+    // A duplicate is acknowledged only once the first copy is durably stored.
+    const persisting = this.inboundPersisting.get(event.deliveryId)
+    if (persisting) await persisting.catch(() => {})
     if (this.inbound.has(event.deliveryId) || this.state.snapshot().seen[marker] !== undefined) {
       await this.state.mutate((state) => {
         state.replied[trackingId] ??= Date.now()
@@ -279,21 +283,24 @@ export class Gateway {
       return new Response('Duplicate', { status: 200 })
     }
     const item: PendingInbound = { trackingId, event, attempts: 0, dueAt: Date.now() }
-    this.inbound.set(event.deliveryId, item)
-    try {
-      await this.inboundStore.save(item)
-    } catch (error) {
-      this.inbound.delete(event.deliveryId)
-      throw error
-    }
+    const stored = this.persistInbound(item, marker).finally(() =>
+      this.inboundPersisting.delete(event.deliveryId),
+    )
+    this.inboundPersisting.set(event.deliveryId, stored)
+    await stored
+    return new Response('Accepted', { status: 202 })
+  }
+
+  private async persistInbound(item: PendingInbound, marker: string): Promise<void> {
+    await this.inboundStore.save(item)
+    this.inbound.set(item.event.deliveryId, item)
+    this.scheduleInbound(item)
     // Persisted work completes the managed delivery; handling continues from the local queue.
     await this.state.mutate((state) => {
       const now = Date.now()
       state.seen[marker] = now
-      state.replied[trackingId] = now
+      state.replied[item.trackingId] = now
     })
-    this.scheduleInbound(item)
-    return new Response('Accepted', { status: 202 })
   }
 
   private scheduleInbound(item: PendingInbound): void {
@@ -325,6 +332,8 @@ export class Gateway {
       const { event } = item
       if (item.turnStarted) return await this.reportInbound(item, 'Agent turn was interrupted by a restart')
       if (event.handler.type === 'script' && item.output === undefined) {
+        if (item.attempts > INBOUND_RETRY_DELAYS_MS.length)
+          return await this.reportInbound(item, 'Script run was interrupted by a restart')
         // Counted before running so a crash mid-run still uses up the attempt.
         item.attempts += 1
         await this.inboundStore.save(item)
@@ -369,12 +378,7 @@ export class Gateway {
 
   private async reportInbound(item: PendingInbound, error: string): Promise<void> {
     const now = Date.now()
-    item.report = {
-      error: error.slice(-2000),
-      attempts: 0,
-      dueAt: now,
-      until: now + INBOUND_REPORT_WINDOW_MS,
-    }
+    item.report = { error: error.slice(-INBOUND_REPORT_ERROR_MAX_CHARS), attempts: 0, dueAt: now }
     await this.inboundStore.save(item)
     this.scheduleInbound(item)
   }
@@ -413,15 +417,13 @@ export class Gateway {
         error.statusCode >= 400 &&
         error.statusCode < 500 &&
         ![408, 429].includes(error.statusCode)
-      report.attempts += 1
-      const dueAt = Date.now() + deliveryRetryDelay(report.attempts)
-      if (!final && dueAt <= report.until) {
-        report.dueAt = dueAt
+      if (!final) {
+        report.attempts += 1
+        report.dueAt = Date.now() + deliveryRetryDelay(report.attempts)
         await this.inboundStore.save(item)
         this.scheduleInbound(item)
         return
       }
-      if (!final) this.log.warn('[inkbox] inbound failure report abandoned', error)
     }
     await this.finishInbound(event.deliveryId)
   }

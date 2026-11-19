@@ -318,9 +318,11 @@ active owner; use a separate identity when testing another host concurrently.
   each event is queued in the state directory before it is acknowledged, and handling resumes after a restart.
   `agent` handlers start a turn in a per-source session, and `script` handlers run `/bin/sh -c <command>` in the
   workspace with the event as JSON on stdin (120 s limit). Empty output finishes the event, other output (up to
-  64 KiB) is passed to the agent, and a failing script or agent turn runs at most 5 times (retries after 10 s,
-  30 s, 2 min, 10 min) before the failure is reported. Deliveries are deduplicated by `delivery_id`; a replay
-  runs again. Bodies over 64 KiB are cut and marked `(truncated)` in agent messages; scripts get the full body.
+  64 KiB) is passed to the agent. A failing script runs at most 5 times (retries after 10 s, 30 s, 2 min,
+  10 min); an agent turn runs once. Failures are reported and the report is retried until it is accepted.
+  Deliveries are deduplicated by `delivery_id`; a replay runs again. Bodies over 64 KiB are cut and marked
+  `(truncated)` in agent messages; a base64 body is shown as text when it is valid UTF-8, otherwise noted as
+  binary. Scripts get the full body.
 
 ## License
 

@@ -14,7 +14,7 @@ import {
   IMESSAGE_TYPING_REFRESH_MS,
   isSilentResponse,
 } from '../src/gateway.js'
-import { INBOUND_BODY_MAX_BYTES } from '../src/inbound.js'
+import { INBOUND_BODY_MAX_BYTES, InboundStore, parseInbound } from '../src/inbound.js'
 import type { InkboxRuntime } from '../src/runtime.js'
 import { VoiceNoteNotAdmitted } from '../src/voice-notes.js'
 
@@ -1073,11 +1073,123 @@ describe('local delivery', () => {
     const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
     try {
       await gateway.handleRequest(
-        inbound('inbev_bin', { type: 'agent' }, { body: 'AAEC', body_encoding: 'base64' }),
+        inbound('inbev_bin', { type: 'agent' }, { body: '//4A', body_encoding: 'base64' }),
       )
       await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
       expect(run.mock.calls[0]?.[1]).toContain('(binary body, 3 bytes, not shown)')
     } finally {
+      await gateway.close()
+    }
+  })
+
+  it('shows a base64 body that decodes to UTF-8 as text', async () => {
+    const { gateway } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    try {
+      const body = Buffer.from('{"note":"café"}').toString('base64')
+      await gateway.handleRequest(inbound('inbev_b64', { type: 'agent' }, { body, body_encoding: 'base64' }))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      expect(run.mock.calls[0]?.[1]).toContain('{"note":"café"}')
+      expect(run.mock.calls[0]?.[1]).not.toContain('binary body')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('acknowledges a duplicate only after the first copy is stored', async () => {
+    const { gateway } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+    const save = InboundStore.prototype.save
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const spy = vi.spyOn(InboundStore.prototype, 'save').mockImplementationOnce(async function (
+      this: InboundStore,
+      item,
+    ) {
+      await gate
+      return save.call(this, item)
+    })
+    try {
+      let duplicateDone = false
+      const first = gateway.handleRequest(inbound('inbev_dup'))
+      await until(() => spy.mock.calls.length === 1)
+      const duplicate = gateway.handleRequest(inbound('inbev_dup')).then((response) => {
+        duplicateDone = true
+        return response
+      })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(duplicateDone).toBe(false)
+      release()
+      expect((await first).status).toBe(202)
+      expect((await duplicate).status).toBe(200)
+    } finally {
+      spy.mockRestore()
+      await gateway.close()
+    }
+  })
+
+  it('caps the reported error at 2000 characters', async () => {
+    const { gateway, stateDir, client } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error(`${'e'.repeat(5_000)}END`))
+    try {
+      await gateway.handleRequest(inbound('inbev_longerr'))
+      await until(async () => (await queued(stateDir)) === 0)
+      const [, , , result] = client.inbound?.reportInboundEventResult.mock.calls[0] ?? []
+      expect(result.error).toHaveLength(2000)
+      expect(result.error.endsWith('END')).toBe(true)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('never starts a sixth script run after a restart during the fifth', async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
+    const request = inbound('inbev_capped', { type: 'script', command: 'echo run >> attempts' })
+    const event = parseInbound(await request.clone().json())
+    if (!event) throw new Error('unparsed')
+    // Five runs already started; the last one was cut off by the restart.
+    await new InboundStore(join(stateDir, 'inbound')).save({
+      trackingId: await trackingId(request),
+      event,
+      attempts: 5,
+      dueAt: 0,
+    })
+    const { gateway, client } = await harness(0, 'inkbox_voice_ai', {}, [], false, stateDir)
+    try {
+      await until(async () => (await queued(stateDir)) === 0)
+      expect(await readFile(join(stateDir, 'attempts'), 'utf8').catch(() => '')).toBe('')
+      expect(client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
+        'deepseek-agent',
+        SOURCE_ID,
+        'inbev_capped',
+        expect.objectContaining({ status: 'failed', error: 'Script run was interrupted by a restart' }),
+      )
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('keeps retrying a failure report past 24 hours until it succeeds', async () => {
+    const { gateway, stateDir, client } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('model unavailable'))
+    client.inbound?.reportInboundEventResult.mockRejectedValue(new InkboxAPIError(503, 'unavailable'))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    try {
+      await gateway.handleRequest(inbound('inbev_slowreport'))
+      const calls = () => client.inbound?.reportInboundEventResult.mock.calls.length ?? 0
+      // Each attempt persists before rescheduling, so let real I/O settle between timer steps.
+      for (let hour = 0; hour < 30; hour++) {
+        await until(() => scheduled(gateway) === 1)
+        await vi.advanceTimersByTimeAsync(3_600_000)
+      }
+      await until(() => scheduled(gateway) === 1)
+      expect(await queued(stateDir)).toBe(1)
+      expect(calls()).toBeGreaterThan(20)
+      client.inbound?.reportInboundEventResult.mockResolvedValue(undefined)
+      await vi.advanceTimersByTimeAsync(3_600_000)
+      await until(async () => (await queued(stateDir)) === 0)
+    } finally {
+      vi.useRealTimers()
       await gateway.close()
     }
   })

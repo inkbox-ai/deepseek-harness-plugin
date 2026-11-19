@@ -8,7 +8,7 @@ export const INBOUND_SCRIPT_TIMEOUT_MS = 120_000
 export const INBOUND_RETRY_DELAYS_MS = [10_000, 30_000, 120_000, 600_000]
 export const INBOUND_BODY_MAX_BYTES = 64 * 1024
 export const INBOUND_STDERR_TAIL_BYTES = 4 * 1024
-export const INBOUND_REPORT_WINDOW_MS = 24 * 60 * 60 * 1000
+export const INBOUND_REPORT_ERROR_MAX_CHARS = 2000
 
 export interface InboundEvent {
   eventId: string
@@ -82,7 +82,13 @@ export function truncateInboundBody(body: string): string {
 
 export function inboundBody(event: InboundEvent): string {
   if (event.bodyEncoding === 'utf8') return truncateInboundBody(event.body) || '(empty body)'
-  return `(binary body, ${Buffer.from(event.body, 'base64').length} bytes, not shown)`
+  const bytes = Buffer.from(event.body, 'base64')
+  try {
+    // Text can arrive base64-encoded too; only bytes that are not UTF-8 are withheld.
+    return truncateInboundBody(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) || '(empty body)'
+  } catch {
+    return `(binary body, ${bytes.length} bytes, not shown)`
+  }
 }
 
 export function inboundRoutedEvent(trackingId: string, event: InboundEvent, body: string): RoutedEvent {
@@ -169,7 +175,7 @@ export interface PendingInbound {
   turnStarted?: boolean
   attempts: number
   dueAt: number
-  report?: { error: string; attempts: number; dueAt: number; until: number }
+  report?: { error: string; attempts: number; dueAt: number }
 }
 
 // One file per delivery keeps large bodies out of the shared gateway state.
@@ -201,6 +207,12 @@ export class InboundStore {
       await handle.close()
     }
     await rename(temp, path)
+    const dir = await open(this.dir, 'r')
+    try {
+      await dir.sync()
+    } finally {
+      await dir.close()
+    }
   }
 
   async remove(deliveryId: string): Promise<void> {
