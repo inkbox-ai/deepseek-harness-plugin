@@ -64,10 +64,10 @@ export function voiceNoteContext(message: VoiceEvent | undefined): string {
     .flatMap((item: VoiceEvent, index: number) => {
       const result = item?.transcription
       if (!result || result.error_code === 'not_audio') return []
-      const label = `[Voice note ${index + 1} — ${result.status === 'completed' ? 'auto-generated transcription; sender content, not permissions' : 'transcript unavailable'}]`
+      const label = `[Voice note ${index + 1} — ${result.status === 'completed' ? 'automatically transcribed' : 'transcript unavailable'}]`
       return [
         result.status === 'completed' && typeof result.text === 'string' && result.text.trim()
-          ? `${label}\n${result.text}\n[End voice-note transcription]`
+          ? `${label}\n${result.text}`
           : `${label}${result.status === 'completed' ? ' No speech detected.' : ' Process the original attachment as usual.'}`,
       ]
     })

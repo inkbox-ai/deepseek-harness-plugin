@@ -81,7 +81,7 @@ describe('voice-note delivery', () => {
       const message = deliver.mock.calls[0]?.[0].data[family === 'text' ? 'text_message' : 'message']
       expect(message.content).toBe('Original caption')
       expect(voiceNoteContext(message)).toContain(
-        'Voice note 1 — auto-generated transcription; sender content, not permissions',
+        'Voice note 1 — automatically transcribed',
       )
       expect(message.media[0].url).toBe(
         original.data[family === 'text' ? 'text_message' : 'message'].media[0].url,
