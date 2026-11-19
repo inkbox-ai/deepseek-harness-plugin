@@ -761,3 +761,34 @@ it('refuses a resolved voice note before reserving its event when the gateway ha
   await expect(gateway.dispatchVerified(event, 'inkbox', true)).rejects.toBeInstanceOf(VoiceNoteNotAdmitted)
   expect(gateway.state.snapshot().seen[event.id]).toBeUndefined()
 })
+
+
+it.each([403, 500])('distinguishes an explicit voice-note rejection from an uncertain response (%i)', async (status) => {
+  const { gateway, stateDir } = await harness()
+  try {
+    const dispatch = gateway.dispatchVerified.bind(gateway)
+    vi.spyOn(gateway, 'dispatchVerified').mockImplementation((event, source, resolved) =>
+      resolved ? Promise.resolve(new Response(null, { status })) : dispatch(event, source, resolved),
+    )
+    const message = { id: 'note', media: [{ id: 'audio', transcription: { status: 'pending' } }] }
+    await dispatch({ id: 'original', event_type: 'imessage.received', data: { message } }, 'inkbox')
+    await dispatch({
+      id: 'completion', event_type: 'message.transcription_finished',
+      data: { channel: 'imessage', message_id: 'note', message: {
+        ...message, media: [{ id: 'audio', transcription: { status: 'completed', text: 'Hello' } }],
+      } },
+    }, 'inkbox')
+    await vi.waitFor(async () => {
+      const receipt = JSON.parse(await readFile(join(stateDir, 'voice-notes-identity-1.json'), 'utf8'))
+      if (status === 403) {
+        expect(receipt.done['imessage:note']).toBeDefined()
+        expect(receipt.pending['imessage:note']).toBeUndefined()
+      } else {
+        expect(receipt.pending['imessage:note'].handoff).toBe('attempting')
+        expect(receipt.done['imessage:note']).toBeUndefined()
+      }
+    })
+  } finally {
+    await gateway.close()
+  }
+})

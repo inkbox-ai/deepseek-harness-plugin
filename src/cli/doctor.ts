@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { Inkbox } from '@inkbox/sdk'
 import { hostedDiagnostics } from '../hosted-diagnostics.js'
+import { unconfirmedVoiceNoteIds } from '../voice-notes.js'
 import { readYaml } from './files.js'
 import { validateHarness } from './harness.js'
 import type { Paths } from './paths.js'
@@ -87,6 +88,14 @@ export async function doctor(paths: Paths): Promise<Check[]> {
         true,
         `${whoami.authSubtype ?? whoami.authType}; ${identity.emailAddress ?? identity.agentHandle}`,
       )
+      const stateDir = typeof section?.stateDir === 'string' && section.stateDir.trim()
+        ? resolve(section.stateDir) : join(paths.dshHome, 'inkbox')
+      try {
+        const ids = unconfirmedVoiceNoteIds(join(stateDir, `voice-notes-${encodeURIComponent(identity.id)}.json`))
+        add('Unconfirmed voice notes', !ids.length, `${ids.length}: ${ids.join(', ') || 'none'}`)
+      } catch {
+        add('Unconfirmed voice notes', false, 'Local inbox unreadable')
+      }
       add('Tunnel resource', identity.tunnel !== null, identity.tunnel ? 'Provisioned' : 'Missing')
       add('Email channel', identity.mailbox !== null, identity.emailAddress ?? 'Missing mailbox')
       add(

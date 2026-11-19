@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   pollVoiceNote,
+  unconfirmedVoiceNoteIds,
   type VoiceEvent,
   VoiceNoteInbox,
   VoiceNoteNotAdmitted,
@@ -188,6 +189,7 @@ describe('voice-note delivery', () => {
     await current.inbox.accept(received())
     await current.inbox.accept(completion())
     await vi.advanceTimersByTimeAsync(0)
+    expect(unconfirmedVoiceNoteIds(join(directory, 'voice.json'))).toEqual(['imessage:message-1'])
     current.inbox.close()
     const recovered = setup()
     const refreshed = received()

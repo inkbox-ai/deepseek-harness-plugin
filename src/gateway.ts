@@ -240,7 +240,8 @@ export class Gateway {
       },
       deliver: async (event) => {
         const response = await this.dispatchVerified(event, 'inkbox', true)
-        if (!response.ok) throw new Error('Voice-note admission is unconfirmed')
+        if (response.ok || [400, 401, 403, 404, 422].includes(response.status)) return
+        throw new Error('Voice-note admission is unconfirmed')
       },
       warn: () => this.log.warn('[inkbox] voice-note delivery retained'),
     })
