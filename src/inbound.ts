@@ -165,6 +165,8 @@ export interface PendingInbound {
   event: InboundEvent
   // Script stdout once the script succeeded; the agent turn then uses it as the body.
   output?: string
+  // Set before the agent turn starts; an interrupted turn is reported, never repeated.
+  turnStarted?: boolean
   attempts: number
   dueAt: number
   report?: { error: string; attempts: number; dueAt: number; until: number }

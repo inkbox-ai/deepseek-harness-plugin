@@ -1168,23 +1168,15 @@ describe('local delivery', () => {
     },
   )
 
-  it('reports agent turn failures after every retry', async () => {
+  it('reports a failed agent turn once without running it again', async () => {
     const { gateway, stateDir, client } = await harness()
     const run = vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('model unavailable'))
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     try {
       await gateway.handleRequest(inbound('inbev_agentfail'))
-      await vi.advanceTimersByTimeAsync(0)
-      for (const [index, delay] of [10_000, 30_000, 120_000, 600_000].entries()) {
-        await until(() => run.mock.calls.length === index + 1)
-        await until(() => scheduled(gateway) === 1)
-        await vi.advanceTimersByTimeAsync(delay)
-      }
-      await until(() => run.mock.calls.length === 5)
-      await until(() => scheduled(gateway) === 1)
-      await vi.advanceTimersByTimeAsync(0)
       await until(async () => (await queued(stateDir)) === 0)
-      expect(run).toHaveBeenCalledTimes(5)
+      expect(scheduled(gateway)).toBe(0)
+      expect(run).toHaveBeenCalledOnce()
+      expect(client.inbound?.reportInboundEventResult).toHaveBeenCalledOnce()
       expect(client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
         'deepseek-agent',
         SOURCE_ID,
@@ -1192,7 +1184,74 @@ describe('local delivery', () => {
         expect.objectContaining({ status: 'failed', error: 'model unavailable' }),
       )
     } finally {
-      vi.useRealTimers()
+      await gateway.close()
+    }
+  })
+
+  it('reports a failed turn on script output without running the script again', async () => {
+    const { gateway, stateDir, client } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('model unavailable'))
+    try {
+      const command = 'echo run >> attempts; echo summary'
+      await gateway.handleRequest(inbound('inbev_outfail', { type: 'script', command }))
+      await until(async () => (await queued(stateDir)) === 0)
+      expect(await readFile(join(stateDir, 'attempts'), 'utf8')).toBe('run\n')
+      expect(run).toHaveBeenCalledOnce()
+      expect(client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
+        'deepseek-agent',
+        SOURCE_ID,
+        'inbev_outfail',
+        expect.objectContaining({ status: 'failed', error: 'model unavailable' }),
+      )
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('reports an agent turn interrupted by a restart instead of repeating it', async () => {
+    const first = await harness()
+    const run = vi.spyOn(first.gateway.agents, 'run').mockImplementation(() => new Promise(() => {}))
+    await first.gateway.handleRequest(inbound('inbev_interrupted'))
+    await until(() => run.mock.calls.length === 1)
+    // The first gateway is left mid-turn, as after a crash.
+
+    const second = await harness(0, 'inkbox_voice_ai', {}, [], false, first.stateDir)
+    const rerun = vi.spyOn(second.gateway.agents, 'run')
+    try {
+      await until(async () => (await queued(first.stateDir)) === 0)
+      expect(rerun).not.toHaveBeenCalled()
+      expect(second.client.inbound?.reportInboundEventResult).toHaveBeenCalledWith(
+        'deepseek-agent',
+        SOURCE_ID,
+        'inbev_interrupted',
+        expect.objectContaining({ status: 'failed', error: 'Agent turn was interrupted by a restart' }),
+      )
+    } finally {
+      await second.gateway.close()
+    }
+  })
+
+  it.each([
+    [400, false],
+    [404, false],
+    [409, false],
+    [408, true],
+    [429, true],
+    [500, true],
+  ])('ends report retries on HTTP %s unless retryable (%s)', async (status, retried) => {
+    const { gateway, stateDir, client } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('model unavailable'))
+    client.inbound?.reportInboundEventResult.mockRejectedValue(new InkboxAPIError(status, 'error'))
+    try {
+      await gateway.handleRequest(inbound('inbev_status'))
+      await until(() => (client.inbound?.reportInboundEventResult.mock.calls.length ?? 0) === 1)
+      if (retried) {
+        await until(() => scheduled(gateway) === 1)
+        // A pending failure report does not keep the gateway awake.
+        expect(gateway.activity().active).toBe(0)
+        expect(await queued(stateDir)).toBe(1)
+      } else await until(async () => (await queued(stateDir)) === 0)
+    } finally {
       await gateway.close()
     }
   })

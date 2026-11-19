@@ -323,9 +323,11 @@ export class Gateway {
     try {
       if (item.report) return await this.sendInboundReport(item)
       const { event } = item
-      item.attempts += 1
-      await this.inboundStore.save(item)
+      if (item.turnStarted) return await this.reportInbound(item, 'Agent turn was interrupted by a restart')
       if (event.handler.type === 'script' && item.output === undefined) {
+        // Counted before running so a crash mid-run still uses up the attempt.
+        item.attempts += 1
+        await this.inboundStore.save(item)
         const result = await runInboundScript(
           event.handler.command,
           this.config.workspace,
@@ -335,14 +337,14 @@ export class Gateway {
         const output = result.stdout.trim()
         if (!output) return await this.finishInbound(key)
         item.output = output
-        item.attempts = 1
-        await this.inboundStore.save(item)
       }
+      await this.inboundStore.save({ ...item, turnStarted: true })
+      item.turnStarted = true
       const routed = inboundRoutedEvent(item.trackingId, event, item.output ?? inboundBody(event))
       try {
         await this.agents.run(routed.routeKey, renderChannelEvent(routed, this.config), { failOnError: true })
       } catch (error) {
-        return await this.retryInbound(item, error instanceof Error ? error.message : String(error))
+        return await this.reportInbound(item, error instanceof Error ? error.message : String(error))
       }
       await this.finishInbound(key)
     } catch (error) {
@@ -355,18 +357,23 @@ export class Gateway {
 
   private async retryInbound(item: PendingInbound, error: string): Promise<void> {
     const delay = INBOUND_RETRY_DELAYS_MS[item.attempts - 1]
+    if (delay === undefined) {
+      this.log.warn('[inkbox] inbound script failed after every retry')
+      return await this.reportInbound(item, error)
+    }
+    this.log.warn('[inkbox] inbound script failed; retry scheduled')
+    item.dueAt = Date.now() + delay
+    await this.inboundStore.save(item)
+    this.scheduleInbound(item)
+  }
+
+  private async reportInbound(item: PendingInbound, error: string): Promise<void> {
     const now = Date.now()
-    if (delay !== undefined) {
-      this.log.warn('[inkbox] inbound event handling failed; retry scheduled')
-      item.dueAt = now + delay
-    } else {
-      this.log.warn('[inkbox] inbound event handling failed after every retry')
-      item.report = {
-        error: error.slice(-2000),
-        attempts: 0,
-        dueAt: now,
-        until: now + INBOUND_REPORT_WINDOW_MS,
-      }
+    item.report = {
+      error: error.slice(-2000),
+      attempts: 0,
+      dueAt: now,
+      until: now + INBOUND_REPORT_WINDOW_MS,
     }
     await this.inboundStore.save(item)
     this.scheduleInbound(item)
@@ -615,7 +622,8 @@ export class Gateway {
   } {
     const deliveries = Object.entries(this.state.snapshot().deliveries)
     return {
-      active: this.inflight.size + this.inbound.size,
+      // Pending failure reports do not keep the gateway awake.
+      active: this.inflight.size + [...this.inbound.values()].filter((item) => !item.report).length,
       buffered: [...this.queues.values()].reduce((count, queue) => count + queue.buffered.length, 0),
       deliveries: deliveries.filter(([id, item]) => item.state === 'ready' || this.activeDeliveries.has(id))
         .length,
