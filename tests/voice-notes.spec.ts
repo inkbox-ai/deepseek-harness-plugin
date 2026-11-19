@@ -80,9 +80,7 @@ describe('voice-note delivery', () => {
       expect(deliver).toHaveBeenCalledTimes(1)
       const message = deliver.mock.calls[0]?.[0].data[family === 'text' ? 'text_message' : 'message']
       expect(message.content).toBe('Original caption')
-      expect(voiceNoteContext(message)).toContain(
-        'Voice note 1 — automatically transcribed',
-      )
+      expect(voiceNoteContext(message)).toContain('[Voice note 1 — automatically transcribed]')
       expect(message.media[0].url).toBe(
         original.data[family === 'text' ? 'text_message' : 'message'].media[0].url,
       )
