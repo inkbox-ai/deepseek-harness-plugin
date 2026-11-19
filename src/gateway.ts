@@ -207,18 +207,28 @@ export class Gateway {
     const callId = endedCallId(payload)
     if (callId && !(await this.claimCallReconciliation(callId)))
       return new Response('Duplicate', { status: 200 })
-    const routed = routeWebhook(
-      payload,
-      this.state.snapshot().routingKey,
-      source !== 'inkbox' || this.config.externalEvents,
-    )
-    if (routed === undefined) return new Response('Ignored', { status: 202 })
-    const accepted = await this.state.mutate((state) => {
-      if (state.seen[routed.eventId] !== undefined) return false
-      state.seen[routed.eventId] = Date.now()
-      return true
-    })
-    if (!accepted) return new Response('Duplicate', { status: 200 })
+    let routed: RoutedEvent | undefined
+    try {
+      routed = routeWebhook(
+        payload,
+        this.state.snapshot().routingKey,
+        source !== 'inkbox' || this.config.externalEvents,
+      )
+      if (routed === undefined) return new Response('Ignored', { status: 202 })
+      const { eventId } = routed
+      const accepted = await this.state.mutate((state) => {
+        if (state.seen[eventId] !== undefined) return false
+        state.seen[eventId] = Date.now()
+        return true
+      })
+      if (!accepted) return new Response('Duplicate', { status: 200 })
+    } catch (error) {
+      // A lock can fail to release after the reservation committed. Never
+      // replay a reserved event or an exception from the host handoff below.
+      if (resolvedVoiceNote && (!routed || this.state.snapshot().seen[routed.eventId] === undefined))
+        throw new VoiceNoteNotAdmitted('Voice note could not be reserved', { cause: error })
+      throw error
+    }
     await this.accept(routed)
     return new Response('Accepted', { status: 202 })
   }
@@ -239,9 +249,7 @@ export class Gateway {
         })
       },
       deliver: async (event) => {
-        const response = await this.dispatchVerified(event, 'inkbox', true)
-        if (response.ok || [400, 401, 403, 404, 422].includes(response.status)) return
-        throw new Error('Voice-note admission is unconfirmed')
+        await this.dispatchVerified(event, 'inkbox', true)
       },
       warn: () => this.log.warn('[inkbox] voice-note delivery retained'),
     })
