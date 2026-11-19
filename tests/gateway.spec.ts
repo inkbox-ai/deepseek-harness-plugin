@@ -81,6 +81,7 @@ async function harness(
   voiceStack: ResolvedConfig['voiceStack'] = 'inkbox_voice_ai',
   channelInstructions: Record<string, string> = {},
   sharedEvents: string[] = [],
+  unsupportedTranscription = false,
 ): Promise<Harness> {
   const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
   const subscriptions = {
@@ -89,7 +90,19 @@ async function harness(
         ? [{ id: 'shared', url: filter.url, eventTypes: sharedEvents }]
         : [],
     ),
-    create: vi.fn(async () => ({ signingKey: null })),
+    create: vi.fn(async (row: { eventTypes: string[] }) => {
+      if (unsupportedTranscription && row.eventTypes.includes('message.transcription_finished'))
+        throw Object.assign(new InkboxAPIError(422, 'Unknown event'), {
+          detail: [
+            {
+              type: 'enum',
+              loc: ['body', 'event_types', 0, 'MailWebhookEventType'],
+              input: 'message.transcription_finished',
+            },
+          ],
+        })
+      return { signingKey: null }
+    }),
     update: vi.fn(async () => ({})),
   }
   const client = { webhooks: { subscriptions } }
@@ -268,6 +281,18 @@ describe('gateway lifecycle and delivery', () => {
     expect(JSON.parse(await readFile(join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
       ready: false,
     })
+  })
+
+  it('starts on an API without transcription callbacks and still registers WhatsApp', async () => {
+    const { gateway, subscriptions } = await harness(0, 'inkbox_voice_ai', {}, [], true)
+    try {
+      expect(gateway.status().ready).toBe(true)
+      expect(subscriptions.create).toHaveBeenCalledWith(
+        expect.objectContaining({ eventTypes: ['whatsapp.received'] }),
+      )
+    } finally {
+      await gateway.close()
+    }
   })
 
   it('keeps an existing shared WhatsApp receiver intact across two starts', async () => {

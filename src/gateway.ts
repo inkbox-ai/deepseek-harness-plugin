@@ -766,6 +766,10 @@ export class Gateway {
           eventTypes: [...spec.events],
         })
         .catch(async (error: unknown) => {
+          if (transcription && transcriptionEventUnsupported(error)) {
+            this.log.warn('[inkbox] transcription callbacks are unavailable on this API version')
+            return undefined
+          }
           if (!whatsapp || !(error instanceof InkboxAPIError) || error.statusCode !== 409) throw error
           const rows = await subscriptions.list(filter)
           if (!rows.some((row) => row.eventTypes.includes('whatsapp.received'))) throw error
@@ -805,6 +809,24 @@ export class Gateway {
 
 export function isSilentResponse(response: string): boolean {
   return response.trim().endsWith('[SILENT]')
+}
+
+function transcriptionEventUnsupported(error: unknown): boolean {
+  if (!(error instanceof InkboxAPIError) || error.statusCode !== 422) return false
+  const issues = error.detail
+  return (
+    Array.isArray(issues) &&
+    issues.length > 0 &&
+    issues.every(
+      (issue) =>
+        issue?.type === 'enum' &&
+        issue.input === TRANSCRIPTION_FINISHED &&
+        Array.isArray(issue.loc) &&
+        issue.loc[0] === 'body' &&
+        issue.loc[1] === 'event_types' &&
+        issue.loc[2] === 0,
+    )
+  )
 }
 
 function deliveryRetryDelay(attempt: number): number {
