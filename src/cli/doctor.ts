@@ -88,10 +88,14 @@ export async function doctor(paths: Paths): Promise<Check[]> {
         true,
         `${whoami.authSubtype ?? whoami.authType}; ${identity.emailAddress ?? identity.agentHandle}`,
       )
-      const stateDir = typeof section?.stateDir === 'string' && section.stateDir.trim()
-        ? resolve(section.stateDir) : join(paths.dshHome, 'inkbox')
+      const stateDir =
+        typeof section?.stateDir === 'string' && section.stateDir.trim()
+          ? resolve(section.stateDir)
+          : join(paths.dshHome, 'inkbox')
       try {
-        const ids = unconfirmedVoiceNoteIds(join(stateDir, `voice-notes-${encodeURIComponent(identity.id)}.json`))
+        const ids = unconfirmedVoiceNoteIds(
+          join(stateDir, `voice-notes-${encodeURIComponent(identity.id)}.json`),
+        )
         add('Unconfirmed voice notes', !ids.length, `${ids.length}: ${ids.join(', ') || 'none'}`)
       } catch {
         add('Unconfirmed voice notes', false, 'Local inbox unreadable')

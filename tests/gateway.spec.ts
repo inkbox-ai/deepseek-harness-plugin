@@ -762,43 +762,61 @@ it('refuses a resolved voice note before reserving its event when the gateway ha
   expect(gateway.state.snapshot().seen[event.id]).toBeUndefined()
 })
 
-it.each(['ignored', 'not-reserved', 'reserved'] as const)('classifies voice-note handoff at the reservation boundary (%s)', async (outcome) => {
-  const { gateway, stateDir } = await harness()
-  try {
-    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
-    const message = {
-      id: 'note', conversation_id: 'thread',
-      ...(outcome === 'ignored' ? {} : { sender_number: '+15555550123' }),
-      media: [{ id: 'audio', transcription: { status: 'pending' } }],
-    }
-    await gateway.dispatchVerified({ id: 'original', event_type: 'imessage.received', data: { message } }, 'inkbox')
-    if (outcome === 'not-reserved') {
-      vi.spyOn(gateway.state, 'mutate').mockRejectedValueOnce(new Error('Store unavailable'))
-    } else if (outcome === 'reserved') {
-      const mutate = gateway.state.mutate.bind(gateway.state)
-      vi.spyOn(gateway.state, 'mutate').mockImplementationOnce(async (change) => {
-        await mutate(change)
-        throw new Error('Lock release failed after commit')
-      })
-    }
-    await gateway.dispatchVerified({
-      id: 'completion', event_type: 'message.transcription_finished',
-      data: { channel: 'imessage', message_id: 'note', message: {
-        ...message, media: [{ id: 'audio', transcription: { status: 'completed', text: 'Hello' } }],
-      } },
-    }, 'inkbox')
-    await vi.waitFor(async () => {
-      const receipt = JSON.parse(await readFile(join(stateDir, 'voice-notes-identity-1.json'), 'utf8'))
-      if (outcome === 'ignored') {
-        expect(receipt.done['imessage:note']).toBeDefined()
-        expect(receipt.pending['imessage:note']).toBeUndefined()
-      } else {
-        expect(receipt.pending['imessage:note'].handoff).toBe(outcome === 'reserved' ? 'attempting' : 'retry')
-        expect(gateway.state.snapshot().seen.original !== undefined).toBe(outcome === 'reserved')
+it.each(['ignored', 'not-reserved', 'reserved'] as const)(
+  'classifies voice-note handoff at the reservation boundary (%s)',
+  async (outcome) => {
+    const { gateway, stateDir } = await harness()
+    try {
+      const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+      const message = {
+        id: 'note',
+        conversation_id: 'thread',
+        ...(outcome === 'ignored' ? {} : { sender_number: '+15555550123' }),
+        media: [{ id: 'audio', transcription: { status: 'pending' } }],
       }
-    })
-    expect(run).not.toHaveBeenCalled()
-  } finally {
-    await gateway.close()
-  }
-})
+      await gateway.dispatchVerified(
+        { id: 'original', event_type: 'imessage.received', data: { message } },
+        'inkbox',
+      )
+      if (outcome === 'not-reserved') {
+        vi.spyOn(gateway.state, 'mutate').mockRejectedValueOnce(new Error('Store unavailable'))
+      } else if (outcome === 'reserved') {
+        const mutate = gateway.state.mutate.bind(gateway.state)
+        vi.spyOn(gateway.state, 'mutate').mockImplementationOnce(async (change) => {
+          await mutate(change)
+          throw new Error('Lock release failed after commit')
+        })
+      }
+      await gateway.dispatchVerified(
+        {
+          id: 'completion',
+          event_type: 'message.transcription_finished',
+          data: {
+            channel: 'imessage',
+            message_id: 'note',
+            message: {
+              ...message,
+              media: [{ id: 'audio', transcription: { status: 'completed', text: 'Hello' } }],
+            },
+          },
+        },
+        'inkbox',
+      )
+      await vi.waitFor(async () => {
+        const receipt = JSON.parse(await readFile(join(stateDir, 'voice-notes-identity-1.json'), 'utf8'))
+        if (outcome === 'ignored') {
+          expect(receipt.done['imessage:note']).toBeDefined()
+          expect(receipt.pending['imessage:note']).toBeUndefined()
+        } else {
+          expect(receipt.pending['imessage:note'].handoff).toBe(
+            outcome === 'reserved' ? 'attempting' : 'retry',
+          )
+          expect(gateway.state.snapshot().seen.original !== undefined).toBe(outcome === 'reserved')
+        }
+      })
+      expect(run).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  },
+)
