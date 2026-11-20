@@ -17,12 +17,18 @@ import { renderChannelEvent, resolveChannelInstruction } from './channel-instruc
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
+  INBOUND_MAX_CONCURRENT_SCRIPTS,
+  INBOUND_MAX_PENDING_BYTES,
+  INBOUND_MAX_PENDING_EVENTS,
+  INBOUND_RELOAD_DELAY_MS,
   INBOUND_REPORT_ERROR_MAX_CHARS,
   INBOUND_RETRY_DELAYS_MS,
   INBOUND_TURN_TIMEOUT_MS,
+  type InboundEvent,
   InboundStore,
   inboundBody,
   inboundRoutedEvent,
+  inboundSize,
   type PendingInbound,
   parseInbound,
   runInboundScript,
@@ -112,6 +118,10 @@ export class Gateway {
   private readonly inboundTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly inboundLanes = new Map<string, Promise<void>>()
   private readonly inboundPersisting = new Map<string, Promise<void>>()
+  private readonly inboundTurns = new Set<AbortController>()
+  private readonly scriptWaiters: (() => void)[] = []
+  private scriptsRunning = 0
+  private inboundReload: ReturnType<typeof setTimeout> | undefined
   // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
   private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
@@ -130,8 +140,7 @@ export class Gateway {
   async initialize(): Promise<void> {
     await this.state.initialize()
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
-    for (const item of await this.inboundStore.load())
-      if (!this.inbound.has(item.event.deliveryId)) this.inbound.set(item.event.deliveryId, item)
+    await this.loadInbound(false)
     this.client = await this.runtime.getClient()
     this.identity = await this.runtime.getIdentity()
     this.signingKey = await this.runtime.resolveSigningKey()
@@ -283,6 +292,7 @@ export class Gateway {
       })
       return new Response('Duplicate', { status: 200 })
     }
+    if (!this.inboundHasRoom(event)) return new Response('Inbound queue is full', { status: 503 })
     const item: PendingInbound = { trackingId, event, attempts: 0, dueAt: Date.now() }
     const stored = this.persistInbound(item, marker).finally(() =>
       this.inboundPersisting.delete(event.deliveryId),
@@ -302,6 +312,50 @@ export class Gateway {
       state.seen[marker] = now
       state.replied[item.trackingId] = now
     })
+  }
+
+  private inboundHasRoom(event: InboundEvent): boolean {
+    let bytes = event.body.length
+    for (const item of this.inbound.values()) bytes += inboundSize(item)
+    return (
+      this.inbound.size + this.inboundPersisting.size < INBOUND_MAX_PENDING_EVENTS &&
+      bytes <= INBOUND_MAX_PENDING_BYTES
+    )
+  }
+
+  // Files a read error skipped stay on disk and are retried until they load.
+  private async loadInbound(schedule: boolean): Promise<void> {
+    this.inboundReload = undefined
+    if (this.closing) return
+    const { items, unreadable } = await this.inboundStore.load()
+    for (const item of items) {
+      if (this.inbound.has(item.event.deliveryId)) continue
+      this.inbound.set(item.event.deliveryId, item)
+      if (schedule) this.scheduleInbound(item)
+    }
+    if (unreadable && !this.closing) {
+      this.log.warn('[inkbox] some queued inbound events could not be read; retrying')
+      this.inboundReload = setTimeout(() => {
+        void this.loadInbound(true).catch((error) =>
+          this.log.error('[inkbox] inbound queue reload failed', error),
+        )
+      }, INBOUND_RELOAD_DELAY_MS)
+      this.inboundReload.unref?.()
+    }
+  }
+
+  private async acquireScriptSlot(): Promise<void> {
+    if (this.scriptsRunning < INBOUND_MAX_CONCURRENT_SCRIPTS) {
+      this.scriptsRunning++
+      return
+    }
+    await new Promise<void>((resolve) => this.scriptWaiters.push(resolve))
+  }
+
+  private releaseScriptSlot(): void {
+    const next = this.scriptWaiters.shift()
+    if (next) next()
+    else this.scriptsRunning--
   }
 
   private scheduleInbound(item: PendingInbound): void {
@@ -335,14 +389,17 @@ export class Gateway {
       if (event.handler.type === 'script' && item.output === undefined) {
         if (item.attempts > INBOUND_RETRY_DELAYS_MS.length)
           return await this.reportInbound(item, 'Script run was interrupted by a restart')
-        // Counted before running so a crash mid-run still uses up the attempt.
-        item.attempts += 1
-        await this.inboundStore.save(item)
-        const result = await runInboundScript(
-          event.handler.command,
-          this.config.workspace,
-          scriptInput(event),
-        )
+        await this.acquireScriptSlot()
+        let result: Awaited<ReturnType<typeof runInboundScript>>
+        try {
+          if (this.closing) return
+          // Counted before running so a crash mid-run still uses up the attempt.
+          item.attempts += 1
+          await this.inboundStore.save(item)
+          result = await runInboundScript(event.handler.command, this.config.workspace, scriptInput(event))
+        } finally {
+          this.releaseScriptSlot()
+        }
         if (!result.ok) return await this.retryInbound(item, result.error)
         const output = result.stdout.trim()
         if (!output) return await this.finishInbound(key)
@@ -351,25 +408,24 @@ export class Gateway {
       await this.inboundStore.save({ ...item, turnStarted: true })
       item.turnStarted = true
       const routed = inboundRoutedEvent(item.trackingId, event, item.output ?? inboundBody(event))
-      let bound: ReturnType<typeof setTimeout> | undefined
+      const turn = new AbortController()
+      this.inboundTurns.add(turn)
+      const timeout = `Agent turn did not finish within ${INBOUND_TURN_TIMEOUT_MS / 60_000} minutes`
+      const bound = setTimeout(() => turn.abort(new Error(timeout)), INBOUND_TURN_TIMEOUT_MS)
+      bound.unref?.()
       try {
-        await Promise.race([
-          this.agents.run(routed.routeKey, renderChannelEvent(routed, this.config), { failOnError: true }),
-          new Promise<never>((_, reject) => {
-            bound = setTimeout(
-              () =>
-                reject(
-                  new Error(`Agent turn did not finish within ${INBOUND_TURN_TIMEOUT_MS / 60_000} minutes`),
-                ),
-              INBOUND_TURN_TIMEOUT_MS,
-            )
-            bound.unref?.()
-          }),
-        ])
+        await this.agents.run(routed.routeKey, renderChannelEvent(routed, this.config), {
+          failOnError: true,
+          signal: turn.signal,
+        })
       } catch (error) {
+        // A shutdown leaves the turn marked started; the next start reports it.
+        if (this.closing) return
+        if (turn.signal.aborted) return await this.reportInbound(item, timeout)
         return await this.reportInbound(item, error instanceof Error ? error.message : String(error))
       } finally {
         clearTimeout(bound)
+        this.inboundTurns.delete(turn)
       }
       await this.finishInbound(key)
     } catch (error) {
@@ -404,28 +460,18 @@ export class Gateway {
     if (report === undefined) return
     if (this.identity === undefined) throw new Error('Gateway identity is unavailable')
     const { event } = item
-    const inbound = (
-      this.client as unknown as {
-        inbound?: {
-          reportInboundEventResult?: (
-            handle: string,
-            sourceId: string,
-            eventId: string,
-            result: { status: 'failed'; error: string; deliveryId: string },
-          ) => Promise<unknown>
-        }
-      }
-    ).inbound
-    if (typeof inbound?.reportInboundEventResult !== 'function') {
-      this.log.warn('[inkbox] inbound event result reporting is unavailable')
-      return await this.finishInbound(event.deliveryId)
-    }
+    if (this.client === undefined) throw new Error('Gateway client is unavailable')
     try {
-      await inbound.reportInboundEventResult(this.identity.agentHandle, event.sourceId, event.eventId, {
-        status: 'failed',
-        error: report.error,
-        deliveryId: event.deliveryId,
-      })
+      await this.client.inbound.reportInboundEventResult(
+        this.identity.agentHandle,
+        event.sourceId,
+        event.eventId,
+        {
+          status: 'failed',
+          error: report.error,
+          deliveryId: event.deliveryId,
+        },
+      )
     } catch (error) {
       // 4xx is final: 409 stale_delivery means a newer delivery owns the event.
       const final =
@@ -671,6 +717,8 @@ export class Gateway {
     this.deliveryTimers.clear()
     for (const timer of this.inboundTimers.values()) clearTimeout(timer)
     this.inboundTimers.clear()
+    if (this.inboundReload) clearTimeout(this.inboundReload)
+    for (const turn of this.inboundTurns) turn.abort(new Error('Gateway stopped'))
     this.stopAllTyping()
     for (const pending of this.pendingHuman.values()) {
       clearTimeout(pending.timer)

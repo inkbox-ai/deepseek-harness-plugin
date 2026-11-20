@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -16,6 +16,8 @@ import {
 } from '../src/gateway.js'
 import {
   INBOUND_BODY_MAX_BYTES,
+  INBOUND_MAX_PENDING_EVENTS,
+  INBOUND_RELOAD_DELAY_MS,
   INBOUND_TURN_TIMEOUT_MS,
   InboundStore,
   parseInbound,
@@ -1001,7 +1003,7 @@ describe('local delivery', () => {
       expect((await gateway.handleRequest(inbound('inbev_1'))).status).toBe(200)
       expect(run).toHaveBeenCalledOnce()
       const [route, prompt = ''] = run.mock.calls[0] ?? []
-      expect(route).toBe('inbound:payments')
+      expect(route).toBe(`inbound:${SOURCE_ID}`)
       expect(prompt).toContain('Untrusted external content received from inbound source "payments"')
       expect(prompt.indexOf('Record every successful charge.')).toBeLessThan(
         prompt.indexOf('{"type":"charge.succeeded"}'),
@@ -1229,61 +1231,55 @@ describe('local delivery', () => {
         inbound('inbev_out', { type: 'script', command: 'echo "charge from $(pwd)"' }),
       )
       await until(() => run.mock.calls.length === 1)
-      expect(run.mock.calls[0]?.[0]).toBe('inbound:payments')
+      expect(run.mock.calls[0]?.[0]).toBe(`inbound:${SOURCE_ID}`)
       expect(run.mock.calls[0]?.[1]).toMatch(/\[untrusted incoming content\]\ncharge from \//)
       expect(run.mock.calls[0]?.[1]).toContain('Record every successful charge.')
-      expect(run.mock.calls[0]?.[2]).toEqual({ failOnError: true })
+      expect(run.mock.calls[0]?.[2]).toMatchObject({ failOnError: true })
     } finally {
       await gateway.close()
     }
   })
 
-  it.each([true, false])(
-    'runs a failing script 5 times on the backoff schedule, then reports failure (reporting available: %s)',
-    async (reporting) => {
-      const { gateway, stateDir, client } = await harness()
-      const report = client.inbound?.reportInboundEventResult
-      if (!reporting) delete client.inbound
-      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-      try {
-        const command = 'echo run >> attempts; echo boom >&2; exit 3'
-        const request = inbound('inbev_fail', { type: 'script', command })
-        const id = await trackingId(request)
-        const deliveryId = JSON.parse(await request.clone().text()).data.delivery_id
-        expect((await gateway.handleRequest(request)).status).toBe(202)
-        expect(gateway.eventState(id)).toBe('completed')
-        await vi.advanceTimersByTimeAsync(0)
-        const attempts = async () =>
-          (await readFile(join(stateDir, 'attempts'), 'utf8').catch(() => '')).split('\n').length - 1
-        for (const [index, delay] of [10_000, 30_000, 120_000, 600_000].entries()) {
-          await until(async () => (await attempts()) === index + 1)
-          await until(() => scheduled(gateway) === 1)
-          expect(gateway.activity().active).toBe(1)
-          await vi.advanceTimersByTimeAsync(delay - 1)
-          expect(await attempts()).toBe(index + 1)
-          await vi.advanceTimersByTimeAsync(1)
-        }
-        await until(async () => (await attempts()) === 5)
+  it('runs a failing script 5 times on the backoff schedule, then reports failure', async () => {
+    const { gateway, stateDir, client } = await harness()
+    const report = client.inbound?.reportInboundEventResult
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const command = 'echo run >> attempts; echo boom >&2; exit 3'
+      const request = inbound('inbev_fail', { type: 'script', command })
+      const id = await trackingId(request)
+      const deliveryId = JSON.parse(await request.clone().text()).data.delivery_id
+      expect((await gateway.handleRequest(request)).status).toBe(202)
+      expect(gateway.eventState(id)).toBe('completed')
+      await vi.advanceTimersByTimeAsync(0)
+      const attempts = async () =>
+        (await readFile(join(stateDir, 'attempts'), 'utf8').catch(() => '')).split('\n').length - 1
+      for (const [index, delay] of [10_000, 30_000, 120_000, 600_000].entries()) {
+        await until(async () => (await attempts()) === index + 1)
         await until(() => scheduled(gateway) === 1)
-        await vi.advanceTimersByTimeAsync(0)
-        await until(async () => (await queued(stateDir)) === 0)
-        expect(await attempts()).toBe(5)
-        await vi.advanceTimersByTimeAsync(3_600_000)
-        expect(await attempts()).toBe(5)
-        expect(gateway.activity().active).toBe(0)
-        if (reporting)
-          expect(report).toHaveBeenCalledWith('deepseek-agent', SOURCE_ID, 'inbev_fail', {
-            status: 'failed',
-            error: 'boom',
-            deliveryId,
-          })
-        else expect(report).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-        await gateway.close()
+        expect(gateway.activity().active).toBe(1)
+        await vi.advanceTimersByTimeAsync(delay - 1)
+        expect(await attempts()).toBe(index + 1)
+        await vi.advanceTimersByTimeAsync(1)
       }
-    },
-  )
+      await until(async () => (await attempts()) === 5)
+      await until(() => scheduled(gateway) === 1)
+      await vi.advanceTimersByTimeAsync(0)
+      await until(async () => (await queued(stateDir)) === 0)
+      expect(await attempts()).toBe(5)
+      await vi.advanceTimersByTimeAsync(3_600_000)
+      expect(await attempts()).toBe(5)
+      expect(gateway.activity().active).toBe(0)
+      expect(report).toHaveBeenCalledWith('deepseek-agent', SOURCE_ID, 'inbev_fail', {
+        status: 'failed',
+        error: 'boom',
+        deliveryId,
+      })
+    } finally {
+      vi.useRealTimers()
+      await gateway.close()
+    }
+  })
 
   it('reports a failed agent turn once without running it again', async () => {
     const { gateway, stateDir, client } = await harness()
@@ -1305,18 +1301,27 @@ describe('local delivery', () => {
     }
   })
 
-  it('reports an agent turn that does not finish within 30 minutes', async () => {
+  it('aborts and reports an agent turn that does not finish within 30 minutes', async () => {
     const { gateway, stateDir, client } = await harness()
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
-    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(() => new Promise(() => {}))
+    let signal: AbortSignal | undefined
+    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(
+      (_route, _prompt, options) =>
+        new Promise((_, reject) => {
+          signal = options?.signal
+          signal?.addEventListener('abort', () => reject(signal?.reason))
+        }),
+    )
     try {
       await gateway.handleRequest(inbound('inbev_stuck'))
       await vi.advanceTimersByTimeAsync(0)
       await until(() => run.mock.calls.length === 1)
       await vi.advanceTimersByTimeAsync(INBOUND_TURN_TIMEOUT_MS - 1)
       expect(client.inbound?.reportInboundEventResult).not.toHaveBeenCalled()
+      expect(signal?.aborted).toBe(false)
       expect(gateway.activity().active).toBeGreaterThan(0)
       await vi.advanceTimersByTimeAsync(1)
+      expect(signal?.aborted).toBe(true)
       await until(() => scheduled(gateway) === 1)
       await vi.advanceTimersByTimeAsync(0)
       await until(async () => (await queued(stateDir)) === 0)
@@ -1347,6 +1352,81 @@ describe('local delivery', () => {
         expect.objectContaining({ status: 'failed', error: 'model unavailable' }),
       )
     } finally {
+      await gateway.close()
+    }
+  })
+
+  it('answers 503 without acknowledging once the inbound queue is full', async () => {
+    const { gateway } = await harness()
+    vi.spyOn(gateway.agents, 'run').mockImplementation(
+      (_route, _prompt, options) =>
+        new Promise((_, reject) =>
+          options?.signal?.addEventListener('abort', () => reject(options.signal?.reason)),
+        ),
+    )
+    try {
+      for (let index = 0; index < INBOUND_MAX_PENDING_EVENTS; index++)
+        expect(
+          (await gateway.handleRequest(inbound(`inbev_q${String(index).padStart(6, '0')}`))).status,
+        ).toBe(202)
+      const overflow = inbound('inbev_overflow')
+      const id = await trackingId(overflow)
+      expect((await gateway.handleRequest(overflow)).status).toBe(503)
+      expect(gateway.eventState(id)).toBe('absent')
+      expect((await gateway.handleRequest(inbound('inbev_q000000'))).status).toBe(200)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('runs at most four inbound scripts at once across sources', async () => {
+    const { gateway, stateDir } = await harness()
+    await mkdir(join(stateDir, 'running'))
+    const command = 'touch "running/$$"; ls running | wc -l >> counts; sleep 0.3; rm "running/$$"'
+    try {
+      for (let index = 0; index < 6; index++) {
+        const body = await inbound(`inbev_c${index}`, { type: 'script', command }).json()
+        body.data.source.id = `inbsrc_${index}`
+        const request = new Request('http://127.0.0.1/webhook', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
+          body: JSON.stringify(body),
+        })
+        expect((await gateway.handleRequest(request)).status).toBe(202)
+      }
+      await until(async () => (await queued(stateDir)) === 0)
+      const counts = (await readFile(join(stateDir, 'counts'), 'utf8')).trim().split('\n').map(Number)
+      expect(counts).toHaveLength(6)
+      expect(Math.max(...counts)).toBeLessThanOrEqual(4)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('keeps a queued event a read error skipped and runs it once readable', async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
+    const request = inbound('inbev_unreadable')
+    const event = parseInbound(await request.clone().json())
+    if (!event) throw new Error('unparsed')
+    const store = new InboundStore(join(stateDir, 'inbound'))
+    await store.save({ trackingId: await trackingId(request), event, attempts: 0, dueAt: 0 })
+    const [file = ''] = (await readdir(join(stateDir, 'inbound'))).filter((name) => name.endsWith('.json'))
+    await chmod(join(stateDir, 'inbound', file), 0)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { gateway } = await harness(0, 'inkbox_voice_ai', {}, [], false, stateDir)
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('done')
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      expect(run).not.toHaveBeenCalled()
+      expect(await queued(stateDir)).toBe(1)
+      await chmod(join(stateDir, 'inbound', file), 0o600)
+      await vi.advanceTimersByTimeAsync(INBOUND_RELOAD_DELAY_MS)
+      await until(() => scheduled(gateway) === 1)
+      await vi.advanceTimersByTimeAsync(0)
+      await until(async () => (await queued(stateDir)) === 0)
+      expect(run).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
       await gateway.close()
     }
   })

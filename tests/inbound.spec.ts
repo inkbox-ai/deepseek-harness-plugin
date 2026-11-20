@@ -1,10 +1,12 @@
-import { mkdtemp } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import {
   INBOUND_BODY_MAX_BYTES,
   INBOUND_STDERR_TAIL_BYTES,
+  InboundStore,
+  inboundRoutedEvent,
   parseInbound,
   runInboundScript,
   truncateInboundBody,
@@ -67,4 +69,45 @@ it('keeps at most 64 KiB of stdout and a 4 KiB stderr tail', async () => {
     expect(Buffer.byteLength(failed.error)).toBeLessThanOrEqual(INBOUND_STDERR_TAIL_BYTES)
     expect(failed.error.endsWith('END')).toBe(true)
   }
+})
+
+it('routes inbound turns by source id, not display name', () => {
+  const event = parseInbound({
+    data: {
+      event_id: 'inbev_1',
+      delivery_id: 'inbdlv_1',
+      source: { id: 'inbsrc_1', name: 'build[1]' },
+      handler: { type: 'agent' },
+      request: { body: '' },
+    },
+  })
+  if (!event) throw new Error('unparsed')
+  const routed = inboundRoutedEvent('evt', event, 'body')
+  expect(routed.routeKey).toBe('inbound:inbsrc_1')
+  expect(routed.context).toContain('"build[1]"')
+})
+
+it('counts unreadable records separately from malformed ones', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'inkbox-inbound-'))
+  const store = new InboundStore(dir)
+  const event = parseInbound({
+    data: {
+      event_id: 'inbev_1',
+      delivery_id: 'inbdlv_1',
+      source: { id: 'inbsrc_1', name: 'payments' },
+      handler: { type: 'agent' },
+      request: { body: '' },
+    },
+  })
+  if (!event) throw new Error('unparsed')
+  await store.save({ trackingId: 'evt', event, attempts: 0, dueAt: 0 })
+  await writeFile(join(dir, 'broken.json'), '{')
+  const [record = ''] = (await readdir(dir)).filter((name) => name !== 'broken.json')
+  await chmod(join(dir, record), 0)
+  expect(await store.load()).toEqual({ items: [], unreadable: 1 })
+  await chmod(join(dir, record), 0o600)
+  const loaded = await store.load()
+  expect(loaded.unreadable).toBe(0)
+  expect(loaded.items.map((item) => item.event.deliveryId)).toEqual(['inbdlv_1'])
+  expect(await readdir(dir)).toContain('broken.json')
 })

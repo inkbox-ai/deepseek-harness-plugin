@@ -71,9 +71,16 @@ export class AgentManager {
     return handle.agent
   }
 
-  async run(routeKey: string, prompt: string, options: { failOnError?: boolean } = {}): Promise<string> {
+  /** An abort before submission skips the prompt; after it, the running turn is cancelled. */
+  async run(
+    routeKey: string,
+    prompt: string,
+    options: { failOnError?: boolean; signal?: AbortSignal } = {},
+  ): Promise<string> {
+    const { signal } = options
     const agent = await this.get(routeKey)
     await agent.whenIdle()
+    signal?.throwIfAborted()
     const firstSeq = agent.session.seq
     agent.followup(
       createUserMessage({
@@ -81,8 +88,15 @@ export class AgentManager {
         source: { kind: 'plugin', plugin: 'inkbox' },
       }),
     )
-    await settleAgent(this.ctx, agent)
+    const cancel = () => agent.cancel({ kind: 'hook', reason: 'inkbox turn aborted' })
+    signal?.addEventListener('abort', cancel, { once: true })
+    try {
+      await settleAgent(this.ctx, agent)
+    } finally {
+      signal?.removeEventListener('abort', cancel)
+    }
     await this.ctx.sessions.flush(agent.session)
+    signal?.throwIfAborted()
     if (options.failOnError) {
       const failure = turnFailure(agent.session.events, firstSeq)
       if (failure !== undefined) throw new Error(failure)

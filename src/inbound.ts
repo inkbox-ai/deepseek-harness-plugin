@@ -10,6 +10,11 @@ export const INBOUND_RETRY_DELAYS_MS = [10_000, 30_000, 120_000, 600_000]
 export const INBOUND_BODY_MAX_BYTES = 64 * 1024
 export const INBOUND_STDERR_TAIL_BYTES = 4 * 1024
 export const INBOUND_REPORT_ERROR_MAX_CHARS = 2000
+// Accepted events are acknowledged, so the queue is bounded before acceptance.
+export const INBOUND_MAX_PENDING_EVENTS = 100
+export const INBOUND_MAX_PENDING_BYTES = 64 * 1024 * 1024
+export const INBOUND_MAX_CONCURRENT_SCRIPTS = 4
+export const INBOUND_RELOAD_DELAY_MS = 30_000
 
 export interface InboundEvent {
   eventId: string
@@ -73,6 +78,10 @@ export function parseInbound(payload: Json): InboundEvent | undefined {
   }
 }
 
+export function inboundSize(item: PendingInbound): number {
+  return item.event.body.length + (item.output?.length ?? 0)
+}
+
 export function truncateInboundBody(body: string): string {
   const bytes = Buffer.from(body, 'utf8')
   if (bytes.length <= INBOUND_BODY_MAX_BYTES) return body
@@ -100,7 +109,7 @@ export function inboundRoutedEvent(trackingId: string, event: InboundEvent, body
   ].join('\n')
   return {
     eventId: trackingId,
-    routeKey: `inbound:${event.sourceName}`,
+    routeKey: `inbound:${event.sourceId}`,
     channel: 'external',
     context,
     content: body,
@@ -183,17 +192,26 @@ export interface PendingInbound {
 export class InboundStore {
   constructor(readonly dir: string) {}
 
-  async load(): Promise<PendingInbound[]> {
+  /** Malformed records are skipped; `unreadable` counts files a read error left for a later load. */
+  async load(): Promise<{ items: PendingInbound[]; unreadable: number }> {
     await mkdir(this.dir, { recursive: true, mode: 0o700 })
     const items: PendingInbound[] = []
+    let unreadable = 0
     for (const name of await readdir(this.dir)) {
       if (!name.endsWith('.json')) continue
+      let raw: string
       try {
-        const item = JSON.parse(await readFile(join(this.dir, name), 'utf8')) as PendingInbound
+        raw = await readFile(join(this.dir, name), 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') unreadable++
+        continue
+      }
+      try {
+        const item = JSON.parse(raw) as PendingInbound
         if (typeof item?.event?.deliveryId === 'string' && typeof item.attempts === 'number') items.push(item)
       } catch {}
     }
-    return items
+    return { items, unreadable }
   }
 
   async save(item: PendingInbound): Promise<void> {
