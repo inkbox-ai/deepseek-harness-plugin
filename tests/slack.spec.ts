@@ -224,7 +224,9 @@ describe('Slack subscription', () => {
     await first.gateway.close()
     const held = backend.holders()
     expect(held).toHaveLength(1)
-    expect(held[0]?.eventTypes).toEqual(expect.arrayContaining(SLACK))
+    expect(held[0]?.eventTypes.some((event) => event.startsWith('slack.'))).toBe(true)
+    const covered = backend.rows.filter((row) => row.url === URL).flatMap((row) => row.eventTypes)
+    expect(covered).toEqual(expect.arrayContaining(SLACK))
     const snapshot = JSON.stringify(backend.rows)
     backend.clear()
     const second = await harness({ backend })
@@ -240,6 +242,7 @@ describe('Slack subscription', () => {
     await startTwice(backend)
     const slackRows = backend.rows.filter((row) => row.eventTypes.some((event) => event.startsWith('slack.')))
     expect(slackRows).toHaveLength(1)
+    expect(slackRows[0]?.eventTypes).toEqual(expect.arrayContaining([...SLACK, FINISHED]))
     expect(slackRows[0]?.eventTypes).not.toContain('slack.session_stopped')
   })
 
@@ -251,6 +254,7 @@ describe('Slack subscription', () => {
     await startTwice(backend)
     expect(backend.rows.some((row) => row.id === 'completions')).toBe(false)
     expect(backend.holders()[0]?.id).toBe('slack')
+    expect(backend.holders()[0]?.eventTypes).toEqual(expect.arrayContaining(SLACK))
   })
 
   it('chooses one target when two Slack rows exist and keeps the other row intact', async () => {
