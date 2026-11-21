@@ -114,6 +114,14 @@ export class AgentManager {
     )
   }
 
+  /** Cancel the running turn of a live route; returns false when the route has no agent. */
+  cancel(routeKey: string, reason: string): boolean {
+    const live = this.agents.get(routeKey)
+    if (live === undefined) return false
+    live.handle.agent.cancel({ kind: 'hook', reason })
+    return true
+  }
+
   routeForAgent(agent: Agent): string | undefined {
     for (const [routeKey, managed] of this.agents) if (managed.handle.agent === agent) return routeKey
     return undefined

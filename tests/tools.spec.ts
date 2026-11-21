@@ -194,4 +194,35 @@ describe('Slack tools', () => {
       idempotencyKey: 'send-1',
     })
   })
+
+  it.each([
+    ['inkbox_slack_list_messages', { connectionId: 'connection-1', conversationId: 'C1', limit: 0 }],
+    ['inkbox_slack_list_conversations', { connectionId: 'connection-1', limit: 101 }],
+    ['inkbox_slack_list_messages', { connectionId: 'connection-1', conversationId: '' }],
+    ['inkbox_slack_list_messages', { connectionId: 'connection-1', conversationId: 'C1', reaction: 'eyes' }],
+    [
+      'inkbox_slack_send_message',
+      { connectionId: 'connection-1', conversationId: 'C1', text: 'Hi', idempotencyKey: 'bad key' },
+    ],
+    [
+      'inkbox_slack_send_message',
+      {
+        connectionId: 'connection-1',
+        conversationId: 'C1',
+        text: 'x'.repeat(12_001),
+        idempotencyKey: 'send-1',
+      },
+    ],
+    [
+      'inkbox_slack_send_message',
+      { connectionId: 'connection-1', conversationId: 'C1', idempotencyKey: 'send-1' },
+    ],
+  ])('rejects invalid %s arguments before approval or any API call', async (name, args) => {
+    const { definitions, request, slack } = slackHarness(true)
+    await expect(findTool(definitions, name).execute(args, exec)).rejects.toThrow()
+    expect(request).not.toHaveBeenCalled()
+    expect(slack.listConnections).not.toHaveBeenCalled()
+    expect(slack.listMessages).not.toHaveBeenCalled()
+    expect(slack.sendMessage).not.toHaveBeenCalled()
+  })
 })

@@ -10,7 +10,8 @@ export const SLACK_EVENTS = [
   'slack.mention_received',
   'slack.thread_reply_received',
 ] as const
-export const SLACK_SUBSCRIPTION_EVENTS: readonly string[] = SLACK_EVENTS
+export const SLACK_STOP = 'slack.session_stopped'
+export const SLACK_SUBSCRIPTION_EVENTS: readonly string[] = [...SLACK_EVENTS, SLACK_STOP]
 
 export interface SlackRoute {
   connectionGeneration?: number
@@ -30,6 +31,7 @@ export interface SlackRoute {
   text: string
   senderAccess?: string
   contactId?: string
+  nativeStop?: boolean
 }
 
 /** The persisted part of a route that a reply needs. */
@@ -50,20 +52,22 @@ export function isSlackEvent(eventType: unknown): boolean {
 export function parseSlack(event: VoiceEvent, identityId: string): SlackRoute | undefined {
   const d = event.data
   if (!record(d) || d.identity_id !== identityId || !nonempty(event.id)) return
-  if (!(SLACK_EVENTS as readonly string[]).includes(event.event_type)) return
-  if (!record(d.event)) return
+  if (![...SLACK_EVENTS, SLACK_STOP].includes(event.event_type)) return
+  const stop = event.event_type === SLACK_STOP
+  if (!record(d.event) || (stop && d.event.type !== 'agent_session_stopped')) return
   // Sponsored senders reach the agent only through a mode this plugin does not run.
-  if ('sender_access' in d && d.sender_access !== 'direct') return
+  if (!stop && 'sender_access' in d && d.sender_access !== 'direct') return
   if (!['connection_id', 'workspace_id', 'conversation_id', 'actor_id'].every((k) => nonempty(d[k]))) return
   if (d.event.bot_id || d.event.app_id || d.event.subtype === 'bot_message') return
   if (d.thread_ts != null && !nonempty(d.thread_ts)) return
-  const messageTs = d.message_ts
+  if (stop && !d.thread_ts) return
+  const messageTs = stop ? d.thread_ts : d.message_ts
   if (!nonempty(messageTs)) return
-  const kinds = d.message_kinds ?? []
+  const kinds = stop ? ['thread'] : (d.message_kinds ?? [])
   if (!Array.isArray(kinds)) return
   const direct = kinds.includes('dm'),
     mentioned = kinds.includes('mention')
-  const rawText = d.event.text ?? ''
+  const rawText = stop ? '/stop' : (d.event.text ?? '')
   if (typeof rawText !== 'string') return
   const files = Array.isArray(d.event.files)
     ? d.event.files
@@ -95,6 +99,7 @@ export function parseSlack(event: VoiceEvent, identityId: string): SlackRoute | 
     text,
     ...(typeof d.sender_access === 'string' ? { senderAccess: d.sender_access } : {}),
     ...(typeof d.contact_id === 'string' && d.contact_id ? { contactId: d.contact_id } : {}),
+    ...(stop ? { nativeStop: true } : {}),
   }
 }
 
@@ -262,6 +267,18 @@ export function slackText(text: string): void {
 
 /** Send one reply to the source conversation and thread; an unconfirmed send is never repeated blindly. */
 export async function sendSlackReply(client: Inkbox, route: SlackReplyRoute, text: string): Promise<string> {
+  return (await prepareSlackReply(client, route, text))()
+}
+
+/**
+ * Validate the text and the connection before anything is sent. The returned
+ * function performs the send itself, so a failed check never reaches Slack.
+ */
+export async function prepareSlackReply(
+  client: Inkbox,
+  route: SlackReplyRoute,
+  text: string,
+): Promise<() => Promise<string>> {
   text = slackMrkdwn(text)
   slackText(text)
   await ownSlackConnection(
@@ -271,18 +288,20 @@ export async function sendSlackReply(client: Inkbox, route: SlackReplyRoute, tex
     route.workspaceId,
     route.connectionGeneration,
   )
-  const key = createHash('sha256')
-    .update(JSON.stringify([route.sourceEventId, slackRouteKey(route), text]))
-    .digest('hex')
-  const action = await client.slack.sendMessage(route.connectionId, {
-    conversationId: route.conversationId,
-    threadTs: route.threadTs,
-    text,
-    idempotencyKey: `deepseek:${key}`,
-  })
-  if (action.status !== 'sent')
-    throw new Error(
-      `Slack action ${action.id} is ${action.status}; inspect it with inkbox_slack_get_action before deciding whether to send again.`,
-    )
-  return action.id
+  return async () => {
+    const key = createHash('sha256')
+      .update(JSON.stringify([route.sourceEventId, slackRouteKey(route), text]))
+      .digest('hex')
+    const action = await client.slack.sendMessage(route.connectionId, {
+      conversationId: route.conversationId,
+      threadTs: route.threadTs,
+      text,
+      idempotencyKey: `deepseek:${key}`,
+    })
+    if (action.status !== 'sent')
+      throw new Error(
+        `Slack action ${action.id} is ${action.status}; inspect it with inkbox_slack_get_action before deciding whether to send again.`,
+      )
+    return action.id
+  }
 }

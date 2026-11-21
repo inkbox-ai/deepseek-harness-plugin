@@ -234,7 +234,7 @@ export async function waitForIMessageConnection(
   }
 }
 
-/** Slack is opt-in. Without prompts, an explicit choice is saved as given. */
+/** Slack is opt-in. Without prompts, an explicit enable is saved as given. */
 export async function configureSlackChannel(
   identity: AgentIdentity,
   client: Inkbox,
@@ -242,8 +242,10 @@ export async function configureSlackChannel(
   options: Pick<ChannelOptions, 'enableSlack' | 'slackDefault' | 'nonInteractive'>,
   dependencies: Pick<ChannelDependencies, 'sleep'> = defaultChannelDependencies,
 ): Promise<boolean> {
+  // Skipping Slack keeps its saved state, as for iMessage and A2A.
+  if (options.enableSlack === false) return options.slackDefault ?? false
   const previous = options.enableSlack ?? options.slackDefault ?? false
-  if (options.nonInteractive || !prompts || options.enableSlack === false) return previous
+  if (options.nonInteractive || !prompts) return previous
   process.stdout.write('\nSlack\n')
   return configureSlack(client, identity.id, previous, {
     prompter: {
