@@ -31,7 +31,8 @@ export interface ChannelResult {
   phoneProvisioned: boolean
   imessageEnabled: boolean
   a2aEnabled: boolean
-  slackEnabled: boolean
+  /** Undefined leaves the saved setting, or its absence, unchanged. */
+  slackEnabled?: boolean
 }
 
 export interface ChannelDependencies {
@@ -84,7 +85,7 @@ export async function configureChannels(
     phoneProvisioned: phone.provisioned,
     imessageEnabled,
     a2aEnabled,
-    slackEnabled,
+    ...(slackEnabled !== undefined ? { slackEnabled } : {}),
   }
 }
 
@@ -234,18 +235,21 @@ export async function waitForIMessageConnection(
   }
 }
 
-/** Slack is opt-in. Without prompts, an explicit enable is saved as given. */
+/**
+ * Slack is opt-in. Undefined means unchanged: skipping Slack, or running
+ * without prompts and without an explicit enable, never writes a setting.
+ */
 export async function configureSlackChannel(
   identity: AgentIdentity,
   client: Inkbox,
   prompts: SetupPrompts | undefined,
   options: Pick<ChannelOptions, 'enableSlack' | 'slackDefault' | 'nonInteractive'>,
   dependencies: Pick<ChannelDependencies, 'sleep'> = defaultChannelDependencies,
-): Promise<boolean> {
+): Promise<boolean | undefined> {
   // Skipping Slack keeps its saved state, as for iMessage and A2A.
-  if (options.enableSlack === false) return options.slackDefault ?? false
+  if (options.enableSlack === false) return undefined
+  if (options.nonInteractive || !prompts) return options.enableSlack
   const previous = options.enableSlack ?? options.slackDefault ?? false
-  if (options.nonInteractive || !prompts) return previous
   process.stdout.write('\nSlack\n')
   return configureSlack(client, identity.id, previous, {
     prompter: {

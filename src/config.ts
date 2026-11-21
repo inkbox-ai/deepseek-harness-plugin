@@ -92,7 +92,7 @@ export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME
   }
 }
 
-function boolEnv(value: string | undefined): boolean | undefined {
+export function boolEnv(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined
   const normalized = value.trim().toLowerCase()
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return true

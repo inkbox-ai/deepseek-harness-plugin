@@ -752,11 +752,13 @@ describe('authenticated voice-note dispatch', () => {
       }
       await gateway.dispatchVerified(finished, 'inkbox')
       await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      const turn = { signal: expect.any(AbortSignal) }
       expect(run).toHaveBeenCalledWith(
         expect.any(String),
         expect.stringContaining('Move the meeting to Thursday.'),
+        turn,
       )
-      expect(run).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Voice note'))
+      expect(run).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Voice note'), turn)
       await gateway.dispatchVerified(finished, 'inkbox')
       expect(run).toHaveBeenCalledTimes(1)
     } finally {

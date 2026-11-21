@@ -18,6 +18,12 @@ export interface PendingDelivery {
   nextAttemptAt: number
 }
 
+/** A native Slack stop and the turns it targeted when first received. */
+export interface SlackStopReceipt {
+  targets: string[]
+  at: number
+}
+
 export interface GatewayState {
   version: 1
   routingKey: string
@@ -25,6 +31,7 @@ export interface GatewayState {
   seen: Record<string, number>
   replied: Record<string, number>
   deliveries: Record<string, PendingDelivery>
+  slackStops: Record<string, SlackStopReceipt>
 }
 
 const EMPTY_AGE_MS = 14 * 24 * 60 * 60 * 1000
@@ -37,6 +44,7 @@ function freshState(): GatewayState {
     seen: {},
     replied: {},
     deliveries: {},
+    slackStops: {},
   }
 }
 
@@ -53,7 +61,24 @@ function validate(value: unknown): GatewayState {
     seen: raw.seen && typeof raw.seen === 'object' ? raw.seen : {},
     replied: raw.replied && typeof raw.replied === 'object' ? raw.replied : {},
     deliveries: validateDeliveries(raw.deliveries),
+    slackStops: validateSlackStops(raw.slackStops),
   }
+}
+
+function validateSlackStops(value: unknown): Record<string, SlackStopReceipt> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const validated: Record<string, SlackStopReceipt> = {}
+  for (const [id, candidate] of Object.entries(value)) {
+    const raw = candidate as Partial<SlackStopReceipt> | null
+    if (
+      raw &&
+      Array.isArray(raw.targets) &&
+      raw.targets.every((target) => typeof target === 'string') &&
+      typeof raw.at === 'number'
+    )
+      validated[id] = { targets: raw.targets, at: raw.at }
+  }
+  return validated
 }
 
 function validateDeliveries(value: unknown): Record<string, PendingDelivery> {
@@ -151,4 +176,6 @@ function prune(state: GatewayState, now: number): void {
   for (const table of [state.seen, state.replied]) {
     for (const [key, timestamp] of Object.entries(table)) if (timestamp < cutoff) delete table[key]
   }
+  for (const [key, receipt] of Object.entries(state.slackStops))
+    if (receipt.at < cutoff) delete state.slackStops[key]
 }
