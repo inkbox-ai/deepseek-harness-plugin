@@ -125,6 +125,8 @@ export class Gateway {
   // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
   private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
+  /** Set by a host that acknowledges deliveries itself after `inboundAdmits`; an acknowledged one is never refused. */
+  externalAdmission = false
 
   constructor(
     private readonly ctx: Context,
@@ -292,7 +294,8 @@ export class Gateway {
       })
       return new Response('Duplicate', { status: 200 })
     }
-    if (!this.inboundHasRoom(event)) return new Response('Inbound queue is full', { status: 503 })
+    if (!this.externalAdmission && !this.inboundHasRoom(event))
+      return new Response('Inbound queue is full', { status: 503 })
     const item: PendingInbound = { trackingId, event, attempts: 0, dueAt: Date.now() }
     const stored = this.persistInbound(item, marker).finally(() =>
       this.inboundPersisting.delete(event.deliveryId),
@@ -312,6 +315,18 @@ export class Gateway {
       state.seen[marker] = now
       state.replied[item.trackingId] = now
     })
+  }
+
+  /** False when a new `inbound.received` delivery should be refused before it is acknowledged. */
+  inboundAdmits(payload: Record<string, unknown>): boolean {
+    const event = parseInbound(payload)
+    if (
+      event === undefined ||
+      this.inbound.has(event.deliveryId) ||
+      this.inboundPersisting.has(event.deliveryId)
+    )
+      return true
+    return this.inboundHasRoom(event)
   }
 
   private inboundHasRoom(event: InboundEvent): boolean {

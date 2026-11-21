@@ -1379,6 +1379,29 @@ describe('local delivery', () => {
     }
   })
 
+  it('reports a full queue through inboundAdmits and stores a host-acknowledged delivery', async () => {
+    const { gateway } = await harness()
+    gateway.externalAdmission = true
+    vi.spyOn(gateway.agents, 'run').mockImplementation(
+      (_route, _prompt, options) =>
+        new Promise((_, reject) =>
+          options?.signal?.addEventListener('abort', () => reject(options.signal?.reason)),
+        ),
+    )
+    try {
+      for (let index = 0; index < INBOUND_MAX_PENDING_EVENTS; index++)
+        await gateway.handleRequest(inbound(`inbev_q${String(index).padStart(6, '0')}`))
+      const overflow = inbound('inbev_overflow')
+      const payload = await overflow.clone().json()
+      expect(gateway.inboundAdmits(await inbound('inbev_q000000').json())).toBe(true)
+      expect(gateway.inboundAdmits(payload)).toBe(false)
+      expect((await gateway.handleRequest(overflow)).status).toBe(202)
+      expect(gateway.eventState(await trackingId(inbound('inbev_overflow')))).toBe('completed')
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('runs at most four inbound scripts at once across sources', async () => {
     const { gateway, stateDir } = await harness()
     await mkdir(join(stateDir, 'running'))
