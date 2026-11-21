@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import { InkboxAPIError } from '@inkbox/sdk'
 import { SLACK_EVENTS } from './slack.js'
 
+// biome-ignore lint/suspicious/noExplicitAny: webhook payloads are untyped JSON read field by field.
 export type VoiceEvent = Record<string, any>
 export class VoiceNoteNotAdmitted extends Error {}
 
