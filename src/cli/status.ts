@@ -8,6 +8,7 @@ export interface RuntimeStatus {
   connected: boolean
   identity?: string
   publicUrl?: string
+  slack?: string
   pid?: number
   startedAt?: string
   updatedAt?: string
@@ -46,6 +47,7 @@ export async function readRuntimeStatus(paths: Paths): Promise<RuntimeStatus> {
     connected: raw.connected === true,
     ...(typeof raw.identity === 'string' ? { identity: raw.identity } : {}),
     ...(typeof raw.publicUrl === 'string' ? { publicUrl: raw.publicUrl } : {}),
+    ...(typeof raw.slack === 'string' ? { slack: raw.slack } : {}),
     ...(pid !== undefined ? { pid } : {}),
     ...(typeof raw.startedAt === 'string' ? { startedAt: raw.startedAt } : {}),
     ...(typeof raw.updatedAt === 'string' ? { updatedAt: raw.updatedAt } : {}),
@@ -62,6 +64,7 @@ export function formatRuntimeStatus(status: RuntimeStatus): string {
     `Tunnel: ${status.connected ? 'connected' : 'disconnected'}`,
     `Process: ${status.processRunning ? `running (PID ${status.pid})` : 'not running'}`,
     `Public URL: ${status.publicUrl ?? 'unavailable'}`,
+    `Slack: ${status.slack ?? 'unknown'}`,
     `Started: ${status.startedAt ?? 'unknown'}`,
     `Updated: ${status.updatedAt ?? 'unknown'}`,
   ].join('\n')

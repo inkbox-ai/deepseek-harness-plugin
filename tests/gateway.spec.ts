@@ -153,6 +153,7 @@ async function harness(
     permissionTimeoutMs: 2_000,
     autoApproveInkboxTools: false,
     externalEvents: false,
+    slackEnabled: false,
     voiceEnabled: true,
     voiceStack,
     realtimeCredentialRef: 'INKBOX_REALTIME_API_KEY',
@@ -607,6 +608,132 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.close()
   })
 
+  it('keeps steering and latest-channel approvals for a WhatsApp turn joined by SMS', async () => {
+    const { gateway, identity } = await harness()
+    let release: (value: string) => void = () => {}
+    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          release = resolve
+        }),
+    )
+    const steer = vi.spyOn(gateway.agents, 'steer').mockResolvedValue()
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.dispatchVerified(
+        {
+          id: 'whatsapp-1',
+          event_type: 'whatsapp.received',
+          data: {
+            message: { sender_number: '+15550000001', conversation_id: 'wa-1', content: 'Hello on WhatsApp' },
+            contacts: [{ id: 'contact-1', address: '+15550000001' }],
+          },
+        },
+        'inkbox',
+      )
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      await gateway.handleRequest(sms('sms-steer', 'Same thing by text'))
+      await vi.waitFor(() => expect(steer).toHaveBeenCalledTimes(1))
+      const approval = gateway.askApproval({} as Agent, 'Send the requested message')
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledOnce())
+      expect(identity.sendText).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: 'sms-conversation-1',
+          text: expect.stringContaining('Reply YES'),
+        }),
+      )
+      await gateway.handleRequest(sms('sms-yes', 'YES'))
+      await expect(approval).resolves.toBe('allowed-once')
+      expect(steer).toHaveBeenCalledTimes(1)
+      release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('sends a second prompt in one email turn as a reply to the answer email', async () => {
+    const { gateway, identity } = await harness()
+    let release: (value: string) => void = () => {}
+    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          release = resolve
+        }),
+    )
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.handleRequest(email('email-turn', 'Please send the report'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      const first = gateway.askApproval({} as Agent, 'Send the report')
+      await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(1))
+      expect(identity.sendEmail.mock.calls[0]?.[0]).toMatchObject({
+        inReplyToMessageId: '<email-turn@example.test>',
+      })
+      await gateway.handleRequest(email('email-answer', 'YES'))
+      await expect(first).resolves.toBe('allowed-once')
+      const second = gateway.askApproval({} as Agent, 'Send the attachment too')
+      await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(2))
+      expect(identity.sendEmail.mock.calls[1]?.[0]).toMatchObject({
+        inReplyToMessageId: '<email-answer@example.test>',
+      })
+      await gateway.handleRequest(email('email-answer-2', 'YES'))
+      await expect(second).resolves.toBe('allowed-once')
+      release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('keeps a cancelled SMS prompt on its route until its send settles', async () => {
+    const { gateway, identity } = await harness(30_000)
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.handleRequest(sms('sms-request', 'Please send it'))
+      let finishSend: () => void = () => {}
+      identity.sendText.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishSend = () => resolve({ id: 'text-prompt' })
+          }),
+      )
+      const request = new AbortController()
+      const first = gateway.askApproval({} as Agent, 'Send the first thing', request.signal)
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledOnce())
+      request.abort(new Error('Tool call cancelled'))
+      // The cancelled prompt still holds the route while its send is outstanding.
+      await expect(gateway.askApproval({} as Agent, 'Send the second thing')).resolves.toBe('rejected')
+      expect(identity.sendText).toHaveBeenCalledOnce()
+      finishSend()
+      await expect(first).resolves.toBe('cancelled')
+      const third = gateway.askApproval({} as Agent, 'Send the third thing')
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledTimes(2))
+      await gateway.handleRequest(sms('sms-yes', 'YES'))
+      await expect(third).resolves.toBe('allowed-once')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('rejects a cancelled SMS question with the request reason', async () => {
+    const { gateway, identity } = await harness(30_000)
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.handleRequest(sms('sms-request', 'Please send it'))
+      const request = new AbortController()
+      const reason = new Error('Question cancelled by the caller')
+      const question = gateway.askQuestions({
+        agent: {} as Agent,
+        questions: [{ id: 'q1', question: 'Which file?' }],
+        signal: request.signal,
+      })
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledOnce())
+      request.abort(reason)
+      await expect(question).rejects.toBe(reason)
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('suppresses channel delivery when the agent returns the silent marker', async () => {
     const { gateway, identity } = await harness()
     vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
@@ -749,11 +876,13 @@ describe('authenticated voice-note dispatch', () => {
       }
       await gateway.dispatchVerified(finished, 'inkbox')
       await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      const turn = { signal: expect.any(AbortSignal) }
       expect(run).toHaveBeenCalledWith(
         expect.any(String),
         expect.stringContaining('Move the meeting to Thursday.'),
+        turn,
       )
-      expect(run).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Voice note'))
+      expect(run).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Voice note'), turn)
       await gateway.dispatchVerified(finished, 'inkbox')
       expect(run).toHaveBeenCalledTimes(1)
     } finally {

@@ -1,5 +1,5 @@
 import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.js'
 
 describe('configuration', () => {
@@ -18,6 +18,8 @@ describe('configuration', () => {
     expect(config.realtimeModel).toBe('gpt-realtime-2')
     expect(config.realtimeVoice).toBe('cedar')
     expect(config.channelInstructions).toEqual({})
+    expect(config.slackEnabled).toBe(false)
+    expect(resolveConfig({ slackEnabled: true }, '/tmp/dsh-home').slackEnabled).toBe(true)
   })
 
   it('normalizes workspace and identity without inventing an identity', () => {
@@ -56,5 +58,42 @@ describe('configuration', () => {
         '/tmp/dsh',
       ).channelInstructions,
     ).toEqual({ sms: 'Keep it brief.', 'contact-1': 'Use the agreed status format.' })
+  })
+
+  describe('Slack enablement from the environment', () => {
+    afterEach(() => vi.unstubAllEnvs())
+    // The managed host builds its configuration without slackEnabled.
+    const hosted = () =>
+      resolveConfig(
+        {
+          agentHandle: 'hosted-agent',
+          workspace: '/home/agent',
+          signingKeyRef: 'INKBOX_SIGNING_KEY',
+          stateDir: '/tmp/hosted-state',
+          autoApproveInkboxTools: false,
+          externalEvents: false,
+          voiceStack: 'inkbox_voice_ai',
+          channelInstructions: { default: '' },
+        },
+        '/tmp/dsh',
+      )
+
+    it('enables Slack for a host that sets INKBOX_SLACK_ENABLED', () => {
+      vi.stubEnv('INKBOX_SLACK_ENABLED', 'true')
+      expect(hosted().slackEnabled).toBe(true)
+      vi.stubEnv('INKBOX_SLACK_ENABLED', ' 1 ')
+      expect(hosted().slackEnabled).toBe(true)
+      vi.stubEnv('INKBOX_SLACK_ENABLED', 'false')
+      expect(hosted().slackEnabled).toBe(false)
+      vi.stubEnv('INKBOX_SLACK_ENABLED', 'maybe')
+      expect(hosted().slackEnabled).toBe(false)
+    })
+
+    it('keeps an explicit profile setting over the environment', () => {
+      vi.stubEnv('INKBOX_SLACK_ENABLED', 'true')
+      expect(resolveConfig({ slackEnabled: false }, '/tmp/dsh').slackEnabled).toBe(false)
+      vi.stubEnv('INKBOX_SLACK_ENABLED', 'false')
+      expect(resolveConfig({ slackEnabled: true }, '/tmp/dsh').slackEnabled).toBe(true)
+    })
   })
 })

@@ -5,12 +5,12 @@
 <p>
   <br><br>
   <b>Give your DeepSeek Harness agent its own Inkbox identity:</b><br>
-  a mailbox, iMessage, a phone number for calls and SMS, agent-to-agent tasks, and an internet address.<br>
+  a mailbox, iMessage, Slack, a phone number for calls and SMS, agent-to-agent tasks, and an internet address.<br>
   Keep DeepSeek Harness reachable from anywhere without a separate plugin daemon.
 </p>
 
 <p>
-  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>A2A</code> · <code>Tunnel</code>
+  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Slack</code> · <code>A2A</code> · <code>Tunnel</code>
 </p>
 
 <br clear="left">
@@ -130,13 +130,14 @@ See [remote tool behavior](REMOTE_TOOLS.md) for retained local capabilities and 
 4. Installs the Inkbox bundle into the existing DeepSeek Harness and creates the `inkbox` profile.
 5. Offers iMessage with RCS/SMS fallback and voice calls, displays a scannable connection QR code, and can
    wait for the first iMessage before continuing.
-6. Optionally provisions a dedicated number for SMS and voice. New numbers display a scannable `START` QR
+6. Optionally enables Slack and connects a workspace (see [Slack](#slack)).
+7. Optionally provisions a dedicated number for SMS and voice. New numbers display a scannable `START` QR
    code and can wait for SMS opt-in.
-7. Configures either the Inkbox hosted call agent or the OpenAI Realtime API. TTS/STT mode is not offered.
-8. Reuses a supplied webhook signing key or creates a new one with explicit rotation confirmation.
-9. Saves the identity, credentials, channel choices, trusted Inkbox-tool behavior, and workspace in the
+8. Configures either the Inkbox hosted call agent or the OpenAI Realtime API. TTS/STT mode is not offered.
+9. Reuses a supplied webhook signing key or creates a new one with explicit rotation confirmation.
+10. Saves the identity, credentials, channel choices, trusted Inkbox-tool behavior, and workspace in the
    `inkbox` Harness profile.
-10. Offers to install or restart the managed gateway and verifies that the process and tunnel are ready.
+11. Offers to install or restart the managed gateway and verifies that the process and tunnel are ready.
 
 Rerunning setup discovers the existing profile and asks before reconfiguring it. Existing avatars and channel
 resources are preserved unless a setup choice explicitly changes them.
@@ -216,7 +217,8 @@ npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepsee
 ## Capabilities
 
 - **33 native tools:** identity, contacts, email sending, SMS/MMS history and sending, iMessage history,
-  sending and reactions, voice calls, and A2A task lifecycle operations.
+  sending and reactions, voice calls, and A2A task lifecycle operations, plus six Slack tools when Slack is
+  enabled.
 - **13 model-invocable skills:** channel response policy, contact resolution, calls, outreach, identity
   access, troubleshooting, credential and note limitations, and authenticated webhook guidance.
 - **Always-on gateway:** signed webhook verification, durable pre-wake deduplication, contact-scoped sessions,
@@ -234,6 +236,42 @@ The setup wizard trusts Inkbox tools so they run without repeated approval promp
 plugin's `inkbox_*` tools; other Harness tools and actions keep their own approval behavior. Automated setup
 can explicitly keep per-action prompts with `--ask-inkbox-tool-approvals`.
 
+## Slack
+
+Slack is off by default. Run `inkbox-deepseek setup` to enable it, select the app's provisioning workspace,
+provide or renew App Configuration credentials through masked input, open the browser installation link, and
+wait for the matching workspace connection. Setup is bounded and can be resumed; an unknown app-creation
+outcome is never blindly repeated. For an already connected identity, set `slackEnabled: true` in the `inkbox`
+settings (or run setup with `--enable-slack`) and restart; `--skip-slack` leaves the saved setting unchanged. When
+the profile has no `slackEnabled` setting, `INKBOX_SLACK_ENABLED=true` enables Slack. Doctor reports whether a workspace is connected, and
+`inkbox-deepseek status` shows the connection the gateway found at startup.
+
+The six Slack tools are `inkbox_slack_list_connections`, `inkbox_slack_list_conversations`,
+`inkbox_slack_list_messages`, `inkbox_slack_search`, `inkbox_slack_send_message`, and
+`inkbox_slack_get_action`. Search covers retained message text, not all workspace history or files; follow
+`nextCursor` even when a page is empty. Reuse the same idempotency key for a send retry and inspect unknown
+actions before doing anything else.
+
+Ordinary Slack channel traffic starts a session only when addressed; later messages in that engaged thread can
+continue it. Unmentioned traffic in unrelated threads does not wake the agent. DMs and group DMs do not require
+a prior session. A plain DM joins the sender's contact session; every other conversation and thread keeps its
+own session. The final reply goes to the source conversation and thread, with simple Markdown links and bold
+converted to Slack mrkdwn outside code. A reply whose send outcome is unconfirmed is kept for attention and
+never sent again automatically; while Slack is disabled, saved Slack replies wait unsent. One Slack message
+delivered under several event types runs one turn, and each Slack message is its own turn, run in order; nothing
+from another channel is merged into a running Slack turn. A Slack turn's approval and question prompts go to its
+Slack conversation and can be answered only by the person whose message started the turn; a Slack prompt with no
+running Slack turn is declined without being sent. Elsewhere prompts go to the latest conversation and answers
+work as before; a Slack message waiting behind another channel's turn does not take over that turn's prompt. A native Slack
+stop cancels that person's running turn, queued messages and pending prompt in the thread; a redelivered stop
+never reaches a later turn.
+
+Slack audio follows the same wait, read, and label as other voice notes: the received event's `data.message_id`
+matches the completion, results arrive on `data.event.files[].transcription`, and when Slack is enabled the
+single `message.transcription_finished` subscription is the Slack webhook subscription, because Slack
+completions are delivered only alongside the Slack message events. Disabled Slack messages are ignored without
+a wait.
+
 ## Config Reference
 
 The bundle reads the `inkbox` settings namespace:
@@ -248,6 +286,7 @@ inkbox:
   permissionTimeoutMs: 600000
   autoApproveInkboxTools: true
   externalEvents: false
+  slackEnabled: false
   voiceEnabled: true
   voiceStack: openai_realtime # or inkbox_voice_ai
   realtimeCredentialRef: INKBOX_REALTIME_API_KEY
@@ -270,7 +309,7 @@ plain text, iMessage conversational and free of Markdown syntax, calls natural a
 follow-up idempotent.
 
 `channelInstructions` adds operator guidance after the built-in safety policy. Keys can be a channel name
-(`email`, `sms`, `imessage`, `call`, `a2a`, or `external`) or a contact id. A contact-specific instruction
+(`email`, `sms`, `imessage`, `whatsapp`, `slack`, `call`, `a2a`, or `external`) or a contact id. A contact-specific instruction
 takes precedence over the current channel instruction. Blank values are ignored. The current event body is
 kept in a separately labeled untrusted-content block, and each event in a mixed-channel batch receives its
 own policy block.

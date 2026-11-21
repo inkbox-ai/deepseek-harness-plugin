@@ -14,6 +14,7 @@ export interface Config {
   permissionTimeoutMs?: number
   autoApproveInkboxTools?: boolean
   externalEvents?: boolean
+  slackEnabled?: boolean
   voiceEnabled?: boolean
   voiceStack?: VoiceStack
   realtimeCredentialRef?: string
@@ -36,6 +37,7 @@ export const Config: z<Config> = z.object({
   permissionTimeoutMs: z.number().step(1).min(1_000).max(3_600_000).default(DEFAULT_PERMISSION_TIMEOUT_MS),
   autoApproveInkboxTools: z.boolean().default(false),
   externalEvents: z.boolean().default(false),
+  slackEnabled: z.boolean(),
   voiceEnabled: z.boolean().default(true),
   voiceStack: z.union(['inkbox_voice_ai', 'openai_realtime']).default('inkbox_voice_ai'),
   realtimeCredentialRef: z.string().default('INKBOX_REALTIME_API_KEY'),
@@ -56,6 +58,7 @@ export interface ResolvedConfig {
   permissionTimeoutMs: number
   autoApproveInkboxTools: boolean
   externalEvents: boolean
+  slackEnabled: boolean
   voiceEnabled: boolean
   voiceStack: VoiceStack
   realtimeCredentialRef: string
@@ -78,6 +81,8 @@ export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME
     permissionTimeoutMs: config.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS,
     autoApproveInkboxTools: config.autoApproveInkboxTools ?? false,
     externalEvents: config.externalEvents ?? false,
+    // A profile setting wins; otherwise a host can enable Slack through the environment.
+    slackEnabled: config.slackEnabled ?? boolEnv(process.env.INKBOX_SLACK_ENABLED) ?? false,
     voiceEnabled: config.voiceEnabled ?? true,
     voiceStack: config.voiceStack ?? 'inkbox_voice_ai',
     realtimeCredentialRef: config.realtimeCredentialRef?.trim() || 'INKBOX_REALTIME_API_KEY',
@@ -85,4 +90,12 @@ export function resolveConfig(config: Config, harnessHome = process.env.DSH_HOME
     realtimeVoice: config.realtimeVoice?.trim() || 'cedar',
     channelInstructions: { ...config.channelInstructions },
   }
+}
+
+export function boolEnv(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined
+  const normalized = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return undefined
 }

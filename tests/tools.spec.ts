@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { describe, expect, it, vi } from 'vitest'
+import { SLACK_TOOL_NAMES } from '../src/constants.js'
 import type { InkboxRuntime } from '../src/runtime.js'
 import { registerTools } from '../src/tools.js'
 
@@ -118,5 +119,110 @@ describe('Harness tool registration and execution', () => {
     const read = findTool(definitions, 'inkbox_list_contacts')
     expect(read.isConcurrencySafe?.({})).toBe(true)
     expect(findTool(definitions, 'inkbox_send_sms').isConcurrencySafe).toBeUndefined()
+  })
+})
+
+describe('Slack tools', () => {
+  function slackHarness(slackEnabled: boolean) {
+    const definitions: ToolDefinition[] = []
+    const request = vi.fn(async () => 'allowed-once')
+    const ctx = {
+      tools: { register: (definition: ToolDefinition) => definitions.push(definition) },
+      approval: { request },
+    } as unknown as Context
+    const slack = {
+      listConnections: vi.fn(async () => ({
+        connections: [
+          { id: 'connection-1', identityId: 'identity-1', workspaceId: 'T1', status: 'connected' },
+        ],
+      })),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, hasMore: false })),
+      sendMessage: vi.fn(async () => ({ id: 'action-1', status: 'sent' })),
+    }
+    const runtime = {
+      config: { autoApproveInkboxTools: false, slackEnabled },
+      getClient: vi.fn(async () => ({ slack })),
+      getIdentity: vi.fn(async () => ({ id: 'identity-1' })),
+    } as unknown as InkboxRuntime
+    registerTools(ctx, runtime)
+    return { definitions, request, slack }
+  }
+
+  it('registers the Slack tools only when Slack is enabled', () => {
+    expect(slackHarness(false).definitions.some((tool) => tool.name.startsWith('inkbox_slack_'))).toBe(false)
+    const names = slackHarness(true).definitions.map((tool) => tool.name)
+    expect(names.filter((name) => name.startsWith('inkbox_slack_'))).toEqual([...SLACK_TOOL_NAMES])
+    expect(names).toHaveLength(33 + SLACK_TOOL_NAMES.length)
+  })
+
+  it('reads Slack history on an owned connection without approval', async () => {
+    const { definitions, request, slack } = slackHarness(true)
+    await findTool(definitions, 'inkbox_slack_list_messages').execute(
+      { connectionId: 'connection-1', conversationId: 'C1', threadTs: '1770000000.000100', limit: 20 },
+      exec,
+    )
+    expect(slack.listMessages).toHaveBeenCalledWith('connection-1', 'C1', {
+      threadTs: '1770000000.000100',
+      limit: 20,
+    })
+    expect(request).not.toHaveBeenCalled()
+    await expect(
+      findTool(definitions, 'inkbox_slack_list_messages').execute(
+        { connectionId: 'connection-2', conversationId: 'C1' },
+        exec,
+      ),
+    ).rejects.toThrow(/not connected to this identity/)
+  })
+
+  it('requires approval and a stable key before sending a Slack message', async () => {
+    const { definitions, request, slack } = slackHarness(true)
+    const tool = findTool(definitions, 'inkbox_slack_send_message')
+    await expect(
+      tool.execute(
+        { connectionId: 'connection-1', conversationId: 'C1', text: 'Hi', idempotencyKey: 'bad key' },
+        exec,
+      ),
+    ).rejects.toThrow(/idempotencyKey/)
+    await tool.execute(
+      { connectionId: 'connection-1', conversationId: 'C1', text: '**Done**', idempotencyKey: 'send-1' },
+      exec,
+    )
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'inkbox_slack_send_message' }))
+    expect(slack.sendMessage).toHaveBeenCalledWith('connection-1', {
+      conversationId: 'C1',
+      text: '*Done*',
+      idempotencyKey: 'send-1',
+    })
+  })
+
+  it.each([
+    ['inkbox_slack_list_messages', { connectionId: 'connection-1', conversationId: 'C1', limit: 0 }],
+    ['inkbox_slack_list_conversations', { connectionId: 'connection-1', limit: 101 }],
+    ['inkbox_slack_list_messages', { connectionId: 'connection-1', conversationId: '' }],
+    ['inkbox_slack_list_messages', { connectionId: 'connection-1', conversationId: 'C1', reaction: 'eyes' }],
+    [
+      'inkbox_slack_send_message',
+      { connectionId: 'connection-1', conversationId: 'C1', text: 'Hi', idempotencyKey: 'bad key' },
+    ],
+    [
+      'inkbox_slack_send_message',
+      {
+        connectionId: 'connection-1',
+        conversationId: 'C1',
+        text: 'x'.repeat(12_001),
+        idempotencyKey: 'send-1',
+      },
+    ],
+    [
+      'inkbox_slack_send_message',
+      { connectionId: 'connection-1', conversationId: 'C1', idempotencyKey: 'send-1' },
+    ],
+  ])('rejects invalid %s arguments before approval or any API call', async (name, args) => {
+    const { definitions, request, slack } = slackHarness(true)
+    await expect(findTool(definitions, name).execute(args, exec)).rejects.toThrow()
+    expect(request).not.toHaveBeenCalled()
+    expect(slack.listConnections).not.toHaveBeenCalled()
+    expect(slack.listMessages).not.toHaveBeenCalled()
+    expect(slack.sendMessage).not.toHaveBeenCalled()
   })
 })
