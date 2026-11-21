@@ -71,9 +71,16 @@ export class AgentManager {
     return handle.agent
   }
 
-  async run(routeKey: string, prompt: string): Promise<string> {
+  /** An abort before submission skips the prompt; after it, the running turn is cancelled. */
+  async run(
+    routeKey: string,
+    prompt: string,
+    options: { failOnError?: boolean; signal?: AbortSignal } = {},
+  ): Promise<string> {
+    const { signal } = options
     const agent = await this.get(routeKey)
     await agent.whenIdle()
+    signal?.throwIfAborted()
     const firstSeq = agent.session.seq
     agent.followup(
       createUserMessage({
@@ -81,8 +88,19 @@ export class AgentManager {
         source: { kind: 'plugin', plugin: 'inkbox' },
       }),
     )
-    await settleAgent(this.ctx, agent)
+    const cancel = () => agent.cancel({ kind: 'hook', reason: 'inkbox turn aborted' })
+    signal?.addEventListener('abort', cancel, { once: true })
+    try {
+      await settleAgent(this.ctx, agent)
+    } finally {
+      signal?.removeEventListener('abort', cancel)
+    }
     await this.ctx.sessions.flush(agent.session)
+    signal?.throwIfAborted()
+    if (options.failOnError) {
+      const failure = turnFailure(agent.session.events, firstSeq)
+      if (failure !== undefined) throw new Error(failure)
+    }
     return summarize(agent.session.events, firstSeq)
   }
 
@@ -134,6 +152,16 @@ export function summarize(events: readonly SessionEvent[], firstSeq: number): st
     if (candidate) text = candidate
   }
   return text
+}
+
+export function turnFailure(events: readonly SessionEvent[], firstSeq: number): string | undefined {
+  for (const event of events) {
+    if (event.seq < firstSeq || event.type !== 'turn/end') continue
+    const reason = event.data.reason
+    if (reason.kind === 'error') return reason.error.message || 'Agent turn failed'
+    if (reason.kind === 'aborted' || reason.kind === 'interrupted') return `Agent turn ${reason.kind}`
+  }
+  return undefined
 }
 
 interface OwnerJobs {
