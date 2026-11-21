@@ -1,7 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { BUILTIN_CHANNEL_INSTRUCTIONS } from '../channel-instructions.js'
-import type { VoiceStack } from '../config.js'
+import { boolEnv, type VoiceStack } from '../config.js'
 import { PLUGIN_PACKAGE, PROFILE_NAME } from '../constants.js'
 import { configureAvatar } from './avatar.js'
 import { configureChannels } from './channels.js'
@@ -161,7 +161,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
       ...(options.enableIMessage !== undefined ? { enableIMessage: options.enableIMessage } : {}),
       ...(options.enableA2A !== undefined ? { enableA2A: options.enableA2A } : {}),
       ...(options.enableSlack !== undefined ? { enableSlack: options.enableSlack } : {}),
-      slackDefault: savedSettings.slackEnabled === true,
+      slackDefault: effectiveSlackEnabled(savedSettings, env),
       ...(options.provisionPhone !== undefined ? { provisionPhone: options.provisionPhone } : {}),
       ...(options.phoneState ? { phoneState: options.phoneState } : {}),
       nonInteractive: options.nonInteractive ?? false,
@@ -194,7 +194,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
         ...(channels.voiceStack ? { voiceStack: channels.voiceStack } : {}),
         ...(channels.realtimeModel ? { realtimeModel: channels.realtimeModel } : {}),
         ...(channels.realtimeVoice ? { realtimeVoice: channels.realtimeVoice } : {}),
-        slackEnabled: channels.slackEnabled,
+        ...slackSetting(channels.slackEnabled),
         autoApproveInkboxTools,
       }
     })
@@ -215,6 +215,21 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
   } finally {
     prompts?.close()
   }
+}
+
+/** The setting the gateway will use: the profile's value, else INKBOX_SLACK_ENABLED, else off. */
+export function effectiveSlackEnabled(
+  settings: Readonly<Record<string, unknown>> | undefined,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  return typeof settings?.slackEnabled === 'boolean'
+    ? settings.slackEnabled
+    : (boolEnv(env.INKBOX_SLACK_ENABLED) ?? false)
+}
+
+/** Profile fields to write for the Slack choice; an unchanged choice writes nothing. */
+export function slackSetting(enabled: boolean | undefined): { slackEnabled?: boolean } {
+  return enabled === undefined ? {} : { slackEnabled: enabled }
 }
 
 export async function resolveToolApprovalChoice(

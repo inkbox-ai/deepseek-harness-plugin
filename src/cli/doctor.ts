@@ -8,6 +8,7 @@ import { validateHarness } from './harness.js'
 import type { Paths } from './paths.js'
 import { run } from './process.js'
 import { manageService, serviceInstalled } from './service.js'
+import { effectiveSlackEnabled } from './setup.js'
 
 export interface Check {
   name: string
@@ -116,7 +117,7 @@ export async function doctor(paths: Paths): Promise<Check[]> {
         identity.imessageEnabled,
         identity.imessageEnabled ? 'Enabled' : 'Optional channel is disabled',
       )
-      if (section?.slackEnabled !== true) add('Slack channel', true, 'Optional channel is disabled')
+      if (!effectiveSlackEnabled(section)) add('Slack channel', true, 'Optional channel is disabled')
       else
         try {
           const connected = (await client.slack.listConnections(identity.id)).connections.filter(

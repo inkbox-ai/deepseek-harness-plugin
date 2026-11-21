@@ -71,7 +71,14 @@ interface Queue {
   buffered: RoutedEvent[]
   timer: ReturnType<typeof setTimeout> | undefined
   active:
-    | { events: RoutedEvent[]; target: ReplyTarget; phase: 'generating' | 'finishing'; stopped?: boolean }
+    | {
+        events: RoutedEvent[]
+        target: ReplyTarget
+        phase: 'generating' | 'finishing'
+        /** The participant whose message started the turn; a steered message never replaces it. */
+        author?: ReplyAuthor
+        abort: AbortController
+      }
     | undefined
 }
 
@@ -363,7 +370,7 @@ export class Gateway {
       this.state.snapshot().routingKey,
     )
     if (route.nativeStop) {
-      this.stopSlack(routed)
+      await this.stopSlack(routed)
       return 'stopped'
     }
     // Quiet channel traffic cannot start a session; an engaged thread continues.
@@ -374,41 +381,55 @@ export class Gateway {
   }
 
   /**
-   * Stop work the same Slack actor started in this thread: its pending prompt,
-   * its queued messages and its running turn. A reply already being delivered
+   * Stop work the same Slack actor started in this thread: its queued messages,
+   * its running turn and that turn's pending prompt. The targets are recorded
+   * durably with the stop before anything is cancelled, so a redelivered stop
+   * reuses them and never reaches a later turn. A reply already being delivered
    * is not retracted.
    */
-  private stopSlack(stop: RoutedEvent): void {
+  private async stopSlack(stop: RoutedEvent): Promise<void> {
     const author = stop.sender
-    const pending = this.pendingHuman.get(stop.routeKey)
-    if (pending?.author?.channel === 'slack' && pending.author.sender === author) {
-      this.pendingHuman.delete(stop.routeKey)
-      clearTimeout(pending.timer)
-      pending.reject(new Error('Stopped from Slack'))
-    }
     const queue = this.queues.get(stop.routeKey)
-    if (queue === undefined) return
-    const dropped = queue.buffered.filter((event) => event.channel === 'slack' && event.sender === author)
+    const receipt = `slack-stop:${stop.target.channel === 'slack' ? stop.target.identityId : ''}:${stop.eventId}`
+    const targets = new Set(
+      await this.state.mutate((state) => {
+        const existing = state.slackStops[receipt]
+        if (existing) return existing.targets
+        const owned = (event: RoutedEvent | undefined) =>
+          event?.channel === 'slack' && event.sender === author
+        const active = queue?.active
+        const targets = [
+          ...(active?.phase === 'generating' && owned(active.events[0])
+            ? active.events.map((event) => event.eventId)
+            : []),
+          ...(queue?.buffered.filter(owned).map((event) => event.eventId) ?? []),
+        ]
+        state.slackStops[receipt] = { targets, at: Date.now() }
+        return targets
+      }),
+    )
+    if (queue === undefined || targets.size === 0) return
+    const dropped = queue.buffered.filter((event) => targets.has(event.eventId))
     if (dropped.length) {
-      queue.buffered = queue.buffered.filter((event) => !dropped.includes(event))
+      queue.buffered = queue.buffered.filter((event) => !targets.has(event.eventId))
       if (!queue.buffered.length && queue.timer !== undefined) {
         clearTimeout(queue.timer)
         queue.timer = undefined
       }
-      this.track(
-        this.state
-          .mutate((state) => {
-            for (const event of dropped) state.replied[event.eventId] = Date.now()
-          })
-          .catch((error) => this.log.error('[inkbox] Slack stop could not be recorded', error)),
-      )
+      await this.state.mutate((state) => {
+        for (const event of dropped) state.replied[event.eventId] = Date.now()
+      })
     }
     const active = queue.active
-    const source = active?.events.at(-1)
-    if (active?.phase === 'generating' && source?.channel === 'slack' && source.sender === author) {
-      active.stopped = true
-      this.agents.cancel(stop.routeKey, 'Stopped from Slack')
+    const first = active?.events[0]
+    if (active?.phase !== 'generating' || first === undefined || !targets.has(first.eventId)) return
+    const pending = this.pendingHuman.get(stop.routeKey)
+    if (pending !== undefined && sameAuthor(pending.author, stop)) {
+      this.pendingHuman.delete(stop.routeKey)
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Stopped from Slack'))
     }
+    active.abort.abort(new Error('Stopped from Slack'))
   }
 
   private async checkSlack(): Promise<void> {
@@ -909,10 +930,7 @@ export class Gateway {
 
   private async accept(event: RoutedEvent): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
-    this.latestAuthors.set(
-      event.routeKey,
-      event.sender ? { channel: event.channel, sender: event.sender } : undefined,
-    )
+    this.latestAuthors.set(event.routeKey, replyAuthor(event))
     const pending = this.pendingHuman.get(event.routeKey)
     // Only the participant who prompted the turn can answer it.
     if (pending !== undefined && event.replyText.trim() && sameAuthor(pending.author, event)) {
@@ -927,7 +945,12 @@ export class Gateway {
     const queue = this.queues.get(event.routeKey) ?? { buffered: [], timer: undefined, active: undefined }
     this.queues.set(event.routeKey, queue)
     if (event.typingConversationId) this.startTyping(event.typingConversationId)
-    if (queue.active?.phase === 'generating') {
+    // A Slack message is its own turn, and nothing joins a stopped turn.
+    if (
+      queue.active?.phase === 'generating' &&
+      event.channel !== 'slack' &&
+      !queue.active.abort.signal.aborted
+    ) {
       queue.active.events.push(event)
       queue.active.target = event.target
       const task = this.agents
@@ -947,18 +970,31 @@ export class Gateway {
 
   private async runBatch(routeKey: string, queue: Queue): Promise<void> {
     if (this.closing || queue.active !== undefined || queue.buffered.length === 0) return
-    const events = queue.buffered.splice(0)
+    // Each Slack message runs as its own turn, owned by its sender.
+    const slackAt = queue.buffered.findIndex((event) => event.channel === 'slack')
+    const events = queue.buffered.splice(0, slackAt === 0 ? 1 : slackAt < 0 ? queue.buffered.length : slackAt)
+    const first = events[0]
+    const author = first && replyAuthor(first)
     const active: NonNullable<Queue['active']> = {
       events,
       target: events.at(-1)?.target ?? { channel: 'none' as const },
       phase: 'generating',
+      ...(author ? { author } : {}),
+      abort: new AbortController(),
     }
     queue.active = active
     try {
       const prompt = events.map((event) => renderChannelEvent(event, this.config)).join('\n\n')
-      const response = (await this.agents.run(routeKey, prompt)).trim()
+      let response: string
+      try {
+        response = (await this.agents.run(routeKey, prompt, { signal: active.abort.signal })).trim()
+      } catch (error) {
+        if (!active.abort.signal.aborted) throw error
+        response = ''
+      }
       this.stopTypingForEvents(active.events)
-      if (active.stopped) {
+      // A stopped turn is complete without a reply.
+      if (active.abort.signal.aborted) {
         await this.state.mutate((state) => {
           for (const event of active.events) state.replied[event.eventId] = Date.now()
         })
@@ -1191,11 +1227,12 @@ export class Gateway {
     if (routeKey === undefined) throw new Error('No active Inkbox route owns this agent')
     if (this.pendingHuman.has(routeKey))
       throw new Error('Another Inkbox interaction is already pending for this route')
-    const target = this.latestTargets.get(routeKey)
+    // The prompt belongs to the running turn: its target and the participant who started it.
+    const active = this.queues.get(routeKey)?.active
+    const target = active?.target ?? this.latestTargets.get(routeKey)
     if (target === undefined || target.channel === 'none')
       throw new Error('The active route has no reply channel')
-    // Captured before sending so a later participant cannot become the answerer.
-    const author = this.latestAuthors.get(routeKey)
+    const author = active ? active.author : this.latestAuthors.get(routeKey)
     await this.deliver(target, prompt)
     return new Promise<string>((resolve, reject) => {
       const finish = (error: Error) => {
@@ -1304,6 +1341,16 @@ export class Gateway {
       mode: 0o600,
     })
   }
+}
+
+/** Shared conversations bind a prompt to its sender; a one-to-one conversation has one participant. */
+function replyAuthor(event: RoutedEvent): ReplyAuthor | undefined {
+  if (
+    event.sender === undefined ||
+    !(event.group || event.channel === 'slack' || event.channel === 'whatsapp')
+  )
+    return undefined
+  return { channel: event.channel, sender: event.sender }
 }
 
 function sameAuthor(expected: ReplyAuthor | undefined, event: RoutedEvent): boolean {

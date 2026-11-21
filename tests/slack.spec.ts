@@ -386,7 +386,9 @@ describe('Slack reception and replies', () => {
     try {
       expect((await gateway.dispatchVerified(message(), 'inkbox')).status).toBe(202)
       await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
-      expect(run).toHaveBeenCalledWith('contact:contact-1', expect.stringContaining('Channel: slack'))
+      expect(run).toHaveBeenCalledWith('contact:contact-1', expect.stringContaining('Channel: slack'), {
+        signal: expect.any(AbortSignal),
+      })
       expect(run.mock.calls[0]?.[1]).toContain('Hello from Slack')
       expect(run.mock.calls[0]?.[1]).toContain('[inkbox:slack from=T1:U1 connection_id=connection-1')
       expect(slack.sendMessage).toHaveBeenCalledWith('connection-1', {
@@ -623,27 +625,159 @@ describe('Slack approvals, stop and saved replies', () => {
     }
   })
 
-  it("stops only the stopping actor's running thread turn and sends no reply for it", async () => {
+  /** Holds each mocked turn open until released, recording the abort signal it was given. */
+  function heldTurns(run: Awaited<ReturnType<typeof harness>>['run']) {
+    const turns: { prompt: string; signal: AbortSignal | undefined; release(value?: string): void }[] = []
+    run.mockImplementation(
+      (_routeKey, prompt, options) =>
+        new Promise<string>((resolve) => {
+          turns.push({
+            prompt,
+            signal: options?.signal,
+            release: (value = 'Reply from DeepSeek') => resolve(value),
+          })
+        }),
+    )
+    return turns
+  }
+
+  it('binds an approval to the participant who started the turn, not a later poster', async () => {
     const { gateway, run, slack } = await harness()
     try {
-      let finish: (value: string) => void = () => {}
-      run.mockImplementationOnce(
+      const turns = heldTurns(run)
+      const steer = vi.spyOn(gateway.agents, 'steer')
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      // Another participant posts while the turn is generating: it becomes a separate turn.
+      await gateway.dispatchVerified(
+        threadReply('event-u2-note', 'U2', 'slack-message-2', 'me too'),
+        'inkbox',
+      )
+      expect(steer).not.toHaveBeenCalled()
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      let settled = false
+      void approval.then(() => {
+        settled = true
+      })
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({
+        threadTs: ROOT,
+        text: expect.stringContaining('Reply YES'),
+      })
+      await gateway.dispatchVerified(threadReply('event-u2-yes', 'U2', 'slack-message-3', 'YES'), 'inkbox')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      await gateway.dispatchVerified(threadReply('event-u1-yes', 'U1', 'slack-message-4', 'YES'), 'inkbox')
+      await expect(approval).resolves.toBe('allowed-once')
+      turns[0]?.release()
+      // The later poster's messages run afterwards as their own turns.
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      expect(turns[1]?.prompt).toContain('me too')
+      turns[1]?.release()
+      await vi.waitFor(() => expect(turns).toHaveLength(3))
+      turns[2]?.release()
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it("ignores another participant's stop and stops the owner's running turn without a reply", async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      expect(run.mock.calls[0]?.[0]).toBe(THREAD_ROUTE)
+      await gateway.dispatchVerified(
+        threadReply('event-u2-note', 'U2', 'slack-message-2', 'me too'),
+        'inkbox',
+      )
+      expect((await gateway.dispatchVerified(stop('stop-u2', 'U2'), 'inkbox')).status).toBe(202)
+      expect(turns[0]?.signal?.aborted).toBe(false)
+      expect((await gateway.dispatchVerified(stop('stop-u1', 'U1'), 'inkbox')).status).toBe(202)
+      expect(turns[0]?.signal?.aborted).toBe(true)
+      turns[0]?.release('Partial answer')
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
+      // The other participant stopped only their own queued message.
+      expect(gateway.eventState('event-u2-note')).toBe('completed')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(turns).toHaveLength(1)
+      expect(slack.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('reuses a redelivered stop receipt and never cancels a later turn', async () => {
+    const { gateway, run } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      await gateway.dispatchVerified(stop('stop-1', 'U1'), 'inkbox')
+      expect(turns[0]?.signal?.aborted).toBe(true)
+      turns[0]?.release()
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
+      await gateway.dispatchVerified(
+        threadReply('event-next', 'U1', 'slack-message-5', 'try again'),
+        'inkbox',
+      )
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      expect((await gateway.dispatchVerified(stop('stop-1', 'U1'), 'inkbox')).status).toBe(202)
+      expect(turns[1]?.signal?.aborted).toBe(false)
+      expect(gateway.state.snapshot().slackStops['slack-stop:identity-1:stop-1']?.targets).toEqual([
+        'event-1',
+      ])
+      turns[1]?.release()
+      await vi.waitFor(() => expect(gateway.eventState('event-next')).toBe('completed'))
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('submits nothing when a stop arrives before the agent is acquired', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      run.mockRestore()
+      let acquire: (agent: Agent) => void = () => {}
+      const get = vi.spyOn(gateway.agents, 'get').mockImplementation(
         () =>
-          new Promise<string>((resolve) => {
-            finish = resolve
+          new Promise<Agent>((resolve) => {
+            acquire = resolve
           }),
       )
-      const cancel = vi.spyOn(gateway.agents, 'cancel').mockReturnValue(true)
+      const followup = vi.fn()
       await gateway.dispatchVerified(mention(), 'inkbox')
-      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
-      expect(run.mock.calls[0]?.[0]).toBe(THREAD_ROUTE)
-      expect((await gateway.dispatchVerified(stop('stop-other', 'U2'), 'inkbox')).status).toBe(202)
-      expect(cancel).not.toHaveBeenCalled()
-      expect((await gateway.dispatchVerified(stop('stop-owner', 'U1'), 'inkbox')).status).toBe(202)
-      expect(cancel).toHaveBeenCalledWith(THREAD_ROUTE, 'Stopped from Slack')
-      finish('Partial answer')
+      await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(1))
+      await gateway.dispatchVerified(stop('stop-early', 'U1'), 'inkbox')
+      acquire({ whenIdle: async () => {}, followup, session: { seq: 0, events: [] } } as unknown as Agent)
       await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
+      expect(followup).not.toHaveBeenCalled()
       expect(slack.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('runs a message sent after a stop as a new turn', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      await gateway.dispatchVerified(stop('stop-1', 'U1'), 'inkbox')
+      await gateway.dispatchVerified(
+        threadReply('event-after', 'U1', 'slack-message-6', 'actually, continue'),
+        'inkbox',
+      )
+      turns[0]?.release()
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      expect(turns[1]?.prompt).toContain('actually, continue')
+      expect(turns[1]?.signal?.aborted).toBe(false)
+      turns[1]?.release('Continuing')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({ text: 'Continuing', threadTs: ROOT })
     } finally {
       await gateway.close()
     }

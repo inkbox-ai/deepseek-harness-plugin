@@ -395,15 +395,15 @@ describe('Slack onboarding', () => {
     } as unknown as Inkbox
   }
 
-  it('saves an explicit choice without prompting in non-interactive setup', async () => {
+  it('saves only an explicit enable in non-interactive setup', async () => {
     const client = slackClient(false)
     await expect(
       configureSlackChannel(identity, client, undefined, { nonInteractive: true, enableSlack: true }),
     ).resolves.toBe(true)
-    await expect(configureSlackChannel(identity, client, undefined, { slackDefault: true })).resolves.toBe(
-      true,
-    )
-    await expect(configureSlackChannel(identity, client, undefined, {})).resolves.toBe(false)
+    await expect(
+      configureSlackChannel(identity, client, undefined, { slackDefault: true }),
+    ).resolves.toBeUndefined()
+    await expect(configureSlackChannel(identity, client, undefined, {})).resolves.toBeUndefined()
     expect(client.slack.listConnections).not.toHaveBeenCalled()
   })
 
@@ -422,20 +422,15 @@ describe('Slack onboarding', () => {
     expect(accepted.confirm).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the saved Slack choice when setup skips Slack', async () => {
+  it('leaves the Slack setting unchanged when setup skips Slack', async () => {
     const prompt = prompts()
     const client = slackClient(true)
-    await expect(
-      configureSlackChannel(identity, client, prompt, { enableSlack: false, slackDefault: true }),
-    ).resolves.toBe(true)
-    await expect(configureSlackChannel(identity, client, prompt, { enableSlack: false })).resolves.toBe(false)
-    await expect(
-      configureSlackChannel(identity, client, undefined, {
-        nonInteractive: true,
-        enableSlack: false,
-        slackDefault: true,
-      }),
-    ).resolves.toBe(true)
+    for (const options of [
+      { enableSlack: false, slackDefault: true },
+      { enableSlack: false },
+      { nonInteractive: true, enableSlack: false, slackDefault: true },
+    ])
+      await expect(configureSlackChannel(identity, client, prompt, options)).resolves.toBeUndefined()
     expect(prompt.confirm).not.toHaveBeenCalled()
     expect(client.slack.listConnections).not.toHaveBeenCalled()
   })
