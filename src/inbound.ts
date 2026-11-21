@@ -79,7 +79,7 @@ export function parseInbound(payload: Json): InboundEvent | undefined {
 }
 
 export function inboundSize(item: PendingInbound): number {
-  return item.event.body.length + (item.output?.length ?? 0)
+  return Buffer.byteLength(item.event.body) + Buffer.byteLength(item.output ?? '')
 }
 
 export function truncateInboundBody(body: string): string {
@@ -133,6 +133,7 @@ export function runInboundScript(
   cwd: string,
   input: string,
   timeoutMs = INBOUND_SCRIPT_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<ScriptResult> {
   return new Promise((resolve) => {
     // A separate process group lets a timeout kill everything the shell started.
@@ -141,12 +142,17 @@ export function runInboundScript(
     let stdout = Buffer.alloc(0)
     let stderr = Buffer.alloc(0)
     let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
+    const kill = () => {
       try {
         if (child.pid) process.kill(-child.pid, 'SIGKILL')
       } catch {}
+    }
+    const timer = setTimeout(() => {
+      timedOut = true
+      kill()
     }, timeoutMs)
+    if (signal?.aborted) kill()
+    else signal?.addEventListener('abort', kill, { once: true })
     child.stdout.on('data', (chunk: Buffer) => {
       if (stdout.length <= INBOUND_BODY_MAX_BYTES)
         stdout = Buffer.concat([stdout, chunk]).subarray(0, INBOUND_BODY_MAX_BYTES + 1)
@@ -157,18 +163,20 @@ export function runInboundScript(
     child.stdin.on('error', () => {})
     child.on('error', (error) => {
       clearTimeout(timer)
+      signal?.removeEventListener('abort', kill)
       resolve({ ok: false, error: error.message })
     })
-    child.on('close', (code, signal) => {
+    child.on('close', (code, exitSignal) => {
       clearTimeout(timer)
-      if (code === 0 && !timedOut) {
+      signal?.removeEventListener('abort', kill)
+      if (code === 0 && !timedOut && !signal?.aborted) {
         resolve({ ok: true, stdout: truncateInboundBody(stdout.toString('utf8')) })
       } else
         resolve({
           ok: false,
           error: timedOut
             ? `Timed out after ${timeoutMs / 1000} s`
-            : stderr.toString('utf8').trim() || `Exited with ${signal ?? `code ${code}`}`,
+            : stderr.toString('utf8').trim() || `Exited with ${exitSignal ?? `code ${code}`}`,
         })
     })
     child.stdin.end(input)

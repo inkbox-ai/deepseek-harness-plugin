@@ -1,4 +1,5 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -232,6 +233,14 @@ export class Gateway {
     if (authenticated.outcome === 'invalid') return new Response(authenticated.detail, { status: 401 })
     if (authenticated.outcome === 'unavailable') return new Response(authenticated.detail, { status: 503 })
     if (authenticated.outcome === 'ignored') return new Response(authenticated.detail, { status: 202 })
+    // Refused before any host admission: retrying a malformed event cannot succeed.
+    if (
+      authenticated.source === 'inkbox' &&
+      this.localDelivery &&
+      authenticated.payload.event_type === 'inbound.received' &&
+      parseInbound(authenticated.payload) === undefined
+    )
+      return new Response('Invalid inbound event', { status: 400 })
     return this.dispatchVerified(authenticated.payload, authenticated.source)
   }
 
@@ -281,7 +290,7 @@ export class Gateway {
 
   private async acceptInbound(payload: Record<string, unknown>): Promise<Response> {
     const event = parseInbound(payload)
-    if (event === undefined) return new Response('Ignored', { status: 202 })
+    if (event === undefined) return new Response('Invalid inbound event', { status: 400 })
     // The host tracks the envelope id; deduplication uses the delivery id.
     const trackingId = typeof payload.id === 'string' && payload.id ? payload.id : event.deliveryId
     const marker = `inbound-delivery:${event.deliveryId}`
@@ -330,7 +339,7 @@ export class Gateway {
   }
 
   private inboundHasRoom(event: InboundEvent): boolean {
-    let bytes = event.body.length
+    let bytes = Buffer.byteLength(event.body)
     for (const item of this.inbound.values()) bytes += inboundSize(item)
     return (
       this.inbound.size + this.inboundPersisting.size < INBOUND_MAX_PENDING_EVENTS &&
@@ -342,9 +351,11 @@ export class Gateway {
   private async loadInbound(schedule: boolean): Promise<void> {
     this.inboundReload = undefined
     if (this.closing) return
+    // A job that finishes during the load may still be read from its old file.
+    const known = new Set(this.inbound.keys())
     const { items, unreadable } = await this.inboundStore.load()
     for (const item of items) {
-      if (this.inbound.has(item.event.deliveryId)) continue
+      if (known.has(item.event.deliveryId) || this.inbound.has(item.event.deliveryId)) continue
       this.inbound.set(item.event.deliveryId, item)
       if (schedule) this.scheduleInbound(item)
     }
@@ -406,15 +417,25 @@ export class Gateway {
           return await this.reportInbound(item, 'Script run was interrupted by a restart')
         await this.acquireScriptSlot()
         let result: Awaited<ReturnType<typeof runInboundScript>>
+        const script = new AbortController()
+        this.inboundTurns.add(script)
         try {
           if (this.closing) return
           // Counted before running so a crash mid-run still uses up the attempt.
           item.attempts += 1
           await this.inboundStore.save(item)
-          result = await runInboundScript(event.handler.command, this.config.workspace, scriptInput(event))
+          result = await runInboundScript(
+            event.handler.command,
+            homedir(),
+            scriptInput(event),
+            undefined,
+            script.signal,
+          )
         } finally {
+          this.inboundTurns.delete(script)
           this.releaseScriptSlot()
         }
+        if (this.closing) return
         if (!result.ok) return await this.retryInbound(item, result.error)
         const output = result.stdout.trim()
         if (!output) return await this.finishInbound(key)
@@ -422,6 +443,7 @@ export class Gateway {
       }
       await this.inboundStore.save({ ...item, turnStarted: true })
       item.turnStarted = true
+      if (this.closing) return
       const routed = inboundRoutedEvent(item.trackingId, event, item.output ?? inboundBody(event))
       const turn = new AbortController()
       this.inboundTurns.add(turn)

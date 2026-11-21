@@ -7,6 +7,7 @@ import {
   INBOUND_STDERR_TAIL_BYTES,
   InboundStore,
   inboundRoutedEvent,
+  inboundSize,
   parseInbound,
   runInboundScript,
   truncateInboundBody,
@@ -41,11 +42,35 @@ it('truncates bodies over 64 KiB on a character boundary', () => {
   expect(truncateInboundBody('a'.repeat(INBOUND_BODY_MAX_BYTES))).toBe('a'.repeat(INBOUND_BODY_MAX_BYTES))
 })
 
+it('sizes queued inbound work in UTF-8 bytes', () => {
+  const event = parseInbound({
+    data: {
+      event_id: 'inbev_1',
+      delivery_id: 'inbdlv_1',
+      source: { id: 'inbsrc_1', name: 'payments', instructions: null },
+      handler: { type: 'agent' },
+      request: { body: '€€', body_encoding: 'utf8' },
+    },
+  })
+  if (!event) throw new Error('unparsed')
+  expect(inboundSize({ trackingId: 't', event, attempts: 0, dueAt: 0, output: 'é' })).toBe(8)
+})
+
 it('kills a timed-out script and everything it started', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'inkbox-inbound-'))
   const started = Date.now()
   const result = await runInboundScript('sleep 30 & sleep 30', dir, '', 200)
   expect(result).toEqual({ ok: false, error: 'Timed out after 0.2 s' })
+  expect(Date.now() - started).toBeLessThan(5_000)
+})
+
+it('kills a script and everything it started when aborted', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'inkbox-inbound-'))
+  const abort = new AbortController()
+  const started = Date.now()
+  const running = runInboundScript('sleep 30 & echo out; sleep 30', dir, '', 60_000, abort.signal)
+  setTimeout(() => abort.abort(), 200)
+  expect((await running).ok).toBe(false)
   expect(Date.now() - started).toBeLessThan(5_000)
 })
 

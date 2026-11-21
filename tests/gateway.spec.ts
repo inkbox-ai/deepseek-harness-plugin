@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -95,6 +95,8 @@ async function harness(
   existingStateDir?: string,
 ): Promise<Harness> {
   const stateDir = existingStateDir ?? (await mkdtemp(join(tmpdir(), 'inkbox-gateway-')))
+  // Inbound scripts run in the home directory.
+  vi.stubEnv('HOME', stateDir)
   const subscriptions = {
     list: vi.fn(async (filter: { scope?: string; url: string }) =>
       filter.scope === 'identity' && sharedEvents.length
@@ -263,6 +265,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllEnvs()
 })
 
 describe('gateway lifecycle and delivery', () => {
@@ -1030,11 +1033,13 @@ describe('local delivery', () => {
     }
   })
 
-  it('ignores an inbound event without a delivery id', async () => {
+  it('rejects an inbound event without a delivery id with 400 before host admission', async () => {
     const { gateway, stateDir } = await harness()
     const run = vi.spyOn(gateway.agents, 'run')
+    const admitted = vi.spyOn(gateway, 'dispatchVerified')
     try {
-      expect((await gateway.handleRequest(inbound('inbev_n', undefined, undefined, null))).status).toBe(202)
+      expect((await gateway.handleRequest(inbound('inbev_n', undefined, undefined, null))).status).toBe(400)
+      expect(admitted).not.toHaveBeenCalled()
       expect(await queued(stateDir)).toBe(0)
       expect(run).not.toHaveBeenCalled()
     } finally {
@@ -1224,7 +1229,7 @@ describe('local delivery', () => {
   })
 
   it('passes script output to the agent as the event body', async () => {
-    const { gateway } = await harness()
+    const { gateway, stateDir } = await harness()
     const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
     try {
       await gateway.handleRequest(
@@ -1232,7 +1237,9 @@ describe('local delivery', () => {
       )
       await until(() => run.mock.calls.length === 1)
       expect(run.mock.calls[0]?.[0]).toBe(`inbound:${SOURCE_ID}`)
-      expect(run.mock.calls[0]?.[1]).toMatch(/\[untrusted incoming content\]\ncharge from \//)
+      expect(run.mock.calls[0]?.[1]).toContain(
+        `[untrusted incoming content]\ncharge from ${await realpath(stateDir)}`,
+      )
       expect(run.mock.calls[0]?.[1]).toContain('Record every successful charge.')
       expect(run.mock.calls[0]?.[2]).toMatchObject({ failOnError: true })
     } finally {
@@ -1426,6 +1433,19 @@ describe('local delivery', () => {
     }
   })
 
+  it('stops a running inbound script on close without starting a turn', async () => {
+    const { gateway, stateDir } = await harness()
+    const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('done')
+    const command = 'touch started; sleep 30; echo summary'
+    await gateway.handleRequest(inbound('inbev_closing', { type: 'script', command }))
+    await until(async () => (await readdir(stateDir)).includes('started'))
+    const started = Date.now()
+    await gateway.close()
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(run).not.toHaveBeenCalled()
+    expect(await queued(stateDir)).toBe(1)
+  })
+
   it('keeps a queued event a read error skipped and runs it once readable', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'inkbox-gateway-'))
     const request = inbound('inbev_unreadable')
@@ -1450,6 +1470,33 @@ describe('local delivery', () => {
       expect(run).toHaveBeenCalledOnce()
     } finally {
       vi.useRealTimers()
+      await gateway.close()
+    }
+  })
+
+  it('does not re-queue a job that finished while the queue was reloading', async () => {
+    const { gateway, stateDir } = await harness()
+    let release = () => {}
+    const run = vi
+      .spyOn(gateway.agents, 'run')
+      .mockImplementation(() => new Promise((resolve) => (release = () => resolve('done'))))
+    try {
+      await gateway.handleRequest(inbound('inbev_reload'))
+      await until(() => run.mock.calls.length === 1)
+      const internals = gateway as unknown as {
+        inboundStore: InboundStore
+        loadInbound(schedule: boolean): Promise<void>
+      }
+      const stale = await internals.inboundStore.load()
+      vi.spyOn(internals.inboundStore, 'load').mockImplementation(async () => {
+        release()
+        await until(async () => (await queued(stateDir)) === 0)
+        return { items: stale.items, unreadable: 0 }
+      })
+      await internals.loadInbound(true)
+      expect(scheduled(gateway)).toBe(0)
+      expect(run).toHaveBeenCalledOnce()
+    } finally {
       await gateway.close()
     }
   })
