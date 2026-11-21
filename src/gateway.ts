@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -838,7 +839,7 @@ export class Gateway {
       'approval',
       signal,
     ).catch(() => '')
-    return /^(yes|y|allow|approve|approved)\b/i.test(answer.trim())
+    return /^(yes|y|allow|approve|approved)\b/i.test((answer ?? '').trim())
       ? 'allowed-once'
       : signal?.aborted
         ? 'cancelled'
@@ -855,7 +856,11 @@ export class Gateway {
       .join('\n')
     const answer = await this.askHuman(request.agent, rendered, 'question', request.signal)
     return {
-      answers: request.questions.map((question) => ({ id: question.id, selected: [], custom: answer })),
+      answers: request.questions.map((question) => ({
+        id: question.id,
+        selected: [],
+        ...(answer !== undefined ? { custom: answer } : {}),
+      })),
     }
   }
 
@@ -1072,7 +1077,8 @@ export class Gateway {
     }
   }
 
-  private async deliver(target: ReplyTarget, response: string): Promise<void> {
+  /** `nonce` makes an in-memory prompt a distinct Slack send; durable replies keep their stable key. */
+  private async deliver(target: ReplyTarget, response: string, nonce?: string): Promise<void> {
     const identity = this.identity
     if (identity === undefined) throw new Error('Gateway identity is unavailable')
     switch (target.channel) {
@@ -1104,7 +1110,7 @@ export class Gateway {
         return
       case 'slack':
         if (this.client === undefined) throw new Error('Gateway client is unavailable')
-        await sendSlackReply(this.client, target, response)
+        await sendSlackReply(this.client, target, response, nonce)
         return
       case 'none':
         return
@@ -1253,38 +1259,64 @@ export class Gateway {
     prompt: string,
     kind: PendingHuman['kind'],
     signal?: AbortSignal,
-  ): Promise<string> {
+  ): Promise<string | undefined> {
     const routeKey = this.agents.routeForAgent(agent)
     if (routeKey === undefined) throw new Error('No active Inkbox route owns this agent')
     if (this.pendingHuman.has(routeKey))
       throw new Error('Another Inkbox interaction is already pending for this route')
-    // A Slack-owned turn's prompt goes to its owner's conversation and is bound to that owner.
+    // A running turn's prompt goes to that turn's target; a Slack-owned turn binds it to its owner.
     const active = this.queues.get(routeKey)?.active
-    const owner = slackOwned(active) ? active : undefined
-    const target = owner?.events[0]?.target ?? this.latestTargets.get(routeKey)
+    const target = active?.target ?? this.latestTargets.get(routeKey)
     if (target === undefined || target.channel === 'none')
       throw new Error('The active route has no reply channel')
-    const author = owner?.author
-    await this.deliver(target, prompt)
-    return new Promise<string>((resolve, reject) => {
-      const finish = (error: Error) => {
-        const current = this.pendingHuman.get(routeKey)
-        if (current !== undefined) clearTimeout(current.timer)
-        this.pendingHuman.delete(routeKey)
-        reject(error)
-      }
-      const timer = setTimeout(
-        () => finish(new Error('Timed out waiting for a channel reply')),
-        this.config.permissionTimeoutMs,
-      )
-      this.pendingHuman.set(routeKey, { kind, ...(author ? { author } : {}), resolve, reject, timer })
-      if (signal !== undefined) {
-        const abort = () =>
-          finish(signal.reason instanceof Error ? signal.reason : new Error('Interaction cancelled'))
-        if (signal.aborted) abort()
-        else signal.addEventListener('abort', abort, { once: true })
-      }
-    })
+    // A Slack prompt with no Slack-owned turn to bind it to is never sent: anyone in the thread could answer it.
+    if (target.channel === 'slack' && !slackOwned(active)) {
+      this.log.info('[inkbox] Slack prompt without an owning turn declined')
+      return undefined
+    }
+    const author = slackOwned(active) ? active?.author : undefined
+    const wait = (): { answer: Promise<string>; cancel(error: Error): void } => {
+      let entry: PendingHuman | undefined
+      const answer = new Promise<string>((resolve, reject) => {
+        const finish = (error: Error) => {
+          const current = this.pendingHuman.get(routeKey)
+          if (current === entry) {
+            if (current !== undefined) clearTimeout(current.timer)
+            this.pendingHuman.delete(routeKey)
+          }
+          reject(error)
+        }
+        const timer = setTimeout(
+          () => finish(new Error('Timed out waiting for a channel reply')),
+          this.config.permissionTimeoutMs,
+        )
+        entry = { kind, ...(author ? { author } : {}), resolve, reject: finish, timer }
+        this.pendingHuman.set(routeKey, entry)
+        if (signal !== undefined) {
+          const abort = () =>
+            finish(signal.reason instanceof Error ? signal.reason : new Error('Interaction cancelled'))
+          if (signal.aborted) abort()
+          else signal.addEventListener('abort', abort, { once: true })
+        }
+      })
+      return { answer, cancel: (error) => entry?.reject(error) }
+    }
+    if (target.channel !== 'slack') {
+      await this.deliver(target, prompt)
+      return wait().answer
+    }
+    // A Slack waiter is registered before the prompt is sent, so an owner's answer
+    // that arrives while the send is outstanding is not lost.
+    const pending = wait()
+    pending.answer.catch(() => {})
+    try {
+      await this.deliver(target, prompt, randomUUID())
+    } catch (error) {
+      // Only this prompt's waiter is removed.
+      pending.cancel(error instanceof Error ? error : new Error(String(error)))
+      throw error
+    }
+    return pending.answer
   }
 
   private async reconcileSubscriptions(publicUrl: string): Promise<void> {
