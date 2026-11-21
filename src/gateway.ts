@@ -1216,7 +1216,8 @@ export class Gateway {
     const owner = slackOwned(active) ? active : undefined
     // The route is reserved here, synchronously: a concurrent prompt is refused before
     // anything is sent. The reservation accepts no answer until it is activated.
-    const reservation = this.prompts.reserve(routeKey, owner?.author)
+    // The request and the owning turn cancel the prompt from here on, before it is activated.
+    const reservation = this.prompts.reserve(routeKey, owner?.author, [signal, owner?.abort.signal])
     if (reservation === undefined)
       throw new Error('Another Inkbox interaction is already pending for this route')
     try {
@@ -1237,16 +1238,21 @@ export class Gateway {
       if (target.channel !== 'slack') {
         // Other channels keep the base order: send, then accept answers.
         await this.deliver(target, prompt)
-        return await reservation.activate(this.config.permissionTimeoutMs, signal)
+        return await reservation.activate(this.config.permissionTimeoutMs)
       }
       if (this.client === undefined) throw new Error('Gateway client is unavailable')
       // The connection is checked before the prompt can accept an answer. Each prompt gets its own send key.
-      const send = await prepareSlackReply(this.client, target, prompt, randomUUID())
+      // A cancellation, stop or shutdown during the check settles the prompt at once.
+      const preparing = prepareSlackReply(this.client, target, prompt, randomUUID())
+      preparing.catch(() => {})
+      const send = await Promise.race([preparing, reservation.cancelled.then(() => undefined)])
+      if (send === undefined) throw new PromptCancelled('Slack prompt cancelled')
+      // A read that finishes late can never send a prompt cancelled meanwhile.
       if (reservation.released || this.closing || signal?.aborted || owner?.abort.signal.aborted)
         throw new PromptCancelled('Slack prompt cancelled')
       // Activated just before the send, so an owner's answer that arrives while the
       // send is outstanding is not lost.
-      const answer = reservation.activate(this.config.permissionTimeoutMs, signal)
+      const answer = reservation.activate(this.config.permissionTimeoutMs)
       answer.catch(() => {})
       await send()
       return await answer
