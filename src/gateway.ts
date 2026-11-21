@@ -810,7 +810,8 @@ export class Gateway {
       `Approval required: ${prompt}\nReply YES to allow once, or NO to reject.`,
       'approval',
       signal,
-    ).catch(() => '')
+    ).catch((error: unknown) => (error instanceof PromptCancelled ? error : ''))
+    if (answer instanceof PromptCancelled) return 'cancelled'
     return /^(yes|y|allow|approve|approved)\b/i.test((answer ?? '').trim())
       ? 'allowed-once'
       : signal?.aborted
@@ -1048,8 +1049,7 @@ export class Gateway {
     }
   }
 
-  /** `nonce` makes an in-memory prompt a distinct Slack send; durable replies keep their stable key. */
-  private async deliver(target: ReplyTarget, response: string, nonce?: string): Promise<void> {
+  private async deliver(target: ReplyTarget, response: string): Promise<void> {
     const identity = this.identity
     if (identity === undefined) throw new Error('Gateway identity is unavailable')
     switch (target.channel) {
@@ -1081,7 +1081,7 @@ export class Gateway {
         return
       case 'slack':
         if (this.client === undefined) throw new Error('Gateway client is unavailable')
-        await sendSlackReply(this.client, target, response, nonce)
+        await sendSlackReply(this.client, target, response)
         return
       case 'none':
         return
@@ -1235,14 +1235,18 @@ export class Gateway {
     if (routeKey === undefined) throw new Error('No active Inkbox route owns this agent')
     if (this.pendingHuman.has(routeKey))
       throw new Error('Another Inkbox interaction is already pending for this route')
-    // A running turn's prompt goes to that turn's target; a Slack-owned turn binds it to its owner.
+    // Prompts follow the latest target, as before, except that a Slack-owned turn keeps
+    // its own target and a Slack message waiting behind a running turn never takes over
+    // that turn's prompt.
     const active = this.queues.get(routeKey)?.active
-    const target = active?.target ?? this.latestTargets.get(routeKey)
+    const latest = this.latestTargets.get(routeKey)
+    const target = active && (slackOwned(active) || latest?.channel === 'slack') ? active.target : latest
     if (target === undefined || target.channel === 'none')
       throw new Error('The active route has no reply channel')
     // A Slack prompt with no Slack-owned turn to bind it to is never sent: anyone in the thread could answer it.
     if (target.channel === 'slack' && !slackOwned(active)) {
-      this.log.info('[inkbox] Slack prompt without an owning turn declined')
+      // The gateway logger has no debug level, so this routine outcome is logged at info.
+      this.log.info('[inkbox] Slack prompt not sent: no running Slack turn owns it')
       return undefined
     }
     const author = slackOwned(active) ? active?.author : undefined
@@ -1276,12 +1280,17 @@ export class Gateway {
       await this.deliver(target, prompt)
       return wait().answer
     }
-    // A Slack waiter is registered before the prompt is sent, so an owner's answer
-    // that arrives while the send is outstanding is not lost.
+    if (this.client === undefined) throw new Error('Gateway client is unavailable')
+    // The connection is checked before anything waits for an answer, so a reply sent
+    // before the prompt is posted cannot answer it. Each prompt gets its own send key.
+    const send = await prepareSlackReply(this.client, target, prompt, randomUUID())
+    if (signal?.aborted || active?.abort.signal.aborted) throw new PromptCancelled('Slack prompt cancelled')
+    // Registered just before the send, so an owner's answer that arrives while the
+    // send is outstanding is not lost.
     const pending = wait()
     pending.answer.catch(() => {})
     try {
-      await this.deliver(target, prompt, randomUUID())
+      await send()
     } catch (error) {
       // Only this prompt's waiter is removed.
       pending.cancel(error instanceof Error ? error : new Error(String(error)))
@@ -1409,6 +1418,9 @@ async function readBeforeAdmission<T>(read: () => Promise<T>): Promise<T> {
     throw new VoiceNoteNotAdmitted('Slack is temporarily unavailable.', { cause: error })
   }
 }
+
+/** A prompt cancelled by its request or its turn before it was sent. */
+class PromptCancelled extends Error {}
 
 function deliveryRetryDelay(attempt: number): number {
   return Math.min(3_600_000, 1_000 * 2 ** Math.min(attempt - 1, 12))

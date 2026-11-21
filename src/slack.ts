@@ -266,13 +266,8 @@ export function slackText(text: string): void {
 }
 
 /** Send one reply to the source conversation and thread; an unconfirmed send is never repeated blindly. */
-export async function sendSlackReply(
-  client: Inkbox,
-  route: SlackReplyRoute,
-  text: string,
-  nonce?: string,
-): Promise<string> {
-  return (await prepareSlackReply(client, route, text, nonce))()
+export async function sendSlackReply(client: Inkbox, route: SlackReplyRoute, text: string): Promise<string> {
+  return (await prepareSlackReply(client, route, text))()
 }
 
 /**

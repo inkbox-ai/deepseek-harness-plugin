@@ -261,8 +261,8 @@ never sent again automatically; while Slack is disabled, saved Slack replies wai
 delivered under several event types runs one turn, and each Slack message is its own turn, run in order; nothing
 from another channel is merged into a running Slack turn. A Slack turn's approval and question prompts go to its
 Slack conversation and can be answered only by the person whose message started the turn; a Slack prompt with no
-running Slack turn is declined without being sent. On other channels prompts and answers work as ordinary
-messages. A native Slack
+running Slack turn is declined without being sent. Elsewhere prompts go to the latest conversation and answers
+work as before; a Slack message waiting behind another channel's turn does not take over that turn's prompt. A native Slack
 stop cancels that person's running turn, queued messages and pending prompt in the thread; a redelivered stop
 never reaches a later turn.
 

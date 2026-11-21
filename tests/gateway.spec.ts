@@ -651,6 +651,39 @@ describe('gateway lifecycle and delivery', () => {
     }
   })
 
+  it('sends a second prompt in one email turn as a reply to the answer email', async () => {
+    const { gateway, identity } = await harness()
+    let release: (value: string) => void = () => {}
+    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          release = resolve
+        }),
+    )
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.handleRequest(email('email-turn', 'Please send the report'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      const first = gateway.askApproval({} as Agent, 'Send the report')
+      await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(1))
+      expect(identity.sendEmail.mock.calls[0]?.[0]).toMatchObject({
+        inReplyToMessageId: '<email-turn@example.test>',
+      })
+      await gateway.handleRequest(email('email-answer', 'YES'))
+      await expect(first).resolves.toBe('allowed-once')
+      const second = gateway.askApproval({} as Agent, 'Send the attachment too')
+      await vi.waitFor(() => expect(identity.sendEmail).toHaveBeenCalledTimes(2))
+      expect(identity.sendEmail.mock.calls[1]?.[0]).toMatchObject({
+        inReplyToMessageId: '<email-answer@example.test>',
+      })
+      await gateway.handleRequest(email('email-answer-2', 'YES'))
+      await expect(second).resolves.toBe('allowed-once')
+      release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('suppresses channel delivery when the agent returns the silent marker', async () => {
     const { gateway, identity } = await harness()
     vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
