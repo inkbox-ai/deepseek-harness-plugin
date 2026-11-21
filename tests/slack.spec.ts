@@ -988,8 +988,10 @@ describe('Slack approvals, stop and saved replies', () => {
       await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(4))
       await gateway.dispatchVerified(stop('stop-during-check', 'U1'), 'inkbox')
       expect(turns[0]?.signal?.aborted).toBe(true)
-      release()
+      // Settled while the connection read is still held open.
       await expect(approval).resolves.toBe('cancelled')
+      release()
+      await new Promise((resolve) => setTimeout(resolve, 20))
       turns[0]?.release()
       await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
       expect(slack.sendMessage).not.toHaveBeenCalled()
@@ -1060,6 +1062,35 @@ describe('Slack approvals, stop and saved replies', () => {
     }
   })
 
+  it('settles an approval cancelled during the connection check and frees the route at once', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      const release = heldConnectionRead(slack)
+      const request = new AbortController()
+      const original = gateway.askApproval({} as Agent, 'Deploy to production', request.signal)
+      await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(3))
+      request.abort(new Error('Tool call cancelled'))
+      // Settled, and the route is free, while the original read is still held open.
+      await expect(original).resolves.toBe('cancelled')
+      expect(gateway.activity().interactions).toBe(0)
+      const replacement = gateway.askApproval({} as Agent, 'Deploy to staging instead')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({ text: expect.stringContaining('staging') })
+      release()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(slack.sendMessage).toHaveBeenCalledTimes(1)
+      await gateway.dispatchVerified(threadReply('event-yes', 'U1', 'slack-message-18', 'YES'), 'inkbox')
+      await expect(replacement).resolves.toBe('allowed-once')
+      turns[0]?.release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('sends nothing when shutdown begins during the connection check and resolves promptly', async () => {
     const { gateway, run, slack } = await harness()
     const turns = heldTurns(run)
@@ -1071,8 +1102,10 @@ describe('Slack approvals, stop and saved replies', () => {
     await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(3))
     const closed = gateway.close()
     expect(gateway.activity().interactions).toBe(0)
-    release()
+    // Settled while the connection read is still held open.
     await expect(approval).resolves.toBe('cancelled')
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 20))
     expect(slack.sendMessage).not.toHaveBeenCalled()
     turns[0]?.release('[SILENT]')
     await closed
