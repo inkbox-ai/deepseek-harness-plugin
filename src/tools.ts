@@ -6,6 +6,7 @@ import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
 import { CallOrigin, type VoicemailDetection } from '@inkbox/sdk'
 import { toIMessagePlainText } from './imessage.js'
 import type { InkboxRuntime } from './runtime.js'
+import { ownSlackConnection, slackMrkdwn, slackText } from './slack.js'
 
 type Args = Record<string, unknown>
 type Params = Record<string, ParameterPropertySpec>
@@ -74,6 +75,11 @@ const readNames = new Set([
   'inkbox_list_a2a_messages',
   'inkbox_list_a2a_sent_tasks',
   'inkbox_get_a2a_sent_task',
+  'inkbox_slack_list_connections',
+  'inkbox_slack_list_conversations',
+  'inkbox_slack_list_messages',
+  'inkbox_slack_search',
+  'inkbox_slack_get_action',
 ])
 
 interface CatalogEntry {
@@ -382,6 +388,113 @@ export const TOOL_CATALOG: readonly CatalogEntry[] = [
   },
 ]
 
+const page = { cursor: s('Next cursor.'), limit: n('Maximum results, 1–100.') }
+
+/** Slack tools, registered only when Slack is enabled for this profile. */
+export const SLACK_TOOL_CATALOG: readonly CatalogEntry[] = [
+  {
+    name: 'inkbox_slack_list_connections',
+    description: "List this identity's Slack connections.",
+    parameters: {},
+  },
+  {
+    name: 'inkbox_slack_list_conversations',
+    description: 'List accessible Slack conversations. Follow nextCursor.',
+    parameters: { connectionId: s('Slack connection UUID.', true), ...page },
+  },
+  {
+    name: 'inkbox_slack_list_messages',
+    description: 'Read one Slack conversation or native thread. Follow nextCursor.',
+    parameters: {
+      connectionId: s('Slack connection UUID.', true),
+      conversationId: s('Slack conversation ID.', true),
+      threadTs: s('Thread timestamp; omit for the conversation.'),
+      ...page,
+    },
+  },
+  {
+    name: 'inkbox_slack_search',
+    description:
+      'Search retained Slack text, not complete workspace history or attachments. Follow nextCursor even on empty pages.',
+    parameters: {
+      q: s('Search text.', true),
+      connectionId: s('Slack connection UUID.'),
+      conversationId: s('Slack conversation ID.'),
+      ...page,
+    },
+  },
+  {
+    name: 'inkbox_slack_send_message',
+    description:
+      'Send an explicitly requested Slack message. Ordinary responses are automatic. Reuse idempotencyKey for retries of the same send. Inspect sending/unknown outcomes with inkbox_slack_get_action; never blindly resend.',
+    parameters: {
+      connectionId: s('Slack connection UUID.', true),
+      conversationId: s('Slack conversation ID.', true),
+      text: s('Message text, at most 12000 characters.', true),
+      threadTs: s('Thread timestamp; omit for a top-level message.'),
+      idempotencyKey: s('Stable key for this exact send: 1–128 of A-Z a-z 0-9 . _ : -', true),
+    },
+    approval: (a) => `Send Slack message to ${a.conversationId as string}`,
+  },
+  {
+    name: 'inkbox_slack_get_action',
+    description: 'Inspect a Slack send action; an unknown outcome must not cause duplicate sending.',
+    parameters: { connectionId: s('Slack connection UUID.', true), actionId: s('Slack action UUID.', true) },
+  },
+]
+
+async function executeSlack(
+  name: string,
+  args: Args,
+  client: Inkbox,
+  identity: AgentIdentity,
+  runtime: InkboxRuntime,
+): Promise<unknown> {
+  if (!runtime.config.slackEnabled) throw new Error('Slack is disabled.')
+  const connectionId = args.connectionId as string | undefined
+  if (connectionId) await ownSlackConnection(client, identity.id, connectionId)
+  const options = compact({ cursor: args.cursor, limit: args.limit }) as { cursor?: string; limit?: number }
+  switch (name) {
+    case 'inkbox_slack_list_connections':
+      return client.slack.listConnections(identity.id)
+    case 'inkbox_slack_list_conversations':
+      return client.slack.listConversations(connectionId as string, options)
+    case 'inkbox_slack_list_messages':
+      return client.slack.listMessages(
+        connectionId as string,
+        args.conversationId as string,
+        compact({ ...options, threadTs: args.threadTs }) as never,
+      )
+    case 'inkbox_slack_search':
+      return client.slack.searchMessages(
+        compact({
+          identityId: identity.id,
+          q: args.q as string,
+          connectionId,
+          conversationId: args.conversationId,
+          ...options,
+        }) as never,
+      )
+    case 'inkbox_slack_send_message': {
+      const key = args.idempotencyKey
+      if (typeof key !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(key))
+        throw new Error('idempotencyKey must be 1–128 of A-Z a-z 0-9 . _ : -')
+      const text = slackMrkdwn(typeof args.text === 'string' ? args.text : '')
+      slackText(text)
+      return client.slack.sendMessage(connectionId as string, {
+        conversationId: args.conversationId as string,
+        text,
+        idempotencyKey: key,
+        ...(typeof args.threadTs === 'string' ? { threadTs: args.threadTs } : {}),
+      })
+    }
+    case 'inkbox_slack_get_action':
+      return client.slack.getAction(connectionId as string, args.actionId as string)
+    default:
+      throw new Error(`Unknown Inkbox tool: ${name}`)
+  }
+}
+
 function compact<T extends Args>(args: T): T {
   return Object.fromEntries(Object.entries(args).filter(([, value]) => value !== undefined)) as T
 }
@@ -528,7 +641,8 @@ async function execute(
 }
 
 export function registerTools(ctx: Context, runtime: InkboxRuntime): void {
-  for (const entry of TOOL_CATALOG) {
+  const slack = new Set(SLACK_TOOL_CATALOG.map((entry) => entry.name))
+  for (const entry of [...TOOL_CATALOG, ...(runtime.config.slackEnabled ? SLACK_TOOL_CATALOG : [])]) {
     ctx.tools.register(
       defineTool({
         name: entry.name,
@@ -546,7 +660,15 @@ export function registerTools(ctx: Context, runtime: InkboxRuntime): void {
           try {
             const client = await runtime.getClient()
             const identity = await runtime.getIdentity()
-            return json(await execute(entry.name, args, client, identity, runtime))
+            return json(
+              await (slack.has(entry.name) ? executeSlack : execute)(
+                entry.name,
+                args,
+                client,
+                identity,
+                runtime,
+              ),
+            )
           } catch (error) {
             throw presentError(error)
           }

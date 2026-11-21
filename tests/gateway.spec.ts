@@ -155,6 +155,7 @@ async function harness(
     permissionTimeoutMs: 2_000,
     autoApproveInkboxTools: false,
     externalEvents: false,
+    slackEnabled: false,
     voiceEnabled: true,
     voiceStack,
     realtimeCredentialRef: 'INKBOX_REALTIME_API_KEY',

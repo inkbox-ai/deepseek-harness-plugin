@@ -4,6 +4,7 @@ import {
   type ChannelDependencies,
   configureChannels,
   configureIMessage,
+  configureSlackChannel,
   configureVoice,
   waitForIMessageConnection,
   waitForSmsOptIn,
@@ -374,5 +375,58 @@ describe('iMessage and phone onboarding parity', () => {
     )
     expect(result.phoneProvisioned).toBe(false)
     expect(result.identity).toBe(identity)
+  })
+})
+
+describe('Slack onboarding', () => {
+  const identity = { id: 'identity-1', agentHandle: 'deepseek-agent' } as unknown as AgentIdentity
+  function slackClient(connected: boolean) {
+    return {
+      whoami: vi.fn(async () => ({ authType: 'api_key', authSubtype: 'api_key.admin_scoped' })),
+      slack: {
+        listConnections: vi.fn(async () => ({
+          connections: connected
+            ? [{ id: 'connection-1', identityId: 'identity-1', status: 'connected' }]
+            : [],
+          installationAvailable: true,
+          setup: { status: 'unavailable' },
+        })),
+      },
+    } as unknown as Inkbox
+  }
+
+  it('saves an explicit choice without prompting in non-interactive setup', async () => {
+    const client = slackClient(false)
+    await expect(
+      configureSlackChannel(identity, client, undefined, { nonInteractive: true, enableSlack: true }),
+    ).resolves.toBe(true)
+    await expect(configureSlackChannel(identity, client, undefined, { slackDefault: true })).resolves.toBe(
+      true,
+    )
+    await expect(configureSlackChannel(identity, client, undefined, {})).resolves.toBe(false)
+    expect(client.slack.listConnections).not.toHaveBeenCalled()
+  })
+
+  it('stays off when declined and confirms an existing connection when enabled', async () => {
+    const declined = prompts({ confirm: vi.fn(async () => false) })
+    await expect(
+      configureSlackChannel(identity, slackClient(true), declined, {}, dependencies()),
+    ).resolves.toBe(false)
+    expect(declined.confirm).toHaveBeenCalledWith('Enable Slack messaging for this agent?', false)
+    const client = slackClient(true)
+    const accepted = prompts({ confirm: vi.fn(async () => true) })
+    await expect(
+      configureSlackChannel(identity, client, accepted, { slackDefault: true }, dependencies()),
+    ).resolves.toBe(true)
+    expect(client.slack.listConnections).toHaveBeenCalledWith('identity-1')
+    expect(accepted.confirm).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves Slack off when setup skips it', async () => {
+    const prompt = prompts()
+    await expect(
+      configureSlackChannel(identity, slackClient(true), prompt, { enableSlack: false, slackDefault: true }),
+    ).resolves.toBe(false)
+    expect(prompt.confirm).not.toHaveBeenCalled()
   })
 })

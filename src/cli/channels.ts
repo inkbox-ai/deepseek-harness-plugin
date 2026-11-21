@@ -1,6 +1,7 @@
 import { type AgentIdentity, HostedAgentAuthorityMode, IncomingCallAction, Inkbox } from '@inkbox/sdk'
 import type { VoiceStack } from '../config.js'
 import { validateOpenAIRealtimeKey } from '../realtime.js'
+import { configureSlack } from '../slack-setup.js'
 import type { IdentityCredential, SetupPrompts } from './onboarding.js'
 import { showQr, smsDraftLink, smsToQrPayload } from './qr.js'
 
@@ -13,6 +14,8 @@ export interface ChannelOptions {
   callInstruction?: string
   enableIMessage?: boolean
   enableA2A?: boolean
+  enableSlack?: boolean
+  slackDefault?: boolean
   provisionPhone?: boolean
   phoneState?: string
   hostedAuthority?: 'contact_scoped' | 'yolo'
@@ -28,6 +31,7 @@ export interface ChannelResult {
   phoneProvisioned: boolean
   imessageEnabled: boolean
   a2aEnabled: boolean
+  slackEnabled: boolean
 }
 
 export interface ChannelDependencies {
@@ -55,6 +59,13 @@ export async function configureChannels(
   let identity = await credential.client.getIdentity(credential.identity.agentHandle)
   const imessageEnabled = await configureIMessage(identity, credential.client, prompts, options, dependencies)
   const a2aEnabled = await configureA2A(identity, prompts, options)
+  const slackEnabled = await configureSlackChannel(
+    identity,
+    credential.client,
+    prompts,
+    options,
+    dependencies,
+  )
   const phone = await configurePhone(identity, prompts, options)
   identity = phone.identity
   printIdentitySummary(identity)
@@ -73,6 +84,7 @@ export async function configureChannels(
     phoneProvisioned: phone.provisioned,
     imessageEnabled,
     a2aEnabled,
+    slackEnabled,
   }
 }
 
@@ -220,6 +232,46 @@ export async function waitForIMessageConnection(
   } finally {
     process.off('SIGINT', interrupt)
   }
+}
+
+/** Slack is opt-in. Without prompts, an explicit choice is saved as given. */
+export async function configureSlackChannel(
+  identity: AgentIdentity,
+  client: Inkbox,
+  prompts: SetupPrompts | undefined,
+  options: Pick<ChannelOptions, 'enableSlack' | 'slackDefault' | 'nonInteractive'>,
+  dependencies: Pick<ChannelDependencies, 'sleep'> = defaultChannelDependencies,
+): Promise<boolean> {
+  const previous = options.enableSlack ?? options.slackDefault ?? false
+  if (options.nonInteractive || !prompts || options.enableSlack === false) return previous
+  process.stdout.write('\nSlack\n')
+  return configureSlack(client, identity.id, previous, {
+    prompter: {
+      ask: (question, defaultValue) => prompts.text(question, defaultValue),
+      askSecret: (question) => prompts.secret(question),
+      confirm: (question, defaultYes = false) => prompts.confirm(question, defaultYes),
+      select: async (question, choices, defaultValue) => {
+        const index = await prompts.choose(
+          question,
+          choices.map((choice) => choice.label),
+          Math.max(
+            0,
+            choices.findIndex((choice) => choice.value === defaultValue),
+          ),
+        )
+        const selected = choices[index] ?? choices[0]
+        if (selected === undefined) throw new Error('No Slack workspace choice is available')
+        return selected.value
+      },
+    },
+    note: (message) => process.stdout.write(`${message}\n`),
+    installation: (url, expiresAt) => {
+      process.stdout.write(
+        `Open this Slack authorization link in your browser before ${expiresAt.toISOString()}: ${url}\n`,
+      )
+    },
+    delay: dependencies.sleep,
+  })
 }
 
 async function configureA2A(

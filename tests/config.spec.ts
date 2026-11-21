@@ -18,6 +18,8 @@ describe('configuration', () => {
     expect(config.realtimeModel).toBe('gpt-realtime-2')
     expect(config.realtimeVoice).toBe('cedar')
     expect(config.channelInstructions).toEqual({})
+    expect(config.slackEnabled).toBe(false)
+    expect(resolveConfig({ slackEnabled: true }, '/tmp/dsh-home').slackEnabled).toBe(true)
   })
 
   it('normalizes workspace and identity without inventing an identity', () => {

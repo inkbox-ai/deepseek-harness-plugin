@@ -21,6 +21,7 @@ async function harness(stack: ResolvedConfig['voiceStack']) {
     permissionTimeoutMs: 1_000,
     autoApproveInkboxTools: false,
     externalEvents: false,
+    slackEnabled: false,
     voiceEnabled: true,
     voiceStack: stack,
     realtimeCredentialRef: 'INKBOX_REALTIME_API_KEY',

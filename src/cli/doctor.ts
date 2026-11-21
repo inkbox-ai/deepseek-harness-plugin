@@ -116,6 +116,22 @@ export async function doctor(paths: Paths): Promise<Check[]> {
         identity.imessageEnabled,
         identity.imessageEnabled ? 'Enabled' : 'Optional channel is disabled',
       )
+      if (section?.slackEnabled !== true) add('Slack channel', true, 'Optional channel is disabled')
+      else
+        try {
+          const connected = (await client.slack.listConnections(identity.id)).connections.filter(
+            (connection) => connection.identityId === identity.id && connection.status === 'connected',
+          )
+          add(
+            'Slack channel',
+            connected.length > 0,
+            connected.length
+              ? `${connected.length} connected workspace(s)`
+              : 'Enabled, but no workspace is connected to this identity; rerun setup',
+          )
+        } catch (error) {
+          add('Slack channel', false, `Connection check unavailable: ${errorText(error)}`)
+        }
       if (identity.phoneNumber) {
         const incoming = await identity.getIncomingCallAction()
         const expected = voiceStack === 'openai_realtime' ? 'auto_accept' : 'hosted_agent'
@@ -179,4 +195,8 @@ export async function doctor(paths: Paths): Promise<Check[]> {
   )
   if (requiredFailures.length > 0) process.exitCode = 1
   return checks
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
