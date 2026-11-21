@@ -49,6 +49,7 @@ import {
   isSlackEvent,
   ownSlackConnection,
   parseSlack,
+  prepareSlackReply,
   reconcileSlackSubscription,
   retryableRead,
   SlackConnectionDenied,
@@ -69,11 +70,20 @@ import { authenticateWebhook } from './webhook-providers.js'
 interface Queue {
   buffered: RoutedEvent[]
   timer: ReturnType<typeof setTimeout> | undefined
-  active: { events: RoutedEvent[]; target: ReplyTarget; phase: 'generating' | 'finishing' } | undefined
+  active:
+    | { events: RoutedEvent[]; target: ReplyTarget; phase: 'generating' | 'finishing'; stopped?: boolean }
+    | undefined
+}
+
+/** The participant who may answer a pending prompt on its route. */
+interface ReplyAuthor {
+  channel: RoutedEvent['channel']
+  sender: string
 }
 
 interface PendingHuman {
   kind: 'approval' | 'question'
+  author?: ReplyAuthor
   resolve(value: string): void
   reject(error: Error): void
   timer: ReturnType<typeof setTimeout>
@@ -129,6 +139,7 @@ export class Gateway {
   private slackConnection: Exclude<SlackStatus, 'disabled'> = 'unverified'
   private readonly queues = new Map<string, Queue>()
   private readonly latestTargets = new Map<string, ReplyTarget>()
+  private readonly latestAuthors = new Map<string, ReplyAuthor | undefined>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
   private readonly inflight = new Set<Promise<void>>()
   private readonly activeDeliveries = new Set<string>()
@@ -290,6 +301,7 @@ export class Gateway {
       return new Response('Duplicate', { status: 200 })
     // Slack reads happen before admission; a temporary failure leaves the message unadmitted.
     const slackRouted = slack ? await this.routeSlackEvent(payload) : undefined
+    if (slackRouted === 'stopped') return new Response('Accepted', { status: 202 })
     if (slack && slackRouted === undefined) return new Response('Ignored', { status: 202 })
     let routed: RoutedEvent | undefined
     try {
@@ -327,8 +339,13 @@ export class Gateway {
     return new Response('Accepted', { status: 202 })
   }
 
-  /** A verified Slack message from a connection this identity owns, or undefined when it is not for the agent. */
-  private async routeSlackEvent(payload: Record<string, unknown>): Promise<RoutedEvent | undefined> {
+  /**
+   * A verified Slack message from a connection this identity owns, or undefined
+   * when it is not for the agent. A native stop is applied here.
+   */
+  private async routeSlackEvent(
+    payload: Record<string, unknown>,
+  ): Promise<RoutedEvent | 'stopped' | undefined> {
     const identity = this.identity,
       client = this.client
     if (identity === undefined || client === undefined) throw new Error('Gateway identity is unavailable')
@@ -345,11 +362,53 @@ export class Gateway {
       slackControlText(route, connection.botUserId),
       this.state.snapshot().routingKey,
     )
+    if (route.nativeStop) {
+      this.stopSlack(routed)
+      return 'stopped'
+    }
     // Quiet channel traffic cannot start a session; an engaged thread continues.
     // An admitted turn counts even before its session is created.
     const engaged =
       this.state.snapshot().routes[routed.routeKey] !== undefined || this.queues.has(routed.routeKey)
     return route.addressed || engaged ? routed : undefined
+  }
+
+  /**
+   * Stop work the same Slack actor started in this thread: its pending prompt,
+   * its queued messages and its running turn. A reply already being delivered
+   * is not retracted.
+   */
+  private stopSlack(stop: RoutedEvent): void {
+    const author = stop.sender
+    const pending = this.pendingHuman.get(stop.routeKey)
+    if (pending?.author?.channel === 'slack' && pending.author.sender === author) {
+      this.pendingHuman.delete(stop.routeKey)
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Stopped from Slack'))
+    }
+    const queue = this.queues.get(stop.routeKey)
+    if (queue === undefined) return
+    const dropped = queue.buffered.filter((event) => event.channel === 'slack' && event.sender === author)
+    if (dropped.length) {
+      queue.buffered = queue.buffered.filter((event) => !dropped.includes(event))
+      if (!queue.buffered.length && queue.timer !== undefined) {
+        clearTimeout(queue.timer)
+        queue.timer = undefined
+      }
+      this.track(
+        this.state
+          .mutate((state) => {
+            for (const event of dropped) state.replied[event.eventId] = Date.now()
+          })
+          .catch((error) => this.log.error('[inkbox] Slack stop could not be recorded', error)),
+      )
+    }
+    const active = queue.active
+    const source = active?.events.at(-1)
+    if (active?.phase === 'generating' && source?.channel === 'slack' && source.sender === author) {
+      active.stopped = true
+      this.agents.cancel(stop.routeKey, 'Stopped from Slack')
+    }
   }
 
   private async checkSlack(): Promise<void> {
@@ -850,8 +909,13 @@ export class Gateway {
 
   private async accept(event: RoutedEvent): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
+    this.latestAuthors.set(
+      event.routeKey,
+      event.sender ? { channel: event.channel, sender: event.sender } : undefined,
+    )
     const pending = this.pendingHuman.get(event.routeKey)
-    if (pending !== undefined && event.replyText.trim()) {
+    // Only the participant who prompted the turn can answer it.
+    if (pending !== undefined && event.replyText.trim() && sameAuthor(pending.author, event)) {
       this.pendingHuman.delete(event.routeKey)
       clearTimeout(pending.timer)
       pending.resolve(event.replyText.trim())
@@ -894,6 +958,12 @@ export class Gateway {
       const prompt = events.map((event) => renderChannelEvent(event, this.config)).join('\n\n')
       const response = (await this.agents.run(routeKey, prompt)).trim()
       this.stopTypingForEvents(active.events)
+      if (active.stopped) {
+        await this.state.mutate((state) => {
+          for (const event of active.events) state.replied[event.eventId] = Date.now()
+        })
+        return
+      }
       active.phase = 'finishing'
       const source = active.events.at(-1)
       const terminal = this.runtime.remoteTools && source ? await replyState(this.runtime, source) : 'none'
@@ -1033,13 +1103,40 @@ export class Gateway {
     if (this.closing || this.activeDeliveries.has(deliveryId)) return
     const pending = this.state.snapshot().deliveries[deliveryId]
     if (pending === undefined || pending.state !== 'ready') return
+    // A disabled channel keeps its saved reply unsubmitted until it is enabled again.
+    if (pending.target.channel === 'slack' && !this.config.slackEnabled) return
     this.activeDeliveries.add(deliveryId)
     try {
+      let send: () => Promise<void>
+      try {
+        send = await this.prepareDelivery(pending.target, pending.response)
+      } catch (error) {
+        // Nothing was sent: a temporary read retries, anything else is refused.
+        const retryable = retryableRead(error)
+        this.log.warn(
+          retryable
+            ? '[inkbox] delivery check failed; retry scheduled'
+            : '[inkbox] delivery refused before sending',
+        )
+        const next = await this.state.mutate((state) => {
+          const current = state.deliveries[deliveryId]
+          if (current === undefined) return undefined
+          current.attempts += 1
+          if (!retryable) {
+            current.state = 'rejected'
+            return undefined
+          }
+          current.nextAttemptAt = Date.now() + deliveryRetryDelay(current.attempts)
+          return current.nextAttemptAt
+        })
+        if (next !== undefined) this.scheduleDelivery(deliveryId, Math.max(0, next - Date.now()))
+        return
+      }
       await this.state.mutate((state) => {
         const current = state.deliveries[deliveryId]
         if (current) current.state = 'submitted'
       })
-      await this.deliver(pending.target, pending.response)
+      await send()
       await this.state.mutate((state) => {
         const current = state.deliveries[deliveryId]
         if (current === undefined) return
@@ -1074,6 +1171,16 @@ export class Gateway {
     }
   }
 
+  /** Checks that must pass before a reply is marked submitted; the returned function sends it. */
+  private async prepareDelivery(target: ReplyTarget, response: string): Promise<() => Promise<void>> {
+    if (target.channel !== 'slack') return () => this.deliver(target, response)
+    if (this.client === undefined) throw new Error('Gateway client is unavailable')
+    const send = await prepareSlackReply(this.client, target, response)
+    return async () => {
+      await send()
+    }
+  }
+
   private async askHuman(
     agent: Agent,
     prompt: string,
@@ -1087,6 +1194,8 @@ export class Gateway {
     const target = this.latestTargets.get(routeKey)
     if (target === undefined || target.channel === 'none')
       throw new Error('The active route has no reply channel')
+    // Captured before sending so a later participant cannot become the answerer.
+    const author = this.latestAuthors.get(routeKey)
     await this.deliver(target, prompt)
     return new Promise<string>((resolve, reject) => {
       const finish = (error: Error) => {
@@ -1099,7 +1208,7 @@ export class Gateway {
         () => finish(new Error('Timed out waiting for a channel reply')),
         this.config.permissionTimeoutMs,
       )
-      this.pendingHuman.set(routeKey, { kind, resolve, reject, timer })
+      this.pendingHuman.set(routeKey, { kind, ...(author ? { author } : {}), resolve, reject, timer })
       if (signal !== undefined) {
         const abort = () =>
           finish(signal.reason instanceof Error ? signal.reason : new Error('Interaction cancelled'))
@@ -1195,6 +1304,14 @@ export class Gateway {
       mode: 0o600,
     })
   }
+}
+
+function sameAuthor(expected: ReplyAuthor | undefined, event: RoutedEvent): boolean {
+  if (expected === undefined) return true
+  if (event.channel !== expected.channel || event.sender === undefined) return false
+  return expected.channel === 'email'
+    ? event.sender.trim().toLowerCase() === expected.sender.trim().toLowerCase()
+    : event.sender === expected.sender
 }
 
 export function isSilentResponse(response: string): boolean {

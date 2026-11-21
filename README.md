@@ -242,7 +242,8 @@ Slack is off by default. Run `inkbox-deepseek setup` to enable it, select the ap
 provide or renew App Configuration credentials through masked input, open the browser installation link, and
 wait for the matching workspace connection. Setup is bounded and can be resumed; an unknown app-creation
 outcome is never blindly repeated. For an already connected identity, set `slackEnabled: true` in the `inkbox`
-settings (or run setup with `--enable-slack`) and restart. Doctor reports whether a workspace is connected, and
+settings (or run setup with `--enable-slack`) and restart; `--skip-slack` leaves the saved choice unchanged. When
+the profile has no `slackEnabled` setting, `INKBOX_SLACK_ENABLED=true` enables Slack. Doctor reports whether a workspace is connected, and
 `inkbox-deepseek status` shows the connection the gateway found at startup.
 
 The six Slack tools are `inkbox_slack_list_connections`, `inkbox_slack_list_conversations`,
@@ -256,7 +257,10 @@ continue it. Unmentioned traffic in unrelated threads does not wake the agent. D
 a prior session. A plain DM joins the sender's contact session; every other conversation and thread keeps its
 own session. The final reply goes to the source conversation and thread, with simple Markdown links and bold
 converted to Slack mrkdwn outside code. A reply whose send outcome is unconfirmed is kept for attention and
-never sent again automatically. One Slack message delivered under several event types runs one turn.
+never sent again automatically; while Slack is disabled, saved Slack replies wait unsent. One Slack message
+delivered under several event types runs one turn. Approval and question prompts can be answered only by the
+person who started the turn. A native Slack stop cancels that person's running turn, queued messages and
+pending prompt in the thread.
 
 Slack audio follows the same wait, read, and label as other voice notes: the received event's `data.message_id`
 matches the completion, results arrive on `data.event.files[].transcription`, and when Slack is enabled the

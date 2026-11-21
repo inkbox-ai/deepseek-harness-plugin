@@ -33,7 +33,7 @@ program
   .option('--enable-a2a', 'enable agent-to-agent communication')
   .option('--skip-a2a', 'do not change agent-to-agent communication')
   .option('--enable-slack', 'enable Slack messaging for a connected workspace')
-  .option('--skip-slack', 'disable Slack messaging')
+  .option('--skip-slack', 'do not change Slack configuration')
   .option('--provision-phone', 'provision a dedicated phone number')
   .option('--skip-phone', 'do not provision a dedicated phone number')
   .option('--phone-state <state>', 'two-letter US state for phone provisioning')

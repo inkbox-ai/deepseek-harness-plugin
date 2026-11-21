@@ -422,11 +422,21 @@ describe('Slack onboarding', () => {
     expect(accepted.confirm).toHaveBeenCalledTimes(1)
   })
 
-  it('leaves Slack off when setup skips it', async () => {
+  it('keeps the saved Slack choice when setup skips Slack', async () => {
     const prompt = prompts()
+    const client = slackClient(true)
     await expect(
-      configureSlackChannel(identity, slackClient(true), prompt, { enableSlack: false, slackDefault: true }),
-    ).resolves.toBe(false)
+      configureSlackChannel(identity, client, prompt, { enableSlack: false, slackDefault: true }),
+    ).resolves.toBe(true)
+    await expect(configureSlackChannel(identity, client, prompt, { enableSlack: false })).resolves.toBe(false)
+    await expect(
+      configureSlackChannel(identity, client, undefined, {
+        nonInteractive: true,
+        enableSlack: false,
+        slackDefault: true,
+      }),
+    ).resolves.toBe(true)
     expect(prompt.confirm).not.toHaveBeenCalled()
+    expect(client.slack.listConnections).not.toHaveBeenCalled()
   })
 })

@@ -443,6 +443,31 @@ export const SLACK_TOOL_CATALOG: readonly CatalogEntry[] = [
   },
 ]
 
+const SLACK_KEY = /^[A-Za-z0-9._:-]{1,128}$/
+
+/** Reject malformed Slack arguments before any approval prompt or API call. */
+export function validateSlackArgs(entry: CatalogEntry, args: Args): void {
+  for (const name of Object.keys(args))
+    if (!(name in entry.parameters)) throw new Error(`Unknown argument for ${entry.name}: ${name}`)
+  for (const [name, spec] of Object.entries(entry.parameters)) {
+    const value = args[name]
+    if (value === undefined || (value === null && name === 'threadTs')) {
+      if (spec.required) throw new Error(`${name} is required`)
+      continue
+    }
+    if ('type' in spec && spec.type === 'integer') {
+      if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100)
+        throw new Error(`${name} must be an integer from 1 to 100`)
+      continue
+    }
+    if (typeof value !== 'string' || !value || value.includes('\0'))
+      throw new Error(`${name} must be a non-empty string without NUL characters`)
+  }
+  if (args.idempotencyKey !== undefined && !SLACK_KEY.test(args.idempotencyKey as string))
+    throw new Error('idempotencyKey must be 1–128 of A-Z a-z 0-9 . _ : -')
+  if (typeof args.text === 'string') slackText(slackMrkdwn(args.text))
+}
+
 async function executeSlack(
   name: string,
   args: Args,
@@ -476,15 +501,12 @@ async function executeSlack(
         }) as never,
       )
     case 'inkbox_slack_send_message': {
-      const key = args.idempotencyKey
-      if (typeof key !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(key))
-        throw new Error('idempotencyKey must be 1–128 of A-Z a-z 0-9 . _ : -')
-      const text = slackMrkdwn(typeof args.text === 'string' ? args.text : '')
+      const text = slackMrkdwn(args.text as string)
       slackText(text)
       return client.slack.sendMessage(connectionId as string, {
         conversationId: args.conversationId as string,
         text,
-        idempotencyKey: key,
+        idempotencyKey: args.idempotencyKey as string,
         ...(typeof args.threadTs === 'string' ? { threadTs: args.threadTs } : {}),
       })
     }
@@ -652,6 +674,7 @@ export function registerTools(ctx: Context, runtime: InkboxRuntime): void {
         ...(readNames.has(entry.name) ? { isConcurrencySafe: () => true } : {}),
         async execute(rawArgs, exec) {
           const args = rawArgs as Args
+          if (slack.has(entry.name)) validateSlackArgs(entry, args)
           const remote = await runtime.remoteTools?.compatibility(entry.name, args, exec)
           if (remote?.handled) return json(remote.value)
           if (entry.approval !== undefined && !runtime.config.autoApproveInkboxTools)

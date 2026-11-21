@@ -3,14 +3,23 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { type AgentIdentity, type Inkbox, InkboxAPIError } from '@inkbox/sdk'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { type AgentIdentity, Inkbox, InkboxAPIError } from '@inkbox/sdk'
 import type { TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ResolvedConfig } from '../src/config.js'
 import { Gateway } from '../src/gateway.js'
 import { routeSlack } from '../src/routing.js'
 import type { InkboxRuntime } from '../src/runtime.js'
-import { parseSlack, SLACK_EVENTS, SlackConnectionDenied } from '../src/slack.js'
+import {
+  parseSlack,
+  SLACK_EVENTS,
+  SLACK_STOP,
+  SLACK_SUBSCRIPTION_EVENTS,
+  SlackConnectionDenied,
+  sendSlackReply,
+} from '../src/slack.js'
+import { configureSlack } from '../src/slack-setup.js'
 import { VoiceNoteNotAdmitted } from '../src/voice-notes.js'
 
 const tunnel = vi.hoisted(() => ({ connect: vi.fn() }))
@@ -19,6 +28,7 @@ vi.mock('@inkbox/sdk/tunnels/connect', () => ({ connect: tunnel.connect }))
 const URL = 'https://agent.example.test/webhook'
 const FINISHED = 'message.transcription_finished'
 const SLACK = [...SLACK_EVENTS]
+const SUBSCRIBED = [...SLACK_SUBSCRIPTION_EVENTS]
 
 interface Row {
   id: string
@@ -215,7 +225,53 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   vi.useRealTimers()
+})
+
+const ROOT = '1770000000.000100'
+const THREAD_ROUTE = `slack:${JSON.stringify(['identity-1', 'connection-1', 'C1', ROOT])}`
+const mention = () => message({ type: 'slack.mention_received', event: { text: '<@UBOT> deploy it' } })
+const threadReply = (id: string, actor: string, messageId: string, text: string) =>
+  message({
+    id,
+    type: 'slack.thread_reply_received',
+    data: {
+      actor_id: actor,
+      message_id: messageId,
+      message_ts: `177000000${id.length}.000200`,
+      thread_ts: ROOT,
+    },
+    event: { text },
+  })
+const stop = (id: string, actor: string) => ({
+  id,
+  event_type: SLACK_STOP,
+  data: {
+    identity_id: 'identity-1',
+    connection_id: 'connection-1',
+    workspace_id: 'T1',
+    conversation_id: 'C1',
+    actor_id: actor,
+    thread_ts: ROOT,
+    event: { type: 'agent_session_stopped' },
+  },
+})
+const savedReply = (nextAttemptAt = Date.now()) => ({
+  state: 'ready' as const,
+  eventIds: ['saved-event'],
+  target: {
+    channel: 'slack' as const,
+    identityId: 'identity-1',
+    connectionId: 'connection-1',
+    workspaceId: 'T1',
+    conversationId: 'C1',
+    threadTs: ROOT,
+    sourceEventId: 'saved-event',
+  },
+  response: 'Saved answer',
+  attempts: 0,
+  nextAttemptAt,
 })
 
 describe('Slack subscription', () => {
@@ -226,7 +282,7 @@ describe('Slack subscription', () => {
     expect(held).toHaveLength(1)
     expect(held[0]?.eventTypes.some((event) => event.startsWith('slack.'))).toBe(true)
     const covered = backend.rows.filter((row) => row.url === URL).flatMap((row) => row.eventTypes)
-    expect(covered).toEqual(expect.arrayContaining(SLACK))
+    expect(covered).toEqual(expect.arrayContaining(SUBSCRIBED))
     const snapshot = JSON.stringify(backend.rows)
     backend.clear()
     const second = await harness({ backend })
@@ -242,8 +298,7 @@ describe('Slack subscription', () => {
     await startTwice(backend)
     const slackRows = backend.rows.filter((row) => row.eventTypes.some((event) => event.startsWith('slack.')))
     expect(slackRows).toHaveLength(1)
-    expect(slackRows[0]?.eventTypes).toEqual(expect.arrayContaining([...SLACK, FINISHED]))
-    expect(slackRows[0]?.eventTypes).not.toContain('slack.session_stopped')
+    expect(slackRows[0]?.eventTypes).toEqual(expect.arrayContaining([...SUBSCRIBED, FINISHED]))
   })
 
   it('removes a standalone completion row on upgrade and adopts the Slack row', async () => {
@@ -254,7 +309,7 @@ describe('Slack subscription', () => {
     await startTwice(backend)
     expect(backend.rows.some((row) => row.id === 'completions')).toBe(false)
     expect(backend.holders()[0]?.id).toBe('slack')
-    expect(backend.holders()[0]?.eventTypes).toEqual(expect.arrayContaining(SLACK))
+    expect(backend.holders()[0]?.eventTypes).toEqual(expect.arrayContaining(SUBSCRIBED))
   })
 
   it('chooses one target when two Slack rows exist and keeps the other row intact', async () => {
@@ -296,7 +351,7 @@ describe('Slack subscription', () => {
         row.eventTypes.some((event) => event.startsWith('slack.')),
       )
       expect(slackRows).toHaveLength(1)
-      expect(slackRows[0]?.eventTypes).toEqual(SLACK)
+      expect(slackRows[0]?.eventTypes).toEqual(SUBSCRIBED)
       expect(backend.holders()).toHaveLength(0)
     } finally {
       await gateway.close()
@@ -537,5 +592,266 @@ describe('Slack voice-note wait', () => {
       '[Voice note 1 — automatically transcribed]\nMove the review to Thursday.',
     )
     expect(routed.replyText).toBe('')
+  })
+})
+
+describe('Slack approvals, stop and saved replies', () => {
+  it('lets only the participant who started the turn answer its approval', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      let settled = false
+      void approval.then(() => {
+        settled = true
+      })
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(2))
+      expect(slack.sendMessage.mock.calls[1]?.[1]).toMatchObject({
+        threadTs: ROOT,
+        text: expect.stringContaining('Reply YES'),
+      })
+      await gateway.dispatchVerified(threadReply('event-other', 'U2', 'slack-message-2', 'YES'), 'inkbox')
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+      expect(settled).toBe(false)
+      await gateway.dispatchVerified(threadReply('event-owner-yes', 'U1', 'slack-message-3', 'YES'), 'inkbox')
+      await expect(approval).resolves.toBe('allowed-once')
+      expect(run).toHaveBeenCalledTimes(2)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it("stops only the stopping actor's running thread turn and sends no reply for it", async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      let finish: (value: string) => void = () => {}
+      run.mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            finish = resolve
+          }),
+      )
+      const cancel = vi.spyOn(gateway.agents, 'cancel').mockReturnValue(true)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      expect(run.mock.calls[0]?.[0]).toBe(THREAD_ROUTE)
+      expect((await gateway.dispatchVerified(stop('stop-other', 'U2'), 'inkbox')).status).toBe(202)
+      expect(cancel).not.toHaveBeenCalled()
+      expect((await gateway.dispatchVerified(stop('stop-owner', 'U1'), 'inkbox')).status).toBe(202)
+      expect(cancel).toHaveBeenCalledWith(THREAD_ROUTE, 'Stopped from Slack')
+      finish('Partial answer')
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
+      expect(slack.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('holds a saved Slack reply while Slack is disabled and sends it once enabled again', async () => {
+    const first = await harness()
+    await first.gateway.state.mutate((state) => {
+      state.deliveries['saved-event'] = savedReply()
+    })
+    await first.gateway.close()
+    const disabled = await harness({ slackEnabled: false, stateDir: first.stateDir })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(disabled.slack.sendMessage).not.toHaveBeenCalled()
+    expect(disabled.gateway.state.snapshot().deliveries['saved-event']?.state).toBe('ready')
+    expect(disabled.gateway.eventState('saved-event')).toBe('pending')
+    await disabled.gateway.close()
+    const enabled = await harness({ stateDir: first.stateDir })
+    try {
+      await vi.waitFor(() => expect(enabled.gateway.eventState('saved-event')).toBe('completed'))
+      expect(enabled.slack.sendMessage).toHaveBeenCalledTimes(1)
+      expect(enabled.slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({
+        conversationId: 'C1',
+        threadTs: ROOT,
+        text: 'Saved answer',
+      })
+    } finally {
+      await enabled.gateway.close()
+    }
+  })
+
+  it('retries a temporary connection read before a reply without marking it submitted', async () => {
+    const { gateway, slack } = await harness()
+    try {
+      slack.listConnections
+        .mockResolvedValueOnce({ connections: [connection], installationAvailable: true })
+        .mockRejectedValueOnce(new InkboxAPIError(503, 'unavailable'))
+      await gateway.dispatchVerified(message(), 'inkbox')
+      await vi.waitFor(() => expect(gateway.state.snapshot().deliveries['event-1']?.attempts).toBe(1))
+      expect(gateway.state.snapshot().deliveries['event-1']?.state).toBe('ready')
+      expect(slack.sendMessage).not.toHaveBeenCalled()
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'), { timeout: 5_000 })
+      expect(slack.sendMessage).toHaveBeenCalledTimes(1)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('refuses a saved reply without sending when the connection workspace changed', async () => {
+    const { gateway, slack } = await harness()
+    try {
+      slack.listConnections
+        .mockResolvedValueOnce({ connections: [connection], installationAvailable: true })
+        .mockResolvedValueOnce({
+          connections: [{ ...connection, workspaceId: 'TOTHER' }],
+          installationAvailable: true,
+        })
+      await gateway.dispatchVerified(message(), 'inkbox')
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('failed'))
+      expect(gateway.state.snapshot().deliveries['event-1']?.state).toBe('rejected')
+      expect(slack.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  })
+})
+
+describe('Slack contract', () => {
+  const route = {
+    identityId: 'identity-1',
+    connectionId: 'connection-1',
+    workspaceId: 'T1',
+    conversationId: 'C1',
+    threadTs: null,
+    sourceEventId: 'event-1',
+  }
+
+  it('uses the real SDK request path with a null thread and a stable idempotency header', async () => {
+    const requests: { url: string; init: RequestInit | undefined }[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        requests.push({ url: String(input), init })
+        const result = String(input).includes('/messages')
+          ? {
+              id: 'action',
+              connection_id: 'connection-1',
+              conversation_id: 'C1',
+              status: 'sent',
+              thread_ts: null,
+            }
+          : {
+              connections: [
+                {
+                  id: 'connection-1',
+                  identity_id: 'identity-1',
+                  workspace_id: 'T1',
+                  workspace_name: 'Workspace',
+                  bot_user_id: 'UBOT',
+                  status: 'connected',
+                  scopes: [],
+                  created_at: '2026-01-01T00:00:00Z',
+                },
+              ],
+            }
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }),
+    )
+    const sdk = new Inkbox({ apiKey: 'synthetic-test-key', baseUrl: 'https://sdk.test' })
+    await sendSlackReply(sdk, route, 'answer')
+    await sendSlackReply(sdk, route, 'answer')
+    const sends = requests.filter((request) => request.url.includes('/messages'))
+    expect(sends).toHaveLength(2)
+    expect(JSON.parse(String(sends[0]?.init?.body))).toEqual({
+      conversation_id: 'C1',
+      text: 'answer',
+      thread_ts: null,
+    })
+    const key = new Headers(sends[0]?.init?.headers).get('Idempotency-Key')
+    expect(key).toMatch(/^deepseek:[0-9a-f]{64}$/)
+    expect(new Headers(sends[1]?.init?.headers).get('Idempotency-Key')).toBe(key)
+  })
+
+  it('rejects a changed connection workspace before a saved reply is sent', async () => {
+    const sendMessage = vi.fn()
+    const sdk = {
+      slack: {
+        listConnections: vi.fn(async () => ({ connections: [{ ...connection, workspaceId: 'TOTHER' }] })),
+        sendMessage,
+      },
+    } as unknown as Inkbox
+    await expect(sendSlackReply(sdk, route, 'saved answer')).rejects.toBeInstanceOf(SlackConnectionDenied)
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('prepares a fresh workspace, hands off browser installation, then observes the connection', async () => {
+    const workspace = { id: 'saved', workspaceId: 'T1', workspaceName: 'Synthetic', status: 'ready' }
+    const snapshot = (status: string, connected = false) => ({
+      connections: connected ? [connection] : [],
+      provisioningWorkspace: workspace,
+      setup: { status },
+      applicationCreated: true,
+    })
+    const slack = {
+      listConnections: vi
+        .fn()
+        .mockResolvedValueOnce(snapshot('not_started'))
+        .mockResolvedValueOnce(snapshot('pending'))
+        .mockResolvedValueOnce(snapshot('ready'))
+        .mockResolvedValueOnce(snapshot('ready', true)),
+      startSetup: vi.fn(),
+      startInstallation: vi.fn(async () => ({
+        authorizationUrl: 'https://install.test',
+        expiresAt: new Date(10_000),
+      })),
+    }
+    const installation = vi.fn(),
+      note = vi.fn()
+    let clock = 0
+    const sdk = {
+      whoami: async () => ({
+        authType: 'api_key',
+        authSubtype: 'api_key.agent_scoped.claimed',
+        scope: 'agent_identity:identity-1',
+      }),
+      slack,
+    } as unknown as Inkbox
+    await expect(
+      configureSlack(sdk, 'identity-1', false, {
+        prompter: { ask: vi.fn(), confirm: async () => true },
+        note,
+        installation,
+        now: () => clock,
+        delay: async (milliseconds) => {
+          clock += milliseconds
+        },
+        waitMs: 10_000,
+      }),
+    ).resolves.toBe(true)
+    expect(slack.startSetup).toHaveBeenCalledTimes(1)
+    expect(slack.startSetup).toHaveBeenCalledWith('identity-1', 'saved')
+    expect(slack.startInstallation).toHaveBeenCalledWith('identity-1', { workspaceId: 'T1' })
+    expect(installation).toHaveBeenCalledWith('https://install.test', new Date(10_000))
+    expect(note).toHaveBeenCalledWith('Slack workspace connection confirmed.')
+  })
+
+  it('does not repeat app creation whose outcome is unknown', async () => {
+    const startSetup = vi.fn(),
+      installation = vi.fn()
+    const sdk = {
+      whoami: async () => ({ authType: 'api_key', authSubtype: 'api_key.admin_scoped' }),
+      slack: {
+        listConnections: async () => ({
+          connections: [],
+          setup: { status: 'failed', errorCode: 'outcome_unknown' },
+        }),
+        startSetup,
+      },
+    } as unknown as Inkbox
+    await configureSlack(sdk, 'identity-1', false, {
+      prompter: { ask: vi.fn(), confirm: async () => true },
+      note: vi.fn(),
+      installation,
+    })
+    expect(startSetup).not.toHaveBeenCalled()
+    expect(installation).not.toHaveBeenCalled()
   })
 })
