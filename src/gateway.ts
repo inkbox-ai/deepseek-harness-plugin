@@ -127,7 +127,7 @@ export class Gateway {
   private readonly scriptWaiters: (() => void)[] = []
   private scriptsRunning = 0
   private inboundReload: ReturnType<typeof setTimeout> | undefined
-  private inboundSweptAt = 0
+  private inboundSweep: ReturnType<typeof setInterval> | undefined
   // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
   private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
@@ -142,7 +142,8 @@ export class Gateway {
   ) {
     this.state = new StateStore(join(config.stateDir, 'gateway-state.json'))
     this.inboundStore = new InboundStore(join(config.stateDir, 'inbound'))
-    this.inboundFiles = join(config.stateDir, 'inbound', 'events')
+    // In the home directory so a sandboxed agent can read it even when the state directory is elsewhere.
+    this.inboundFiles = join(homedir(), '.inkbox', 'inbound', 'events')
     this.agents = new AgentManager(ctx, config, this.state)
   }
 
@@ -150,8 +151,9 @@ export class Gateway {
     await this.state.initialize()
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
     await this.loadInbound(false)
-    this.inboundSweptAt = Date.now()
     await sweepInboundFiles(this.inboundFiles)
+    this.inboundSweep ??= setInterval(() => void sweepInboundFiles(this.inboundFiles), INBOUND_FILES_SWEEP_MS)
+    this.inboundSweep.unref?.()
     this.client = await this.runtime.getClient()
     this.identity = await this.runtime.getIdentity()
     this.signingKey = await this.runtime.resolveSigningKey()
@@ -541,10 +543,6 @@ export class Gateway {
     event: InboundEvent,
     output: string | undefined,
   ): Promise<string | undefined> {
-    if (Date.now() - this.inboundSweptAt >= INBOUND_FILES_SWEEP_MS) {
-      this.inboundSweptAt = Date.now()
-      await sweepInboundFiles(this.inboundFiles)
-    }
     try {
       return await writeInboundFiles(
         this.inboundFiles,
@@ -785,6 +783,7 @@ export class Gateway {
     for (const timer of this.inboundTimers.values()) clearTimeout(timer)
     this.inboundTimers.clear()
     if (this.inboundReload) clearTimeout(this.inboundReload)
+    clearInterval(this.inboundSweep)
     for (const turn of this.inboundTurns) turn.abort(new Error('Gateway stopped'))
     this.stopAllTyping()
     for (const pending of this.pendingHuman.values()) {
