@@ -260,8 +260,9 @@ converted to Slack mrkdwn outside code. A reply whose send outcome is unconfirme
 never sent again automatically; while Slack is disabled, saved Slack replies wait unsent. One Slack message
 delivered under several event types runs one turn, and each Slack message is its own turn, run in order; nothing
 from another channel is merged into a running Slack turn. A Slack turn's approval and question prompts go to its
-Slack conversation and can be answered only by the person whose message started the turn; on other channels
-prompts and answers work as ordinary messages. A native Slack
+Slack conversation and can be answered only by the person whose message started the turn; a Slack prompt with no
+running Slack turn is declined without being sent. On other channels prompts and answers work as ordinary
+messages. A native Slack
 stop cancels that person's running turn, queued messages and pending prompt in the thread; a redelivered stop
 never reaches a later turn.
 

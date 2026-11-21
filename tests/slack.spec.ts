@@ -146,6 +146,7 @@ async function harness(
     mailbox: null,
     phoneNumber: null,
     sendText: vi.fn(async () => ({ id: 'text-1' })),
+    sendWhatsApp: vi.fn(async () => ({ id: 'whatsapp-1' })),
   }
   const runtime = {
     getClient: vi.fn(async () => client as unknown as Inkbox),
@@ -809,6 +810,140 @@ describe('Slack approvals, stop and saved replies', () => {
       await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledTimes(1))
       expect(identity.sendText).toHaveBeenCalledWith({ conversationId: 'sms-1', text: 'SMS answer' })
       expect(slack.sendMessage).toHaveBeenCalledTimes(2)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('declines a Slack approval or question with no owning turn and sends nothing', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
+      expect(slack.sendMessage).toHaveBeenCalledTimes(1)
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      await expect(gateway.askApproval({} as Agent, 'Deploy to production')).resolves.toBe('rejected')
+      await expect(
+        gateway.askQuestions({ agent: {} as Agent, questions: [{ id: 'q1', question: 'Which region?' }] }),
+      ).resolves.toEqual({ answers: [{ id: 'q1', selected: [] }] })
+      expect(slack.sendMessage).toHaveBeenCalledTimes(1)
+      // Another participant's YES is an ordinary message, not an approval.
+      await gateway.dispatchVerified(threadReply('event-u2-yes', 'U2', 'slack-message-8', 'YES'), 'inkbox')
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+      expect(run.mock.calls[1]?.[1]).toContain('YES')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it("sends a running WhatsApp turn's prompt to WhatsApp when a Slack DM from the contact is waiting", async () => {
+    const { gateway, run, slack, identity } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(
+        {
+          id: 'whatsapp-1',
+          event_type: 'whatsapp.received',
+          data: {
+            message: { sender_number: '+15550000001', conversation_id: 'wa-1', content: 'Hello on WhatsApp' },
+            contacts: [{ id: 'contact-1', address: '+15550000001' }],
+          },
+        },
+        'inkbox',
+      )
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      await gateway.dispatchVerified(message(), 'inkbox')
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+      const approval = gateway.askApproval({} as Agent, 'Send the requested message')
+      await vi.waitFor(() => expect(identity.sendWhatsApp).toHaveBeenCalledOnce())
+      expect(identity.sendWhatsApp).toHaveBeenCalledWith({
+        conversationId: 'wa-1',
+        text: expect.stringContaining('Reply YES'),
+      })
+      expect(slack.sendMessage).not.toHaveBeenCalled()
+      await gateway.dispatchVerified(
+        {
+          id: 'whatsapp-yes',
+          event_type: 'whatsapp.received',
+          data: {
+            message: { sender_number: '+15550000001', conversation_id: 'wa-1', content: 'YES' },
+            contacts: [{ id: 'contact-1', address: '+15550000001' }],
+          },
+        },
+        'inkbox',
+      )
+      await expect(approval).resolves.toBe('allowed-once')
+      turns[0]?.release('[SILENT]')
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      turns[1]?.release('Slack answer')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({
+        conversationId: 'D1',
+        text: 'Slack answer',
+      })
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it("accepts the owner's answer while the Slack prompt is still being sent, and drops a failed prompt's waiter", async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      let finishSend: () => void = () => {}
+      slack.sendMessage.mockImplementationOnce(
+        (_connectionId, request) =>
+          new Promise((resolve) => {
+            finishSend = () =>
+              resolve({
+                id: 'action-prompt',
+                connectionId: 'connection-1',
+                status: 'sent',
+                conversationId: request.conversationId,
+              })
+          }),
+      )
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      await gateway.dispatchVerified(threadReply('event-u1-yes', 'U1', 'slack-message-9', 'YES'), 'inkbox')
+      finishSend()
+      await expect(approval).resolves.toBe('allowed-once')
+      slack.sendMessage.mockRejectedValueOnce(new InkboxAPIError(500, 'unavailable'))
+      await expect(gateway.askApproval({} as Agent, 'Deploy again')).resolves.toBe('rejected')
+      // The failed prompt left no waiter behind, so the next prompt is sent normally.
+      const next = gateway.askApproval({} as Agent, 'Deploy once more')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(3))
+      await gateway.dispatchVerified(threadReply('event-u1-yes-2', 'U1', 'slack-message-10', 'YES'), 'inkbox')
+      await expect(next).resolves.toBe('allowed-once')
+      turns[0]?.release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('posts two identical approvals in one Slack turn as two sends with different keys', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      for (const [index, messageId] of ['slack-message-11', 'slack-message-12'].entries()) {
+        const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+        await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(index + 1))
+        await gateway.dispatchVerified(threadReply(`event-yes-${index}`, 'U1', messageId, 'YES'), 'inkbox')
+        await expect(approval).resolves.toBe('allowed-once')
+      }
+      const [first, second] = slack.sendMessage.mock.calls.map(
+        ([, request]) => request as { text?: string; idempotencyKey?: string },
+      )
+      expect(first?.text).toBe(second?.text)
+      expect(first?.idempotencyKey).toMatch(/^deepseek:[0-9a-f]{64}$/)
+      expect(second?.idempotencyKey).not.toBe(first?.idempotencyKey)
+      turns[0]?.release('[SILENT]')
     } finally {
       await gateway.close()
     }

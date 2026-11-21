@@ -266,8 +266,13 @@ export function slackText(text: string): void {
 }
 
 /** Send one reply to the source conversation and thread; an unconfirmed send is never repeated blindly. */
-export async function sendSlackReply(client: Inkbox, route: SlackReplyRoute, text: string): Promise<string> {
-  return (await prepareSlackReply(client, route, text))()
+export async function sendSlackReply(
+  client: Inkbox,
+  route: SlackReplyRoute,
+  text: string,
+  nonce?: string,
+): Promise<string> {
+  return (await prepareSlackReply(client, route, text, nonce))()
 }
 
 /**
@@ -278,6 +283,8 @@ export async function prepareSlackReply(
   client: Inkbox,
   route: SlackReplyRoute,
   text: string,
+  /** Distinguishes in-memory sends such as prompts; a durable reply omits it to keep a stable key. */
+  nonce?: string,
 ): Promise<() => Promise<string>> {
   text = slackMrkdwn(text)
   slackText(text)
@@ -290,7 +297,14 @@ export async function prepareSlackReply(
   )
   return async () => {
     const key = createHash('sha256')
-      .update(JSON.stringify([route.sourceEventId, slackRouteKey(route), text]))
+      .update(
+        JSON.stringify([
+          route.sourceEventId,
+          slackRouteKey(route),
+          text,
+          ...(nonce === undefined ? [] : [nonce]),
+        ]),
+      )
       .digest('hex')
     const action = await client.slack.sendMessage(route.connectionId, {
       conversationId: route.conversationId,
