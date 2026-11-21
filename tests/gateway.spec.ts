@@ -608,6 +608,49 @@ describe('gateway lifecycle and delivery', () => {
     await gateway.close()
   })
 
+  it('keeps steering and latest-channel approvals for a WhatsApp turn joined by SMS', async () => {
+    const { gateway, identity } = await harness()
+    let release: (value: string) => void = () => {}
+    const run = vi.spyOn(gateway.agents, 'run').mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          release = resolve
+        }),
+    )
+    const steer = vi.spyOn(gateway.agents, 'steer').mockResolvedValue()
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.dispatchVerified(
+        {
+          id: 'whatsapp-1',
+          event_type: 'whatsapp.received',
+          data: {
+            message: { sender_number: '+15550000001', conversation_id: 'wa-1', content: 'Hello on WhatsApp' },
+            contacts: [{ id: 'contact-1', address: '+15550000001' }],
+          },
+        },
+        'inkbox',
+      )
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+      await gateway.handleRequest(sms('sms-steer', 'Same thing by text'))
+      await vi.waitFor(() => expect(steer).toHaveBeenCalledTimes(1))
+      const approval = gateway.askApproval({} as Agent, 'Send the requested message')
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledOnce())
+      expect(identity.sendText).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: 'sms-conversation-1',
+          text: expect.stringContaining('Reply YES'),
+        }),
+      )
+      await gateway.handleRequest(sms('sms-yes', 'YES'))
+      await expect(approval).resolves.toBe('allowed-once')
+      expect(steer).toHaveBeenCalledTimes(1)
+      release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('suppresses channel delivery when the agent returns the silent marker', async () => {
     const { gateway, identity } = await harness()
     vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')

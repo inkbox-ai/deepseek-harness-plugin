@@ -75,7 +75,7 @@ interface Queue {
         events: RoutedEvent[]
         target: ReplyTarget
         phase: 'generating' | 'finishing'
-        /** The participant whose message started the turn; a steered message never replaces it. */
+        /** The Slack participant whose message started the turn. */
         author?: ReplyAuthor
         abort: AbortController
       }
@@ -146,7 +146,6 @@ export class Gateway {
   private slackConnection: Exclude<SlackStatus, 'disabled'> = 'unverified'
   private readonly queues = new Map<string, Queue>()
   private readonly latestTargets = new Map<string, ReplyTarget>()
-  private readonly latestAuthors = new Map<string, ReplyAuthor | undefined>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
   private readonly inflight = new Set<Promise<void>>()
   private readonly activeDeliveries = new Set<string>()
@@ -388,6 +387,14 @@ export class Gateway {
    * is not retracted.
    */
   private async stopSlack(stop: RoutedEvent): Promise<void> {
+    await this.applySlackStop(stop)
+    // The stop itself is complete, including one that found nothing to stop.
+    await this.state.mutate((state) => {
+      state.replied[stop.eventId] = Date.now()
+    })
+  }
+
+  private async applySlackStop(stop: RoutedEvent): Promise<void> {
     const author = stop.sender
     const queue = this.queues.get(stop.routeKey)
     const receipt = `slack-stop:${stop.target.channel === 'slack' ? stop.target.identityId : ''}:${stop.eventId}`
@@ -930,9 +937,8 @@ export class Gateway {
 
   private async accept(event: RoutedEvent): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
-    this.latestAuthors.set(event.routeKey, replyAuthor(event))
     const pending = this.pendingHuman.get(event.routeKey)
-    // Only the participant who prompted the turn can answer it.
+    // A Slack turn's prompt can be answered only by the participant who started it.
     if (pending !== undefined && event.replyText.trim() && sameAuthor(pending.author, event)) {
       this.pendingHuman.delete(event.routeKey)
       clearTimeout(pending.timer)
@@ -945,12 +951,8 @@ export class Gateway {
     const queue = this.queues.get(event.routeKey) ?? { buffered: [], timer: undefined, active: undefined }
     this.queues.set(event.routeKey, queue)
     if (event.typingConversationId) this.startTyping(event.typingConversationId)
-    // A Slack message is its own turn, and nothing joins a stopped turn.
-    if (
-      queue.active?.phase === 'generating' &&
-      event.channel !== 'slack' &&
-      !queue.active.abort.signal.aborted
-    ) {
+    // A Slack message is its own turn, and nothing is steered into a Slack-owned turn.
+    if (queue.active?.phase === 'generating' && event.channel !== 'slack' && !slackOwned(queue.active)) {
       queue.active.events.push(event)
       queue.active.target = event.target
       const task = this.agents
@@ -974,7 +976,7 @@ export class Gateway {
     const slackAt = queue.buffered.findIndex((event) => event.channel === 'slack')
     const events = queue.buffered.splice(0, slackAt === 0 ? 1 : slackAt < 0 ? queue.buffered.length : slackAt)
     const first = events[0]
-    const author = first && replyAuthor(first)
+    const author = first && slackAuthor(first)
     const active: NonNullable<Queue['active']> = {
       events,
       target: events.at(-1)?.target ?? { channel: 'none' as const },
@@ -1227,12 +1229,13 @@ export class Gateway {
     if (routeKey === undefined) throw new Error('No active Inkbox route owns this agent')
     if (this.pendingHuman.has(routeKey))
       throw new Error('Another Inkbox interaction is already pending for this route')
-    // The prompt belongs to the running turn: its target and the participant who started it.
+    // A Slack-owned turn's prompt goes to its owner's conversation and is bound to that owner.
     const active = this.queues.get(routeKey)?.active
-    const target = active?.target ?? this.latestTargets.get(routeKey)
+    const owner = slackOwned(active) ? active : undefined
+    const target = owner?.events[0]?.target ?? this.latestTargets.get(routeKey)
     if (target === undefined || target.channel === 'none')
       throw new Error('The active route has no reply channel')
-    const author = active ? active.author : this.latestAuthors.get(routeKey)
+    const author = owner?.author
     await this.deliver(target, prompt)
     return new Promise<string>((resolve, reject) => {
       const finish = (error: Error) => {
@@ -1343,22 +1346,20 @@ export class Gateway {
   }
 }
 
-/** Shared conversations bind a prompt to its sender; a one-to-one conversation has one participant. */
-function replyAuthor(event: RoutedEvent): ReplyAuthor | undefined {
-  if (
-    event.sender === undefined ||
-    !(event.group || event.channel === 'slack' || event.channel === 'whatsapp')
-  )
-    return undefined
-  return { channel: event.channel, sender: event.sender }
+/** A turn started by a Slack message; it owns its target, prompts and stops. */
+function slackOwned(active: Queue['active']): boolean {
+  return active?.events[0]?.channel === 'slack'
+}
+
+/** The Slack participant who owns a turn; other channels keep the latest author. */
+function slackAuthor(event: RoutedEvent): ReplyAuthor | undefined {
+  return event.channel === 'slack' && event.sender !== undefined
+    ? { channel: 'slack', sender: event.sender }
+    : undefined
 }
 
 function sameAuthor(expected: ReplyAuthor | undefined, event: RoutedEvent): boolean {
-  if (expected === undefined) return true
-  if (event.channel !== expected.channel || event.sender === undefined) return false
-  return expected.channel === 'email'
-    ? event.sender.trim().toLowerCase() === expected.sender.trim().toLowerCase()
-    : event.sender === expected.sender
+  return expected === undefined || (event.channel === expected.channel && event.sender === expected.sender)
 }
 
 export function isSilentResponse(response: string): boolean {
