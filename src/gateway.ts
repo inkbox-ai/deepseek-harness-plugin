@@ -18,6 +18,7 @@ import { renderChannelEvent, resolveChannelInstruction } from './channel-instruc
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
 import {
+  INBOUND_FILES_SWEEP_MS,
   INBOUND_MAX_CONCURRENT_SCRIPTS,
   INBOUND_MAX_PENDING_BYTES,
   INBOUND_MAX_PENDING_EVENTS,
@@ -27,13 +28,15 @@ import {
   INBOUND_TURN_TIMEOUT_MS,
   type InboundEvent,
   InboundStore,
-  inboundBody,
+  inboundBodyBytes,
   inboundRoutedEvent,
   inboundSize,
   type PendingInbound,
   parseInbound,
   runInboundScript,
   scriptInput,
+  sweepInboundFiles,
+  writeInboundFiles,
 } from './inbound.js'
 import {
   authenticateCallWebSocket,
@@ -115,6 +118,7 @@ export class Gateway {
   private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly typingPulses = new Map<string, TypingPulse>()
   private readonly inboundStore: InboundStore
+  private readonly inboundFiles: string
   private readonly inbound = new Map<string, PendingInbound>()
   private readonly inboundTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly inboundLanes = new Map<string, Promise<void>>()
@@ -123,6 +127,7 @@ export class Gateway {
   private readonly scriptWaiters: (() => void)[] = []
   private scriptsRunning = 0
   private inboundReload: ReturnType<typeof setTimeout> | undefined
+  private inboundSweptAt = 0
   // Local delivery: the host hands verified requests to handleRequest; no tunnel or public URL.
   private readonly localDelivery = process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local'
   private readonly startedAt = new Date().toISOString()
@@ -137,6 +142,7 @@ export class Gateway {
   ) {
     this.state = new StateStore(join(config.stateDir, 'gateway-state.json'))
     this.inboundStore = new InboundStore(join(config.stateDir, 'inbound'))
+    this.inboundFiles = join(config.stateDir, 'inbound', 'events')
     this.agents = new AgentManager(ctx, config, this.state)
   }
 
@@ -144,6 +150,8 @@ export class Gateway {
     await this.state.initialize()
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
     await this.loadInbound(false)
+    this.inboundSweptAt = Date.now()
+    await sweepInboundFiles(this.inboundFiles)
     this.client = await this.runtime.getClient()
     this.identity = await this.runtime.getIdentity()
     this.signingKey = await this.runtime.resolveSigningKey()
@@ -441,10 +449,11 @@ export class Gateway {
         if (!output) return await this.finishInbound(key)
         item.output = output
       }
+      const dir = await this.writeInboundFiles(event, item.output)
       await this.inboundStore.save({ ...item, turnStarted: true })
       item.turnStarted = true
       if (this.closing) return
-      const routed = inboundRoutedEvent(item.trackingId, event, item.output ?? inboundBody(event))
+      const routed = inboundRoutedEvent(item.trackingId, event, item.output, dir)
       const turn = new AbortController()
       this.inboundTurns.add(turn)
       const timeout = `Agent turn did not finish within ${INBOUND_TURN_TIMEOUT_MS / 60_000} minutes`
@@ -525,6 +534,27 @@ export class Gateway {
       }
     }
     await this.finishInbound(event.deliveryId)
+  }
+
+  /** Returns the event directory, or undefined when the files could not be written. */
+  private async writeInboundFiles(
+    event: InboundEvent,
+    output: string | undefined,
+  ): Promise<string | undefined> {
+    if (Date.now() - this.inboundSweptAt >= INBOUND_FILES_SWEEP_MS) {
+      this.inboundSweptAt = Date.now()
+      await sweepInboundFiles(this.inboundFiles)
+    }
+    try {
+      return await writeInboundFiles(
+        this.inboundFiles,
+        event,
+        output === undefined ? inboundBodyBytes(event) : Buffer.from(output),
+      )
+    } catch (error) {
+      this.log.warn('[inkbox] inbound event files could not be written', error)
+      return undefined
+    }
   }
 
   private async finishInbound(key: string): Promise<void> {

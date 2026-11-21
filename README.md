@@ -320,9 +320,13 @@ active owner; use a separate identity when testing another host concurrently.
   home directory with the event as JSON on stdin (120 s limit). Empty output finishes the event, other output (up to
   64 KiB) is passed to the agent. A failing script runs at most 5 times (retries after 10 s, 30 s, 2 min,
   10 min); an agent turn runs once. Failures are reported and the report is retried until it is accepted.
-  Deliveries are deduplicated by `delivery_id`; a replay runs again. A malformed event is answered with 400. Bodies over 64 KiB are cut and marked
-  `(truncated)` in agent messages; a base64 body is shown as text when it is valid UTF-8, otherwise noted as
-  binary. Scripts get the full body.
+  Deliveries are deduplicated by `delivery_id`; a replay runs again. A malformed event is answered with 400.
+  Before each agent turn the event is written to `inbound/events/<event_id>/` in the state directory (mode 0700,
+  kept for 7 days): `body` holds the decoded request body (or the script output) and `request.json` holds the
+  method, query, headers and event metadata. The agent gets a short header with the signature status, size and
+  that absolute path; a UTF-8 body of up to 4 KiB is also shown inline, and a larger or binary body is pointed to
+  instead. If the files cannot be written, the body is shown inline, cut at 64 KiB and marked `(truncated)`.
+  Scripts get the full body.
 
 ## License
 
