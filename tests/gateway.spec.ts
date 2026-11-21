@@ -684,6 +684,56 @@ describe('gateway lifecycle and delivery', () => {
     }
   })
 
+  it('keeps a cancelled SMS prompt on its route until its send settles', async () => {
+    const { gateway, identity } = await harness(30_000)
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.handleRequest(sms('sms-request', 'Please send it'))
+      let finishSend: () => void = () => {}
+      identity.sendText.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishSend = () => resolve({ id: 'text-prompt' })
+          }),
+      )
+      const request = new AbortController()
+      const first = gateway.askApproval({} as Agent, 'Send the first thing', request.signal)
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledOnce())
+      request.abort(new Error('Tool call cancelled'))
+      // The cancelled prompt still holds the route while its send is outstanding.
+      await expect(gateway.askApproval({} as Agent, 'Send the second thing')).resolves.toBe('rejected')
+      expect(identity.sendText).toHaveBeenCalledOnce()
+      finishSend()
+      await expect(first).resolves.toBe('cancelled')
+      const third = gateway.askApproval({} as Agent, 'Send the third thing')
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledTimes(2))
+      await gateway.handleRequest(sms('sms-yes', 'YES'))
+      await expect(third).resolves.toBe('allowed-once')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('rejects a cancelled SMS question with the request reason', async () => {
+    const { gateway, identity } = await harness(30_000)
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+    try {
+      await gateway.handleRequest(sms('sms-request', 'Please send it'))
+      const request = new AbortController()
+      const reason = new Error('Question cancelled by the caller')
+      const question = gateway.askQuestions({
+        agent: {} as Agent,
+        questions: [{ id: 'q1', question: 'Which file?' }],
+        signal: request.signal,
+      })
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledOnce())
+      request.abort(reason)
+      await expect(question).rejects.toBe(reason)
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('suppresses channel delivery when the agent returns the silent marker', async () => {
     const { gateway, identity } = await harness()
     vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')

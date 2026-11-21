@@ -36,8 +36,11 @@ export interface PromptReservation {
   readonly released: boolean
   /** Resolves with the reason as soon as the reservation is released; it never rejects. */
   readonly cancelled: Promise<Error>
-  /** Start accepting answers. Called immediately before (Slack) or after (other channels) the send. */
-  activate(timeoutMs: number): Promise<string>
+  /**
+   * Start accepting answers. Called immediately before (Slack) or after (other
+   * channels) the send. `signal`, when given, cancels from activation on.
+   */
+  activate(timeoutMs: number, signal?: AbortSignal): Promise<string>
   /** Remove this reservation only; an active waiter is rejected with `error`. */
   release(error?: Error): void
 }
@@ -106,7 +109,7 @@ export class PendingPrompts {
         return waiter.released
       },
       cancelled,
-      activate: (timeoutMs) =>
+      activate: (timeoutMs, signal) =>
         new Promise<string>((resolve, reject) => {
           if (waiter.released) {
             reject(new Error('Interaction cancelled'))
@@ -119,6 +122,15 @@ export class PendingPrompts {
             () => release(new Error('Timed out waiting for a channel reply')),
             timeoutMs,
           )
+          if (signal !== undefined) {
+            const abort = () =>
+              release(signal.reason instanceof Error ? signal.reason : new Error('Interaction cancelled'))
+            if (signal.aborted) abort()
+            else {
+              signal.addEventListener('abort', abort, { once: true })
+              listeners.push(() => signal.removeEventListener('abort', abort))
+            }
+          }
         }),
       release,
     }
