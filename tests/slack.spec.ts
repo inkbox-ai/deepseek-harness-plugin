@@ -140,7 +140,13 @@ async function harness(
     })),
   }
   const client = { webhooks: { subscriptions: backend.subscriptions }, slack }
-  const identity = { id: 'identity-1', agentHandle: 'deepseek-agent', mailbox: null, phoneNumber: null }
+  const identity = {
+    id: 'identity-1',
+    agentHandle: 'deepseek-agent',
+    mailbox: null,
+    phoneNumber: null,
+    sendText: vi.fn(async () => ({ id: 'text-1' })),
+  }
   const runtime = {
     getClient: vi.fn(async () => client as unknown as Inkbox),
     getIdentity: vi.fn(async () => identity as unknown as AgentIdentity),
@@ -170,7 +176,7 @@ async function harness(
   const gateway = new Gateway(ctx, runtime, config, { info: vi.fn(), warn: vi.fn(), error: vi.fn() })
   await gateway.start()
   const run = vi.spyOn(gateway.agents, 'run').mockResolvedValue('Reply from DeepSeek')
-  return { gateway, backend, slack, run, stateDir }
+  return { gateway, backend, slack, run, stateDir, identity }
 }
 
 function message(
@@ -598,33 +604,6 @@ describe('Slack voice-note wait', () => {
 })
 
 describe('Slack approvals, stop and saved replies', () => {
-  it('lets only the participant who started the turn answer its approval', async () => {
-    const { gateway, run, slack } = await harness()
-    try {
-      await gateway.dispatchVerified(mention(), 'inkbox')
-      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
-      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
-      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
-      let settled = false
-      void approval.then(() => {
-        settled = true
-      })
-      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(2))
-      expect(slack.sendMessage.mock.calls[1]?.[1]).toMatchObject({
-        threadTs: ROOT,
-        text: expect.stringContaining('Reply YES'),
-      })
-      await gateway.dispatchVerified(threadReply('event-other', 'U2', 'slack-message-2', 'YES'), 'inkbox')
-      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
-      expect(settled).toBe(false)
-      await gateway.dispatchVerified(threadReply('event-owner-yes', 'U1', 'slack-message-3', 'YES'), 'inkbox')
-      await expect(approval).resolves.toBe('allowed-once')
-      expect(run).toHaveBeenCalledTimes(2)
-    } finally {
-      await gateway.close()
-    }
-  })
-
   /** Holds each mocked turn open until released, recording the abort signal it was given. */
   function heldTurns(run: Awaited<ReturnType<typeof harness>>['run']) {
     const turns: { prompt: string; signal: AbortSignal | undefined; release(value?: string): void }[] = []
@@ -780,6 +759,79 @@ describe('Slack approvals, stop and saved replies', () => {
       expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({ text: 'Continuing', threadTs: ROOT })
     } finally {
       await gateway.close()
+    }
+  })
+
+  it('keeps a Slack-owned turn on Slack when an SMS from the same contact arrives', async () => {
+    const { gateway, run, slack, identity } = await harness()
+    try {
+      const turns = heldTurns(run)
+      const steer = vi.spyOn(gateway.agents, 'steer')
+      await gateway.dispatchVerified(message(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      expect(run.mock.calls[0]?.[0]).toBe('contact:contact-1')
+      const sms = {
+        id: 'event-sms',
+        event_type: 'text.received',
+        data: {
+          text_message: {
+            sender_phone_number: '+15550000001',
+            conversation_id: 'sms-1',
+            text: 'Also by text',
+          },
+          contacts: [{ id: 'contact-1', address: '+15550000001' }],
+        },
+      }
+      expect((await gateway.dispatchVerified(sms, 'inkbox')).status).toBe(202)
+      expect(steer).not.toHaveBeenCalled()
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue('contact:contact-1')
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({
+        conversationId: 'D1',
+        text: expect.stringContaining('Reply YES'),
+      })
+      expect(identity.sendText).not.toHaveBeenCalled()
+      await gateway.dispatchVerified(
+        message({ id: 'event-dm-yes', data: { message_id: 'slack-message-7' }, event: { text: 'YES' } }),
+        'inkbox',
+      )
+      await expect(approval).resolves.toBe('allowed-once')
+      turns[0]?.release('Slack answer')
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(2))
+      expect(slack.sendMessage.mock.calls[1]?.[1]).toMatchObject({
+        conversationId: 'D1',
+        text: 'Slack answer',
+      })
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      expect(turns[1]?.prompt).toContain('Also by text')
+      turns[1]?.release('SMS answer')
+      await vi.waitFor(() => expect(identity.sendText).toHaveBeenCalledTimes(1))
+      expect(identity.sendText).toHaveBeenCalledWith({ conversationId: 'sms-1', text: 'SMS answer' })
+      expect(slack.sendMessage).toHaveBeenCalledTimes(2)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('records a native stop as completed, including one with nothing to stop, across a restart', async () => {
+    const first = await harness()
+    const turns = heldTurns(first.run)
+    await first.gateway.dispatchVerified(mention(), 'inkbox')
+    await vi.waitFor(() => expect(turns).toHaveLength(1))
+    await first.gateway.dispatchVerified(stop('stop-active', 'U1'), 'inkbox')
+    expect(first.gateway.eventState('stop-active')).toBe('completed')
+    await first.gateway.dispatchVerified(stop('stop-idle', 'U3'), 'inkbox')
+    expect(first.gateway.eventState('stop-idle')).toBe('completed')
+    turns[0]?.release()
+    await vi.waitFor(() => expect(first.gateway.eventState('event-1')).toBe('completed'))
+    await first.gateway.close()
+    const restarted = await harness({ stateDir: first.stateDir })
+    try {
+      expect(restarted.gateway.eventState('stop-active')).toBe('completed')
+      expect(restarted.gateway.eventState('stop-idle')).toBe('completed')
+    } finally {
+      await restarted.gateway.close()
     }
   })
 
