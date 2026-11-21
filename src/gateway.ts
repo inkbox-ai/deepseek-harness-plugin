@@ -1245,8 +1245,14 @@ export class Gateway {
     const owner = slackOwned(active) ? active : undefined
     // The route is reserved here, synchronously: a concurrent prompt is refused before
     // anything is sent. The reservation accepts no answer until it is activated.
-    // The request and the owning turn cancel the prompt from here on, before it is activated.
-    const reservation = this.prompts.reserve(routeKey, owner?.author, [signal, owner?.abort.signal])
+    // A Slack-owned prompt is cancelled by its request or turn from here on, before
+    // activation. Other prompts keep the route through the send and observe the
+    // request only once activated, as before.
+    const reservation = this.prompts.reserve(
+      routeKey,
+      owner?.author,
+      owner ? [signal, owner.abort.signal] : [],
+    )
     if (reservation === undefined)
       throw new Error('Another Inkbox interaction is already pending for this route')
     try {
@@ -1267,7 +1273,7 @@ export class Gateway {
       if (target.channel !== 'slack') {
         // Other channels keep the base order: send, then accept answers.
         await this.deliver(target, prompt)
-        return await reservation.activate(this.config.permissionTimeoutMs)
+        return await reservation.activate(this.config.permissionTimeoutMs, signal)
       }
       if (this.client === undefined) throw new Error('Gateway client is unavailable')
       // The connection is checked before the prompt can accept an answer. Each prompt gets its own send key.
