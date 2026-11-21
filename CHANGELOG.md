@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.7
+
+- Add Slack messaging, off by default. Setup enables it (`--enable-slack` / `--skip-slack`), connects a workspace and saves `slackEnabled`; doctor checks for a connected workspace and status reports the Slack connection.
+- Route incoming Slack DMs, group DMs, mentions, thread replies and messages in an engaged thread to the agent. A plain DM joins the sender's contact session; other messages keep one session per Slack conversation and thread. Unaddressed channel traffic does not start a session. Redeliveries are deduplicated by the Slack message's `data.message_id`, falling back to the event ID.
+- Send the agent's reply to the source Slack conversation and thread. A send whose outcome is not confirmed is kept for attention and never repeated.
+- Add `inkbox_slack_list_connections`, `inkbox_slack_list_conversations`, `inkbox_slack_list_messages`, `inkbox_slack_search`, `inkbox_slack_send_message` and `inkbox_slack_get_action`, registered only when Slack is enabled.
+- Wait for Slack voice-note transcripts the same way as MMS, iMessage and WhatsApp audio, keyed by the received event's `data.message_id`; the Slack subscription carries `message.transcription_finished`. A temporary connection read failure (timeout, connection error, 408, 429 or 5xx) leaves the message unadmitted and retries it after 5 seconds; other failures are final.
+
 ## 0.2.6
 
 - Add local delivery (`INKBOX_DELIVERY_MODE=local`): the gateway opens no tunnel, registers no webhook URL, and handles signed requests passed to it by the host. Identities without a tunnel are supported in this mode.

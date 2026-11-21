@@ -5,7 +5,7 @@ export const DEFAULT_BATCH_WINDOW_MS = 750
 export const DEFAULT_PERMISSION_TIMEOUT_MS = 10 * 60 * 1000
 export const DEFAULT_STATE_DIRNAME = 'inkbox'
 export const PLUGIN_PACKAGE = '@inkbox/deepseek-harness-plugin'
-export const PLUGIN_VERSION = '0.2.6'
+export const PLUGIN_VERSION = '0.2.7'
 
 export const TOOL_NAMES = [
   'inkbox_whoami',
@@ -41,6 +41,16 @@ export const TOOL_NAMES = [
   'inkbox_list_a2a_messages',
   'inkbox_list_a2a_sent_tasks',
   'inkbox_get_a2a_sent_task',
+] as const
+
+/** Registered only when Slack is enabled. */
+export const SLACK_TOOL_NAMES = [
+  'inkbox_slack_list_connections',
+  'inkbox_slack_list_conversations',
+  'inkbox_slack_list_messages',
+  'inkbox_slack_search',
+  'inkbox_slack_send_message',
+  'inkbox_slack_get_action',
 ] as const
 
 export const SKILL_NAMES = [

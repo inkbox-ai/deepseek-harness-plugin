@@ -34,6 +34,7 @@ export interface SetupOptions {
   hostedAuthority?: 'contact_scoped' | 'yolo'
   enableIMessage?: boolean
   enableA2A?: boolean
+  enableSlack?: boolean
   provisionPhone?: boolean
   phoneState?: string
 }
@@ -159,6 +160,8 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
       ...(options.hostedAuthority ? { hostedAuthority: options.hostedAuthority } : {}),
       ...(options.enableIMessage !== undefined ? { enableIMessage: options.enableIMessage } : {}),
       ...(options.enableA2A !== undefined ? { enableA2A: options.enableA2A } : {}),
+      ...(options.enableSlack !== undefined ? { enableSlack: options.enableSlack } : {}),
+      slackDefault: savedSettings.slackEnabled === true,
       ...(options.provisionPhone !== undefined ? { provisionPhone: options.provisionPhone } : {}),
       ...(options.phoneState ? { phoneState: options.phoneState } : {}),
       nonInteractive: options.nonInteractive ?? false,
@@ -191,6 +194,7 @@ export async function setup(paths: Paths, options: SetupOptions): Promise<SetupR
         ...(channels.voiceStack ? { voiceStack: channels.voiceStack } : {}),
         ...(channels.realtimeModel ? { realtimeModel: channels.realtimeModel } : {}),
         ...(channels.realtimeVoice ? { realtimeVoice: channels.realtimeVoice } : {}),
+        slackEnabled: channels.slackEnabled,
         autoApproveInkboxTools,
       }
     })

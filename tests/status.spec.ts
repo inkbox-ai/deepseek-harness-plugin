@@ -37,6 +37,7 @@ describe('runtime status', () => {
         connected: true,
         identity: 'deepseek-agent',
         publicUrl: 'https://agent.example.test',
+        slack: 'connected',
         pid: process.pid,
         startedAt: '2026-08-26T00:00:00.000Z',
         updatedAt: '2026-08-26T00:00:01.000Z',
@@ -46,6 +47,7 @@ describe('runtime status', () => {
     const status = await readRuntimeStatus(paths)
     expect(status).toMatchObject({ ready: true, connected: true, processRunning: true })
     expect(formatRuntimeStatus(status)).toContain('Gateway: ready')
+    expect(formatRuntimeStatus(status)).toContain('Slack: connected')
   })
 
   it('reports a stale ready file as stopped', async () => {

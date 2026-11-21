@@ -43,11 +43,27 @@ import {
   runRealtimeBridge,
   type TranscriptTurn,
 } from './realtime.js'
-import { type ReplyTarget, type RoutedEvent, routeForAddress, routeWebhook } from './routing.js'
+import { type ReplyTarget, type RoutedEvent, routeForAddress, routeSlack, routeWebhook } from './routing.js'
 import type { InkboxRuntime } from './runtime.js'
+import {
+  isSlackEvent,
+  ownSlackConnection,
+  parseSlack,
+  reconcileSlackSubscription,
+  retryableRead,
+  SlackConnectionDenied,
+  sendSlackReply,
+  slackControlText,
+} from './slack.js'
 import { StateStore } from './state.js'
 import { replyState } from './terminal-reply.js'
-import { pollVoiceNote, TRANSCRIPTION_FINISHED, VoiceNoteInbox, VoiceNoteNotAdmitted } from './voice-notes.js'
+import {
+  pollVoiceNote,
+  TRANSCRIPTION_FINISHED,
+  transcriptionEventUnsupported,
+  VoiceNoteInbox,
+  VoiceNoteNotAdmitted,
+} from './voice-notes.js'
 import { authenticateWebhook } from './webhook-providers.js'
 
 interface Queue {
@@ -86,11 +102,14 @@ const EVENT_TYPES = {
   a2a: ['a2a.task.created', 'a2a.task.message', 'a2a.task.canceled', 'a2a.sent_task.updated'],
 } as const
 
+export type SlackStatus = 'disabled' | 'connected' | 'not connected' | 'unverified'
+
 export interface GatewayStatus {
   ready: boolean
   publicUrl?: string
   connected: boolean
   identity: string
+  slack: SlackStatus
   startedAt: string
   pid: number
   updatedAt: string
@@ -107,6 +126,7 @@ export class Gateway {
   private githubWebhookSecret: string | undefined
   private closing = false
   private voiceNotes: VoiceNoteInbox | undefined
+  private slackConnection: Exclude<SlackStatus, 'disabled'> = 'unverified'
   private readonly queues = new Map<string, Queue>()
   private readonly latestTargets = new Map<string, ReplyTarget>()
   private readonly pendingHuman = new Map<string, PendingHuman>()
@@ -161,6 +181,7 @@ export class Gateway {
       if (this.signingKey === undefined) throw new Error('Webhook signing key is unavailable')
       this.resumeDeliveries()
       this.voiceNoteInbox().recover()
+      await this.checkSlack()
       await this.writeStatus(true)
       return
     }
@@ -207,6 +228,7 @@ export class Gateway {
     }
     this.resumeDeliveries()
     this.voiceNoteInbox().recover()
+    await this.checkSlack()
     await this.writeStatus(true)
     void this.tunnelTask.catch((error) => {
       if (!this.closing) this.log.error('[inkbox] tunnel stopped unexpectedly', error)
@@ -257,23 +279,40 @@ export class Gateway {
       return source === 'inkbox' && this.localDelivery
         ? this.acceptInbound(payload)
         : new Response('Ignored', { status: 202 })
+    // Disabled Slack is acknowledged without waiting on a transcript.
+    const slack = isSlackEvent(payload.event_type)
+    if (slack && (source !== 'inkbox' || !this.config.slackEnabled))
+      return new Response('Ignored', { status: 202 })
     if (source === 'inkbox' && !resolvedVoiceNote && (await this.voiceNoteInbox().accept(payload)))
       return new Response('Accepted', { status: 202 })
     const callId = endedCallId(payload)
     if (callId && !(await this.claimCallReconciliation(callId)))
       return new Response('Duplicate', { status: 200 })
+    // Slack reads happen before admission; a temporary failure leaves the message unadmitted.
+    const slackRouted = slack ? await this.routeSlackEvent(payload) : undefined
+    if (slack && slackRouted === undefined) return new Response('Ignored', { status: 202 })
     let routed: RoutedEvent | undefined
     try {
-      routed = routeWebhook(
-        payload,
-        this.state.snapshot().routingKey,
-        source !== 'inkbox' || this.config.externalEvents,
-      )
+      routed =
+        slackRouted ??
+        routeWebhook(
+          payload,
+          this.state.snapshot().routingKey,
+          source !== 'inkbox' || this.config.externalEvents,
+        )
       if (routed === undefined) return new Response('Ignored', { status: 202 })
       const { eventId } = routed
+      // One Slack message can arrive under several envelopes; its retained message ID identifies it.
+      const marker = routed.channel === 'slack' ? `slack-message:${routed.messageId ?? eventId}` : undefined
       const accepted = await this.state.mutate((state) => {
         if (state.seen[eventId] !== undefined) return false
-        state.seen[eventId] = Date.now()
+        if (marker !== undefined && state.seen[marker] !== undefined) {
+          state.replied[eventId] ??= Date.now()
+          return false
+        }
+        const now = Date.now()
+        state.seen[eventId] = now
+        if (marker !== undefined) state.seen[marker] = now
         return true
       })
       if (!accepted) return new Response('Duplicate', { status: 200 })
@@ -286,6 +325,46 @@ export class Gateway {
     }
     await this.accept(routed)
     return new Response('Accepted', { status: 202 })
+  }
+
+  /** A verified Slack message from a connection this identity owns, or undefined when it is not for the agent. */
+  private async routeSlackEvent(payload: Record<string, unknown>): Promise<RoutedEvent | undefined> {
+    const identity = this.identity,
+      client = this.client
+    if (identity === undefined || client === undefined) throw new Error('Gateway identity is unavailable')
+    const route = parseSlack(payload, identity.id)
+    if (route === undefined) return undefined
+    const connection = await readBeforeAdmission(() =>
+      ownSlackConnection(client, identity.id, route.connectionId),
+    )
+    if (connection.generation !== undefined) route.connectionGeneration = connection.generation
+    if (connection.workspaceId !== route.workspaceId) throw new Error('Slack connection workspace mismatch.')
+    const routed = routeSlack(
+      payload,
+      route,
+      slackControlText(route, connection.botUserId),
+      this.state.snapshot().routingKey,
+    )
+    // Quiet channel traffic cannot start a session; an engaged thread continues.
+    // An admitted turn counts even before its session is created.
+    const engaged =
+      this.state.snapshot().routes[routed.routeKey] !== undefined || this.queues.has(routed.routeKey)
+    return route.addressed || engaged ? routed : undefined
+  }
+
+  private async checkSlack(): Promise<void> {
+    const identity = this.identity
+    if (!this.config.slackEnabled || this.client === undefined || identity === undefined) return
+    try {
+      const { connections } = await this.client.slack.listConnections(identity.id)
+      this.slackConnection = connections.some(
+        (connection) => connection.identityId === identity.id && connection.status === 'connected',
+      )
+        ? 'connected'
+        : 'not connected'
+    } catch {
+      this.slackConnection = 'unverified'
+    }
   }
 
   private async acceptInbound(payload: Record<string, unknown>): Promise<Response> {
@@ -671,6 +750,7 @@ export class Gateway {
       ...(this.listener ? { publicUrl: this.listener.publicUrl } : {}),
       connected: this.listener?.isConnected ?? false,
       identity: this.identity?.agentHandle ?? this.config.agentHandle ?? 'unconfigured',
+      slack: this.config.slackEnabled ? this.slackConnection : 'disabled',
       startedAt: this.startedAt,
       pid: process.pid,
       updatedAt: new Date().toISOString(),
@@ -885,6 +965,10 @@ export class Gateway {
       case 'whatsapp':
         await identity.sendWhatsApp({ conversationId: target.conversationId, text: response })
         return
+      case 'slack':
+        if (this.client === undefined) throw new Error('Gateway client is unavailable')
+        await sendSlackReply(this.client, target, response)
+        return
       case 'none':
         return
     }
@@ -1087,6 +1171,7 @@ export class Gateway {
         this.signingKey = created.signingKey
       }
     }
+    if (this.config.slackEnabled) await reconcileSlackSubscription(this.client, this.identity.id, url)
   }
 
   private track(promise: Promise<void>): void {
@@ -1116,22 +1201,16 @@ export function isSilentResponse(response: string): boolean {
   return response.trim().endsWith('[SILENT]')
 }
 
-function transcriptionEventUnsupported(error: unknown): boolean {
-  if (!(error instanceof InkboxAPIError) || error.statusCode !== 422) return false
-  const issues = error.detail
-  return (
-    Array.isArray(issues) &&
-    issues.length > 0 &&
-    issues.every(
-      (issue) =>
-        issue?.type === 'enum' &&
-        issue.input === TRANSCRIPTION_FINISHED &&
-        Array.isArray(issue.loc) &&
-        issue.loc[0] === 'body' &&
-        issue.loc[1] === 'event_types' &&
-        issue.loc[2] === 0,
-    )
-  )
+// Reads made before a Slack message is admitted. A timeout, network failure,
+// 408, 429 or 5xx leaves the message unadmitted so it can be delivered again; a
+// denial and every other error stay final.
+async function readBeforeAdmission<T>(read: () => Promise<T>): Promise<T> {
+  try {
+    return await read()
+  } catch (error) {
+    if (error instanceof SlackConnectionDenied || !retryableRead(error)) throw error
+    throw new VoiceNoteNotAdmitted('Slack is temporarily unavailable.', { cause: error })
+  }
 }
 
 function deliveryRetryDelay(attempt: number): number {
