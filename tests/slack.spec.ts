@@ -998,6 +998,86 @@ describe('Slack approvals, stop and saved replies', () => {
     }
   })
 
+  it('does not let an answer that arrived before the prompt approve it, even when admitted after', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      // The answer arrives first, but its own connection read is held open.
+      const releaseAnswerRead = heldConnectionRead(slack)
+      const early = gateway.dispatchVerified(
+        threadReply('event-early', 'U1', 'slack-message-15', 'YES'),
+        'inkbox',
+      )
+      await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(3))
+      let settled = false
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      void approval.then(() => {
+        settled = true
+      })
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      releaseAnswerRead()
+      expect((await early).status).toBe(202)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      await gateway.dispatchVerified(threadReply('event-late', 'U1', 'slack-message-16', 'YES'), 'inkbox')
+      await expect(approval).resolves.toBe('allowed-once')
+      turns[0]?.release('[SILENT]')
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      expect(turns[1]?.prompt).toContain('YES')
+      turns[1]?.release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('refuses an overlapping prompt immediately and sends only the first', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      const release = heldConnectionRead(slack)
+      const first = gateway.askApproval({} as Agent, 'Deploy to production')
+      await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(3))
+      await expect(gateway.askApproval({} as Agent, 'Delete the database')).resolves.toBe('rejected')
+      expect(gateway.activity().interactions).toBe(1)
+      release()
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      expect(slack.sendMessage.mock.calls[0]?.[1]).toMatchObject({
+        text: expect.stringContaining('Deploy to production'),
+      })
+      await gateway.dispatchVerified(threadReply('event-yes', 'U1', 'slack-message-17', 'YES'), 'inkbox')
+      await expect(first).resolves.toBe('allowed-once')
+      expect(slack.sendMessage).toHaveBeenCalledTimes(1)
+      expect(gateway.activity().interactions).toBe(0)
+      turns[0]?.release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('sends nothing when shutdown begins during the connection check and resolves promptly', async () => {
+    const { gateway, run, slack } = await harness()
+    const turns = heldTurns(run)
+    await gateway.dispatchVerified(mention(), 'inkbox')
+    await vi.waitFor(() => expect(turns).toHaveLength(1))
+    vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+    const release = heldConnectionRead(slack)
+    const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+    await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(3))
+    const closed = gateway.close()
+    expect(gateway.activity().interactions).toBe(0)
+    release()
+    await expect(approval).resolves.toBe('cancelled')
+    expect(slack.sendMessage).not.toHaveBeenCalled()
+    turns[0]?.release('[SILENT]')
+    await closed
+  })
+
   it('posts two identical approvals in one Slack turn as two sends with different keys', async () => {
     const { gateway, run, slack } = await harness()
     try {

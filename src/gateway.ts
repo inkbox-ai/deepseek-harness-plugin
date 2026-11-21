@@ -36,6 +36,7 @@ import {
   runInboundScript,
   scriptInput,
 } from './inbound.js'
+import { PendingPrompts, type ReplyAuthor } from './pending.js'
 import {
   authenticateCallWebSocket,
   awaitRealtimeReady,
@@ -81,20 +82,6 @@ interface Queue {
         abort: AbortController
       }
     | undefined
-}
-
-/** The participant who may answer a pending prompt on its route. */
-interface ReplyAuthor {
-  channel: RoutedEvent['channel']
-  sender: string
-}
-
-interface PendingHuman {
-  kind: 'approval' | 'question'
-  author?: ReplyAuthor
-  resolve(value: string): void
-  reject(error: Error): void
-  timer: ReturnType<typeof setTimeout>
 }
 
 interface TypingPulse {
@@ -147,7 +134,7 @@ export class Gateway {
   private slackConnection: Exclude<SlackStatus, 'disabled'> = 'unverified'
   private readonly queues = new Map<string, Queue>()
   private readonly latestTargets = new Map<string, ReplyTarget>()
-  private readonly pendingHuman = new Map<string, PendingHuman>()
+  private readonly prompts = new PendingPrompts()
   private readonly inflight = new Set<Promise<void>>()
   private readonly activeDeliveries = new Set<string>()
   private readonly deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -254,6 +241,7 @@ export class Gateway {
   }
 
   async handleRequest(request: Request): Promise<Response> {
+    const arrival = this.prompts.arrival()
     const url = new URL(request.url)
     if (request.method === 'GET' && url.pathname === '/health') {
       return Response.json(this.status(), {
@@ -281,13 +269,15 @@ export class Gateway {
       parseInbound(authenticated.payload) === undefined
     )
       return new Response('Invalid inbound event', { status: 400 })
-    return this.dispatchVerified(authenticated.payload, authenticated.source)
+    return this.dispatchVerified(authenticated.payload, authenticated.source, false, arrival)
   }
 
   async dispatchVerified(
     payload: Record<string, unknown>,
     source: 'inkbox' | 'github',
     resolvedVoiceNote = false,
+    /** When the message arrived, taken before any await; it decides which prompt it can answer. */
+    arrival = this.prompts.arrival(),
   ): Promise<Response> {
     if (this.closing) {
       if (resolvedVoiceNote) throw new VoiceNoteNotAdmitted('Gateway is stopping')
@@ -342,7 +332,7 @@ export class Gateway {
         throw new VoiceNoteNotAdmitted('Voice note could not be reserved', { cause: error })
       throw error
     }
-    await this.accept(routed)
+    await this.accept(routed, arrival)
     return new Response('Accepted', { status: 202 })
   }
 
@@ -431,12 +421,7 @@ export class Gateway {
     const active = queue.active
     const first = active?.events[0]
     if (active?.phase !== 'generating' || first === undefined || !targets.has(first.eventId)) return
-    const pending = this.pendingHuman.get(stop.routeKey)
-    if (pending !== undefined && sameAuthor(pending.author, stop)) {
-      this.pendingHuman.delete(stop.routeKey)
-      clearTimeout(pending.timer)
-      pending.reject(new Error('Stopped from Slack'))
-    }
+    this.prompts.cancelFor(stop.routeKey, stop, new Error('Stopped from Slack'))
     active.abort.abort(new Error('Stopped from Slack'))
   }
 
@@ -905,7 +890,7 @@ export class Gateway {
         ([id, item]) =>
           !['ready', 'rejected', 'quarantined'].includes(item.state ?? '') && !this.activeDeliveries.has(id),
       ).length,
-      interactions: this.pendingHuman.size,
+      interactions: this.prompts.size,
     }
   }
 
@@ -930,25 +915,19 @@ export class Gateway {
     if (this.inboundReload) clearTimeout(this.inboundReload)
     for (const turn of this.inboundTurns) turn.abort(new Error('Gateway stopped'))
     this.stopAllTyping()
-    for (const pending of this.pendingHuman.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(new Error('Gateway stopped'))
-    }
-    this.pendingHuman.clear()
+    // Releases every prompt, including one still in its connection check.
+    this.prompts.close()
     await this.listener?.aclose()
     await Promise.allSettled([...this.inflight])
     await this.agents.close()
     await this.writeStatus(false)
   }
 
-  private async accept(event: RoutedEvent): Promise<void> {
+  private async accept(event: RoutedEvent, arrival: number): Promise<void> {
     this.latestTargets.set(event.routeKey, event.target)
-    const pending = this.pendingHuman.get(event.routeKey)
-    // A Slack turn's prompt can be answered only by the participant who started it.
-    if (pending !== undefined && event.replyText.trim() && sameAuthor(pending.author, event)) {
-      this.pendingHuman.delete(event.routeKey)
-      clearTimeout(pending.timer)
-      pending.resolve(event.replyText.trim())
+    // A Slack turn's prompt can be answered only by the participant who started it,
+    // with a message that arrived after the prompt was active.
+    if (this.prompts.tryConsume(event.routeKey, event, event.replyText.trim(), arrival)) {
       await this.state.mutate((state) => {
         state.replied[event.eventId] = Date.now()
       })
@@ -1228,75 +1207,54 @@ export class Gateway {
   private async askHuman(
     agent: Agent,
     prompt: string,
-    kind: PendingHuman['kind'],
+    _kind: 'approval' | 'question',
     signal?: AbortSignal,
   ): Promise<string | undefined> {
     const routeKey = this.agents.routeForAgent(agent)
     if (routeKey === undefined) throw new Error('No active Inkbox route owns this agent')
-    if (this.pendingHuman.has(routeKey))
-      throw new Error('Another Inkbox interaction is already pending for this route')
-    // Prompts follow the latest target, as before, except that a Slack-owned turn keeps
-    // its own target and a Slack message waiting behind a running turn never takes over
-    // that turn's prompt.
     const active = this.queues.get(routeKey)?.active
-    const latest = this.latestTargets.get(routeKey)
-    const target = active && (slackOwned(active) || latest?.channel === 'slack') ? active.target : latest
-    if (target === undefined || target.channel === 'none')
-      throw new Error('The active route has no reply channel')
-    // A Slack prompt with no Slack-owned turn to bind it to is never sent: anyone in the thread could answer it.
-    if (target.channel === 'slack' && !slackOwned(active)) {
-      // The gateway logger has no debug level, so this routine outcome is logged at info.
-      this.log.info('[inkbox] Slack prompt not sent: no running Slack turn owns it')
-      return undefined
-    }
-    const author = slackOwned(active) ? active?.author : undefined
-    const wait = (): { answer: Promise<string>; cancel(error: Error): void } => {
-      let entry: PendingHuman | undefined
-      const answer = new Promise<string>((resolve, reject) => {
-        const finish = (error: Error) => {
-          const current = this.pendingHuman.get(routeKey)
-          if (current === entry) {
-            if (current !== undefined) clearTimeout(current.timer)
-            this.pendingHuman.delete(routeKey)
-          }
-          reject(error)
-        }
-        const timer = setTimeout(
-          () => finish(new Error('Timed out waiting for a channel reply')),
-          this.config.permissionTimeoutMs,
-        )
-        entry = { kind, ...(author ? { author } : {}), resolve, reject: finish, timer }
-        this.pendingHuman.set(routeKey, entry)
-        if (signal !== undefined) {
-          const abort = () =>
-            finish(signal.reason instanceof Error ? signal.reason : new Error('Interaction cancelled'))
-          if (signal.aborted) abort()
-          else signal.addEventListener('abort', abort, { once: true })
-        }
-      })
-      return { answer, cancel: (error) => entry?.reject(error) }
-    }
-    if (target.channel !== 'slack') {
-      await this.deliver(target, prompt)
-      return wait().answer
-    }
-    if (this.client === undefined) throw new Error('Gateway client is unavailable')
-    // The connection is checked before anything waits for an answer, so a reply sent
-    // before the prompt is posted cannot answer it. Each prompt gets its own send key.
-    const send = await prepareSlackReply(this.client, target, prompt, randomUUID())
-    if (signal?.aborted || active?.abort.signal.aborted) throw new PromptCancelled('Slack prompt cancelled')
-    // Registered just before the send, so an owner's answer that arrives while the
-    // send is outstanding is not lost.
-    const pending = wait()
-    pending.answer.catch(() => {})
+    const owner = slackOwned(active) ? active : undefined
+    // The route is reserved here, synchronously: a concurrent prompt is refused before
+    // anything is sent. The reservation accepts no answer until it is activated.
+    const reservation = this.prompts.reserve(routeKey, owner?.author)
+    if (reservation === undefined)
+      throw new Error('Another Inkbox interaction is already pending for this route')
     try {
+      // Prompts follow the latest target, as before, except that a Slack-owned turn keeps
+      // its own target and a Slack message waiting behind a running turn never takes over
+      // that turn's prompt.
+      const latest = this.latestTargets.get(routeKey)
+      const target = active && (owner || latest?.channel === 'slack') ? active.target : latest
+      if (target === undefined || target.channel === 'none')
+        throw new Error('The active route has no reply channel')
+      // A Slack prompt with no Slack-owned turn to bind it to is never sent: anyone in the thread could answer it.
+      if (target.channel === 'slack' && owner === undefined) {
+        // The gateway logger has no debug level, so this routine outcome is logged at info.
+        this.log.info('[inkbox] Slack prompt not sent: no running Slack turn owns it')
+        reservation.release()
+        return undefined
+      }
+      if (target.channel !== 'slack') {
+        // Other channels keep the base order: send, then accept answers.
+        await this.deliver(target, prompt)
+        return await reservation.activate(this.config.permissionTimeoutMs, signal)
+      }
+      if (this.client === undefined) throw new Error('Gateway client is unavailable')
+      // The connection is checked before the prompt can accept an answer. Each prompt gets its own send key.
+      const send = await prepareSlackReply(this.client, target, prompt, randomUUID())
+      if (reservation.released || this.closing || signal?.aborted || owner?.abort.signal.aborted)
+        throw new PromptCancelled('Slack prompt cancelled')
+      // Activated just before the send, so an owner's answer that arrives while the
+      // send is outstanding is not lost.
+      const answer = reservation.activate(this.config.permissionTimeoutMs, signal)
+      answer.catch(() => {})
       await send()
+      return await answer
     } catch (error) {
-      // Only this prompt's waiter is removed.
-      pending.cancel(error instanceof Error ? error : new Error(String(error)))
+      // Only this prompt's reservation is released.
+      reservation.release(error instanceof Error ? error : new Error(String(error)))
       throw error
     }
-    return pending.answer
   }
 
   private async reconcileSubscriptions(publicUrl: string): Promise<void> {
@@ -1397,10 +1355,6 @@ function slackAuthor(event: RoutedEvent): ReplyAuthor | undefined {
   return event.channel === 'slack' && event.sender !== undefined
     ? { channel: 'slack', sender: event.sender }
     : undefined
-}
-
-function sameAuthor(expected: ReplyAuthor | undefined, event: RoutedEvent): boolean {
-  return expected === undefined || (event.channel === expected.channel && event.sender === expected.sender)
 }
 
 export function isSilentResponse(response: string): boolean {
