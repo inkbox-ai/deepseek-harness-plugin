@@ -924,6 +924,80 @@ describe('Slack approvals, stop and saved replies', () => {
     }
   })
 
+  /** Holds the next connection read (the prompt's check) open until released. */
+  function heldConnectionRead(slack: Awaited<ReturnType<typeof harness>>['slack']) {
+    let release: () => void = () => {}
+    slack.listConnections.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ connections: [connection], installationAvailable: true })
+        }),
+    )
+    return () => release()
+  }
+
+  it('does not let an answer sent before the Slack prompt is posted approve it', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      const release = heldConnectionRead(slack)
+      let settled = false
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      void approval.then(() => {
+        settled = true
+      })
+      await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(3))
+      // The early YES is checked by its own connection read and becomes an ordinary message.
+      await gateway.dispatchVerified(
+        threadReply('event-early-yes', 'U1', 'slack-message-13', 'YES'),
+        'inkbox',
+      )
+      release()
+      await vi.waitFor(() => expect(slack.sendMessage).toHaveBeenCalledTimes(1))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      await gateway.dispatchVerified(threadReply('event-late-yes', 'U1', 'slack-message-14', 'YES'), 'inkbox')
+      await expect(approval).resolves.toBe('allowed-once')
+      turns[0]?.release('[SILENT]')
+      // The early YES runs afterwards as its own turn.
+      await vi.waitFor(() => expect(turns).toHaveLength(2))
+      expect(turns[1]?.prompt).toContain('YES')
+      turns[1]?.release('[SILENT]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('sends no Slack prompt for an aborted request or a turn stopped during the connection check', async () => {
+    const { gateway, run, slack } = await harness()
+    try {
+      const turns = heldTurns(run)
+      await gateway.dispatchVerified(mention(), 'inkbox')
+      await vi.waitFor(() => expect(turns).toHaveLength(1))
+      vi.spyOn(gateway.agents, 'routeForAgent').mockReturnValue(THREAD_ROUTE)
+      const aborted = new AbortController()
+      aborted.abort(new Error('Tool call cancelled'))
+      await expect(gateway.askApproval({} as Agent, 'Deploy to production', aborted.signal)).resolves.toBe(
+        'cancelled',
+      )
+      const release = heldConnectionRead(slack)
+      const approval = gateway.askApproval({} as Agent, 'Deploy to production')
+      await vi.waitFor(() => expect(slack.listConnections).toHaveBeenCalledTimes(4))
+      await gateway.dispatchVerified(stop('stop-during-check', 'U1'), 'inkbox')
+      expect(turns[0]?.signal?.aborted).toBe(true)
+      release()
+      await expect(approval).resolves.toBe('cancelled')
+      turns[0]?.release()
+      await vi.waitFor(() => expect(gateway.eventState('event-1')).toBe('completed'))
+      expect(slack.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('posts two identical approvals in one Slack turn as two sends with different keys', async () => {
     const { gateway, run, slack } = await harness()
     try {
