@@ -250,7 +250,7 @@ export function slackMrkdwn(text: string): string {
         ? part
         : part
             .replace(
-              /\[([^\]\n]+)\]\((https?:\/\/[^\s()<>]+)\)/g,
+              /\[([^[\]\n]+)\]\((https?:\/\/[^\s()<>]+)\)/g,
               (_match, label: string, url: string) =>
                 `<${url.replaceAll('&', '&amp;')}|${label.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}>`,
             )
