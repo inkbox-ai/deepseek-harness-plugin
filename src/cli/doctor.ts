@@ -100,7 +100,9 @@ export async function doctor(paths: Paths): Promise<Check[]> {
       } catch {
         add('Unconfirmed voice notes', false, 'Local inbox unreadable')
       }
-      add('Tunnel resource', identity.tunnel !== null, identity.tunnel ? 'Provisioned' : 'Missing')
+      if (process.env.INKBOX_DELIVERY_MODE?.trim().toLowerCase() === 'local')
+        add('Tunnel resource', true, 'Not used for local delivery')
+      else add('Tunnel resource', identity.tunnel !== null, identity.tunnel ? 'Provisioned' : 'Missing')
       add('Email channel', identity.mailbox !== null, identity.emailAddress ?? 'Missing mailbox')
       add(
         'SMS/voice channel',

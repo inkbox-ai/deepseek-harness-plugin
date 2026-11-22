@@ -313,6 +313,22 @@ active owner; use a separate identity when testing another host concurrently.
 - The gateway verifies signed webhooks before dispatch, stores durable delivery and session state, and exposes
   `GET /health` plus authenticated `POST /webhook` handling through the Inkbox tunnel.
 - Current public URL and readiness state are written to `status.json` in the configured state directory.
+- With `INKBOX_DELIVERY_MODE=local`, the gateway opens no tunnel and registers no webhook URL; the host passes
+  signed requests (up to 2 MiB) to its webhook handler. In this mode, `inbound.received` events are handled:
+  each event is queued in the state directory before it is acknowledged, and handling resumes after a restart.
+  `agent` handlers start a turn in a per-source session, and `script` handlers run `/bin/sh -c <command>` in the
+  home directory with the event as JSON on stdin (120 s limit). Empty output finishes the event, other output (up to
+  64 KiB) is passed to the agent. A failing script runs at most 5 times (retries after 10 s, 30 s, 2 min,
+  10 min); an agent turn runs once. Failures are reported and the report is retried until it is accepted.
+  Deliveries are deduplicated by `delivery_id`; a replay runs again. A malformed event is answered with 400.
+  Before each agent turn the event is written to `~/.inkbox/inbound/events/<delivery_id>/` (mode 0700, kept for
+  7 days, swept at startup and hourly): `body` holds the decoded request body (or the script output) and
+  `request.json` holds the method, query, headers and event metadata. The agent gets a short header saying its
+  text reply is not delivered, with the signature status, media type, request body size and that absolute path; a
+  UTF-8 body of up to 4 KiB is also shown inline under an untrusted-data label, and a larger or binary body is
+  pointed to instead. If the files cannot be written, the body is shown inline, cut at 64 KiB and marked
+  `(truncated)`.
+  Scripts get the full body.
 
 ## License
 
