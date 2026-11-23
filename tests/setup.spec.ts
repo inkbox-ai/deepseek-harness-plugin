@@ -7,11 +7,13 @@ import type { SetupPrompts } from '../src/cli/onboarding.js'
 import type { Paths } from '../src/cli/paths.js'
 import {
   configureManagedService,
+  effectiveSlackEnabled,
   printSummary,
   resolveDeepSeekCredential,
   resolveToolApprovalChoice,
   selectInkboxCredential,
   selectRealtimeCredential,
+  slackSetting,
   waitForGatewayReady,
 } from '../src/cli/setup.js'
 
@@ -227,5 +229,24 @@ describe('managed-service wizard parity', () => {
       },
     )
     expect(result).toEqual({ installed: true, started: false, ready: false })
+  })
+})
+
+describe('Slack profile setting', () => {
+  it('writes nothing for a skipped Slack choice, so the environment keeps applying', async () => {
+    const env = { INKBOX_SLACK_ENABLED: 'true' }
+    const document: Record<string, unknown> = { agentHandle: 'deepseek-agent' }
+    Object.assign(document, slackSetting(undefined))
+    expect(document).not.toHaveProperty('slackEnabled')
+    expect(effectiveSlackEnabled(document, env)).toBe(true)
+    expect(slackSetting(false)).toEqual({ slackEnabled: false })
+    expect(slackSetting(true)).toEqual({ slackEnabled: true })
+  })
+
+  it('reports the effective setting the gateway uses: the profile, else the environment', () => {
+    expect(effectiveSlackEnabled({}, {})).toBe(false)
+    expect(effectiveSlackEnabled(undefined, { INKBOX_SLACK_ENABLED: 'yes' })).toBe(true)
+    expect(effectiveSlackEnabled({ slackEnabled: false }, { INKBOX_SLACK_ENABLED: 'true' })).toBe(false)
+    expect(effectiveSlackEnabled({ slackEnabled: true }, { INKBOX_SLACK_ENABLED: 'false' })).toBe(true)
   })
 })

@@ -32,6 +32,8 @@ program
   .option('--skip-imessage', 'do not change iMessage configuration')
   .option('--enable-a2a', 'enable agent-to-agent communication')
   .option('--skip-a2a', 'do not change agent-to-agent communication')
+  .option('--enable-slack', 'enable Slack messaging for a connected workspace')
+  .option('--skip-slack', 'do not change Slack configuration')
   .option('--provision-phone', 'provision a dedicated phone number')
   .option('--skip-phone', 'do not provision a dedicated phone number')
   .option('--phone-state <state>', 'two-letter US state for phone provisioning')
@@ -45,6 +47,8 @@ program
     if (options.enableImessage && options.skipImessage)
       throw new Error('Choose only one of --enable-imessage or --skip-imessage')
     if (options.enableA2a && options.skipA2a) throw new Error('Choose only one of --enable-a2a or --skip-a2a')
+    if (options.enableSlack && options.skipSlack)
+      throw new Error('Choose only one of --enable-slack or --skip-slack')
     if (options.provisionPhone && options.skipPhone)
       throw new Error('Choose only one of --provision-phone or --skip-phone')
     if (options.autoApproveInkboxTools && options.askInkboxToolApprovals)
@@ -79,6 +83,7 @@ program
           ? { enableIMessage: false }
           : {}),
       ...(options.enableA2a ? { enableA2A: true } : options.skipA2a ? { enableA2A: false } : {}),
+      ...(options.enableSlack ? { enableSlack: true } : options.skipSlack ? { enableSlack: false } : {}),
       ...(options.provisionPhone
         ? { provisionPhone: true }
         : options.skipPhone

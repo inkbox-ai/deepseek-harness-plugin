@@ -1,13 +1,15 @@
 import { createHmac } from 'node:crypto'
+import { type SlackReplyRoute, type SlackRoute, slackRouteKey } from './slack.js'
 import { voiceNoteContext } from './voice-notes.js'
 
-export type Channel = 'email' | 'sms' | 'imessage' | 'whatsapp' | 'a2a' | 'call' | 'external'
+export type Channel = 'email' | 'sms' | 'imessage' | 'whatsapp' | 'slack' | 'a2a' | 'call' | 'external'
 
 export type ReplyTarget =
   | { channel: 'email'; to: string; subject: string; inReplyToMessageId?: string }
   | { channel: 'sms'; conversationId?: string; to?: string }
   | { channel: 'imessage'; conversationId: string }
   | { channel: 'whatsapp'; conversationId: string }
+  | ({ channel: 'slack' } & SlackReplyRoute)
   | { channel: 'none' }
 
 export interface RoutedEvent {
@@ -209,5 +211,48 @@ export function routeWebhook(
     content: stringify(payload),
     replyText: stringify(payload),
     target: { channel: 'none' },
+  }
+}
+
+/**
+ * A verified Slack message whose connection was confirmed for this identity.
+ * A plain DM joins the sender's contact session; every other message keeps one
+ * session per Slack conversation and thread.
+ */
+export function routeSlack(
+  payload: Json,
+  route: SlackRoute,
+  controlText: string,
+  routingKey: string,
+): RoutedEvent {
+  const data = record(payload.data)
+  const messageId = text(data.message_id)
+  const root = route.direct && route.threadTs === null
+  const routeKey = root
+    ? route.contactId
+      ? `contact:${route.contactId}`
+      : opaqueRoute('peer', route.author, routingKey)
+    : `slack:${slackRouteKey(route)}`
+  const target: ReplyTarget = {
+    channel: 'slack',
+    identityId: route.identityId,
+    connectionId: route.connectionId,
+    workspaceId: route.workspaceId,
+    conversationId: route.conversationId,
+    threadTs: route.threadTs,
+    sourceEventId: route.sourceEventId,
+    ...(route.connectionGeneration !== undefined ? { connectionGeneration: route.connectionGeneration } : {}),
+  }
+  return {
+    eventId: route.sourceEventId,
+    ...(messageId ? { messageId } : {}),
+    sender: route.author,
+    group: !route.direct,
+    routeKey,
+    channel: 'slack',
+    context: `[inkbox:${route.direct ? 'slack' : 'group_slack'} from=${route.author} connection_id=${route.connectionId} conversation_id=${route.conversationId}${route.threadTs ? ` thread_ts=${route.threadTs}` : ''}]`,
+    content: [route.text, voiceNoteContext(record(data.event))].filter(Boolean).join('\n\n'),
+    replyText: controlText,
+    target,
   }
 }
