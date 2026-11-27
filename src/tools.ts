@@ -3,7 +3,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ParameterPropertySpec, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { AgentIdentity, Inkbox } from '@inkbox/sdk'
-import { CallOrigin, type VoicemailDetection } from '@inkbox/sdk'
+import { CallOrigin, type UnlockedVault, type VoicemailDetection } from '@inkbox/sdk'
+import { VAULT_KEY_REF } from './constants.js'
 import { toIMessagePlainText } from './imessage.js'
 import type { InkboxRuntime } from './runtime.js'
 import { ownSlackConnection, slackMrkdwn, slackText } from './slack.js'
@@ -75,6 +76,7 @@ const readNames = new Set([
   'inkbox_list_a2a_messages',
   'inkbox_list_a2a_sent_tasks',
   'inkbox_get_a2a_sent_task',
+  'inkbox_credentials_list',
   'inkbox_slack_list_connections',
   'inkbox_slack_list_conversations',
   'inkbox_slack_list_messages',
@@ -386,7 +388,80 @@ export const TOOL_CATALOG: readonly CatalogEntry[] = [
     description: 'Get a full A2A task sent by this identity.',
     parameters: { taskId: s('Task UUID.', true) },
   },
+  {
+    name: 'inkbox_credentials_list',
+    description:
+      'List Vault credentials shared with this identity: id, name, secretType and description only, never plaintext. Works while the Vault is locked.',
+    parameters: { type: s('Optional filter: login, api_key, key_pair, ssh_key, or other.') },
+  },
+  {
+    name: 'inkbox_credentials_get_login',
+    description:
+      'Decrypt one login credential (username, password, URL) by secret UUID. Returns plaintext plus has_totp, never the TOTP seed. Call only when the task needs it.',
+    parameters: { secretId: s('Login secret UUID from inkbox_credentials_list.', true) },
+    approval: (a) => `Read login credential ${a.secretId as string}`,
+  },
+  {
+    name: 'inkbox_credentials_get_api_key',
+    description:
+      'Decrypt one API-key credential by secret UUID. Returns plaintext. Call only when the task needs it.',
+    parameters: { secretId: s('API-key secret UUID from inkbox_credentials_list.', true) },
+    approval: (a) => `Read API-key credential ${a.secretId as string}`,
+  },
+  {
+    name: 'inkbox_credentials_get_ssh_key',
+    description:
+      'Decrypt one SSH-key credential by secret UUID. Returns the plaintext private key and any public key, fingerprint or passphrase. Call only when the task needs it.',
+    parameters: { secretId: s('SSH-key secret UUID from inkbox_credentials_list.', true) },
+    approval: (a) => `Read SSH-key credential ${a.secretId as string}`,
+  },
+  {
+    name: 'inkbox_totp_code',
+    description:
+      'Generate the current TOTP code for a login credential that has TOTP configured. Returns the code and seconds remaining, never the seed or password.',
+    parameters: { secretId: s('Login secret UUID from inkbox_credentials_list.', true) },
+    approval: (a) => `Generate a TOTP code for credential ${a.secretId as string}`,
+  },
 ]
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const VAULT_LOCKED =
+  `Vault is locked. Set ${VAULT_KEY_REF} to the Vault unlock key: when hosted by Inkbox, save it as a Secret in the identity's Env vars tab; ` +
+  'otherwise export it where the Harness is launched (or add it to the Harness .env) and restart. Never send the key in chat.'
+
+/** Rechecks the identity's grant and unlocks with this plugin's key on every read. */
+async function unlockFor(
+  client: Inkbox,
+  identity: AgentIdentity,
+  runtime: InkboxRuntime,
+  secretId: string,
+): Promise<UnlockedVault> {
+  // The SDK places the ID in request paths unencoded.
+  if (!UUID.test(secretId)) throw new Error('secretId must be a UUID from inkbox_credentials_list')
+  const key = await runtime.resolveVaultKey()
+  if (!key) throw new Error(VAULT_LOCKED)
+  const rules = await client.vault.listAccessRules(secretId)
+  if (!rules.some((rule) => rule.identityId === identity.id))
+    throw new Error('This credential is not shared with the configured identity.')
+  return client.vault.unlock(key, { identityId: identity.id })
+}
+
+async function readCredential(
+  client: Inkbox,
+  identity: AgentIdentity,
+  runtime: InkboxRuntime,
+  secretId: string,
+  expected: 'login' | 'api_key' | 'ssh_key',
+): Promise<Record<string, unknown>> {
+  const secret = await (await unlockFor(client, identity, runtime, secretId)).getSecret(secretId)
+  if (secret.secretType !== expected) throw new Error(`The requested credential is not a ${expected} secret.`)
+  const payload = { ...secret.payload } as Record<string, unknown>
+  if (expected === 'login') {
+    payload.has_totp = payload.totp != null
+    delete payload.totp
+  }
+  return payload
+}
 
 const page = { cursor: s('Next cursor.'), limit: n('Maximum results, 1–100.') }
 
@@ -657,6 +732,20 @@ async function execute(
       )
     case 'inkbox_get_a2a_sent_task':
       return identity.a2aSentTask(args.taskId as string)
+    case 'inkbox_credentials_list':
+      return (await client.vault.listSecrets(typeof args.type === 'string' ? { secretType: args.type } : {}))
+        .filter((secret) => secret.access.some((rule) => rule.identityId === identity.id))
+        .map(({ id, name, secretType, description }) => ({ id, name, secretType, description }))
+    case 'inkbox_credentials_get_login':
+      return readCredential(client, identity, runtime, args.secretId as string, 'login')
+    case 'inkbox_credentials_get_api_key':
+      return readCredential(client, identity, runtime, args.secretId as string, 'api_key')
+    case 'inkbox_credentials_get_ssh_key':
+      return readCredential(client, identity, runtime, args.secretId as string, 'ssh_key')
+    case 'inkbox_totp_code': {
+      const vault = await unlockFor(client, identity, runtime, args.secretId as string)
+      return vault.getTotpCode(args.secretId as string)
+    }
     default:
       throw new Error(`Unknown Inkbox tool: ${name}`)
   }

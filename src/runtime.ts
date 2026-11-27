@@ -5,6 +5,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { type AgentIdentity, CallMode, type CallOrigin, Inkbox, type VoicemailDetection } from '@inkbox/sdk'
 import type { ResolvedConfig } from './config.js'
+import { VAULT_KEY_REF } from './constants.js'
 import type { RemoteTools } from './remote-tools.js'
 
 export class InkboxRuntime {
@@ -39,6 +40,11 @@ export class InkboxRuntime {
 
   async resolveSigningKey(): Promise<string | undefined> {
     const credential = await this.ctx.credentials.resolve(credentialRef(this.config.signingKeyRef))
+    return credential?.value
+  }
+
+  async resolveVaultKey(): Promise<string | undefined> {
+    const credential = await this.ctx.credentials.resolve(credentialRef(VAULT_KEY_REF))
     return credential?.value
   }
 

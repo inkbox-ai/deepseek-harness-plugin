@@ -19,7 +19,7 @@ Use this skill whenever the user asks for **multi-step outbound communication** 
 - `inkbox_list_text_conversations` — check whether the recipient has replied to past SMS
 - `inkbox_get_text_conversation` — inspect a specific SMS thread when the conversation id is known
 
-DeepSeek Harness does not expose historical email-read, note, vCard export/import, or email-forwarding tools. Use contact lookup/list/get or literal email addresses/phone numbers supplied by the user. If a named recipient lookup is ambiguous or does not include a usable destination, ask the user for the concrete destination before starting.
+Historical email reads, notes, and forwarding are not registered natively; claimed identities can use them from the current Inkbox tool catalog (`inkbox_remote_tools` to discover and read a schema, `inkbox_remote_call` to run it). Use contact lookup/list/get or literal email addresses/phone numbers supplied by the user. If a named recipient lookup is ambiguous or does not include a usable destination, ask the user for the concrete destination before starting.
 
 ## Workflow
 
@@ -38,7 +38,7 @@ If the user is vague, propose a default 3-step sequence: email today → SMS in 
 
 For each step:
 1. **Check for reply since last step.**
-   - If last step was email: DeepSeek Harness cannot list historical email replies directly; only continue if the current turn or user-supplied context confirms no reply.
+   - If last step was email: check for a reply with a remote mailbox read tool when available; otherwise continue only if the current turn or user-supplied context confirms no reply.
    - If last step was SMS: `inkbox_get_text_conversation(remotePhoneNumber)` and look for new inbound messages.
    - Reply found → exit the sequence.
 2. **Send the step.** Email → `inkbox_send_email` (thread to last outbound if possible via `inReplyToMessageId`). SMS → `inkbox_send_sms`.

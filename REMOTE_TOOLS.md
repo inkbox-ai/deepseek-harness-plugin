@@ -26,6 +26,7 @@ unavailable or unknown authority does not fall back to local execution of a migr
 | Calls and live audio | Existing local voice handling remains. |
 | A2A tasks and messages | Existing native task callbacks and local methods remain. |
 | Identity and setup | Existing credential, claim and configuration behavior remains. |
+| Vault credentials | Local tools; decryption runs in the plugin process with its own unlock key. |
 | Final reply to an incoming email or direct SMS | `inkbox_reply_current` derives the destination from the admitted source and records a durable acceptance receipt. |
 
 The final-reply helper requires explicit final intent. Progress or unrelated sends do not suppress the
