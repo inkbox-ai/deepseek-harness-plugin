@@ -94,6 +94,7 @@ interface TypingPulse {
 
 export const IMESSAGE_TYPING_REFRESH_MS = 40_000
 export const IMESSAGE_TYPING_MAX_MS = 600_000
+export const A2A_RUN_FAILED_REASON = 'The agent run failed before producing a result.'
 
 const EVENT_TYPES = {
   email: ['message.received', 'message.sent', 'message.delivered', 'message.bounced', 'message.failed'],
@@ -1001,11 +1002,20 @@ export class Gateway {
     queue.active = active
     try {
       const prompt = events.map((event) => renderChannelEvent(event, this.config)).join('\n\n')
+      const a2aTasks = new Set(events.flatMap((event) => (event.a2aTaskId ? [event.a2aTaskId] : [])))
       let response: string
       try {
-        response = (await this.agents.run(routeKey, prompt, { signal: active.abort.signal })).trim()
+        response = (
+          await this.agents.run(routeKey, prompt, {
+            signal: active.abort.signal,
+            ...(a2aTasks.size ? { failOnError: true } : {}),
+          })
+        ).trim()
       } catch (error) {
-        if (!active.abort.signal.aborted) throw error
+        if (!active.abort.signal.aborted) {
+          await this.failOpenA2ATasks(a2aTasks)
+          throw error
+        }
         response = ''
       }
       this.stopTypingForEvents(active.events)
@@ -1053,6 +1063,21 @@ export class Gateway {
       if (queue.buffered.length > 0 && !this.closing) {
         const task = this.runBatch(routeKey, queue)
         this.track(task)
+      }
+    }
+  }
+
+  /** A failed run fails its inbound tasks unless they were already settled or are waiting on the caller. */
+  private async failOpenA2ATasks(taskIds: ReadonlySet<string>): Promise<void> {
+    for (const taskId of taskIds) {
+      try {
+        const identity = this.identity
+        if (identity === undefined) return
+        const task = await identity.a2aTask(taskId)
+        if (task.state !== 'submitted' && task.state !== 'working') continue
+        await identity.a2aReply(taskId, { intent: 'fail', text: A2A_RUN_FAILED_REASON })
+      } catch (error) {
+        this.log.warn('[inkbox] could not fail A2A task after a failed run', error)
       }
     }
   }

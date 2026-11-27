@@ -187,7 +187,28 @@ describe('webhook routing', () => {
       key,
       false,
     )
-    expect(routed).toMatchObject({ routeKey: 'a2a:context-1', channel: 'a2a', target: { channel: 'none' } })
+    expect(routed).toMatchObject({
+      routeKey: 'a2a:context-1',
+      channel: 'a2a',
+      target: { channel: 'none' },
+      a2aTaskId: 'task-1',
+    })
+  })
+
+  it('marks only inbound A2A task events with their task', () => {
+    const route = (eventType: string) =>
+      routeWebhook(
+        {
+          id: `evt_${eventType}`,
+          event_type: eventType,
+          data: { task_id: 'task-1', context_id: 'context-1' },
+        },
+        key,
+        false,
+      )
+    expect(route('a2a.task.message')?.a2aTaskId).toBe('task-1')
+    expect(route('a2a.task.canceled')?.a2aTaskId).toBeUndefined()
+    expect(route('a2a.sent_task.updated')?.a2aTaskId).toBeUndefined()
   })
 
   it('routes post-call reconciliation to a resolved contact', () => {

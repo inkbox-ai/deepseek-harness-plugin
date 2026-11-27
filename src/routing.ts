@@ -24,6 +24,8 @@ export interface RoutedEvent {
   replyText: string
   target: ReplyTarget
   typingConversationId?: string
+  /** An inbound A2A task this event belongs to. */
+  a2aTaskId?: string
 }
 
 type Json = Record<string, unknown>
@@ -184,6 +186,7 @@ export function routeWebhook(
       content: stringify(data.parts ?? data),
       replyText: stringify(data.parts ?? data),
       target: { channel: 'none' },
+      ...(eventType === 'a2a.task.created' || eventType === 'a2a.task.message' ? { a2aTaskId: taskId } : {}),
     }
   }
 
