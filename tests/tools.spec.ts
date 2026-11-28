@@ -152,7 +152,11 @@ describe('Vault credential tools', () => {
         { id: OTHER, name: 'Hidden', secretType: 'api_key', description: null, access: [] },
       ]),
       listAccessRules: vi.fn(async (id: string) => (id === SECRET ? shared : [])),
-      unlock: vi.fn(async () => unlocked),
+      unlock: vi.fn(async () => {
+        vault._unlocked = unlocked
+        return unlocked
+      }),
+      _unlocked: null as unknown,
     }
     const runtime = {
       config: { autoApproveInkboxTools, slackEnabled: false },
@@ -187,8 +191,17 @@ describe('Vault credential tools', () => {
     const { run, vault } = vaultHarness('vault-key')
     const login = JSON.parse(String(await run('inkbox_credentials_get_login', { secretId: SECRET })))
     expect(login).toEqual({ username: 'agent', password: 'pw', has_totp: true })
-    expect(vault.listAccessRules).toHaveBeenCalledWith(SECRET)
-    expect(vault.unlock).toHaveBeenCalledWith('vault-key', { identityId: 'identity-1' })
+    expect(vault.listAccessRules).toHaveBeenCalledTimes(2)
+    expect(vault.unlock).toHaveBeenCalledWith('vault-key')
+    expect(vault._unlocked).toBeNull()
+  })
+
+  it('withholds a credential whose sharing is revoked during the read', async () => {
+    const { run, vault, unlocked } = vaultHarness('vault-key')
+    vault.listAccessRules.mockResolvedValueOnce([{ identityId: 'identity-1' }]).mockResolvedValueOnce([])
+    await expect(run('inkbox_credentials_get_login', { secretId: SECRET })).rejects.toThrow(/not shared/)
+    expect(unlocked.getSecret).toHaveBeenCalledWith(SECRET)
+    expect(vault._unlocked).toBeNull()
   })
 
   it('returns a current TOTP code', async () => {
@@ -210,6 +223,12 @@ describe('Vault credential tools', () => {
     vault.listAccessRules.mockClear()
     await expect(run('inkbox_credentials_get_login', { secretId: '../keys' })).rejects.toThrow(/UUID/)
     expect(vault.listAccessRules).not.toHaveBeenCalled()
+  })
+
+  it('rejects a malformed secret ID before asking for approval', async () => {
+    const { run, request } = vaultHarness('vault-key', false)
+    await expect(run('inkbox_totp_code', { secretId: 'see the attached key' })).rejects.toThrow(/UUID/)
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('asks for approval before a plaintext read unless Inkbox tools are trusted', async () => {

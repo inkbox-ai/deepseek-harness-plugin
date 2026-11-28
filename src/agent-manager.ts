@@ -99,7 +99,7 @@ export class AgentManager {
     signal?.throwIfAborted()
     if (options.failOnError) {
       const failure = turnFailure(agent.session.events, firstSeq)
-      if (failure !== undefined) throw new Error(failure)
+      if (failure !== undefined) throw failure
     }
     return summarize(agent.session.events, firstSeq)
   }
@@ -154,12 +154,16 @@ export function summarize(events: readonly SessionEvent[], firstSeq: number): st
   return text
 }
 
-export function turnFailure(events: readonly SessionEvent[], firstSeq: number): string | undefined {
+/** A turn that was cancelled rather than failed. */
+export class TurnCancelledError extends Error {}
+
+export function turnFailure(events: readonly SessionEvent[], firstSeq: number): Error | undefined {
   for (const event of events) {
     if (event.seq < firstSeq || event.type !== 'turn/end') continue
     const reason = event.data.reason
-    if (reason.kind === 'error') return reason.error.message || 'Agent turn failed'
-    if (reason.kind === 'aborted' || reason.kind === 'interrupted') return `Agent turn ${reason.kind}`
+    if (reason.kind === 'error') return new Error(reason.error.message || 'Agent turn failed')
+    if (reason.kind === 'aborted' || reason.kind === 'interrupted')
+      return new TurnCancelledError(`Agent turn ${reason.kind}`)
   }
   return undefined
 }

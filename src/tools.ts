@@ -399,28 +399,28 @@ export const TOOL_CATALOG: readonly CatalogEntry[] = [
     description:
       'Decrypt one login credential (username, password, URL) by secret UUID. Returns plaintext plus has_totp, never the TOTP seed. Call only when the task needs it.',
     parameters: { secretId: s('Login secret UUID from inkbox_credentials_list.', true) },
-    approval: (a) => `Read login credential ${a.secretId as string}`,
+    approval: (a) => `Read login credential ${secretIdOf(a)}`,
   },
   {
     name: 'inkbox_credentials_get_api_key',
     description:
       'Decrypt one API-key credential by secret UUID. Returns plaintext. Call only when the task needs it.',
     parameters: { secretId: s('API-key secret UUID from inkbox_credentials_list.', true) },
-    approval: (a) => `Read API-key credential ${a.secretId as string}`,
+    approval: (a) => `Read API-key credential ${secretIdOf(a)}`,
   },
   {
     name: 'inkbox_credentials_get_ssh_key',
     description:
       'Decrypt one SSH-key credential by secret UUID. Returns the plaintext private key and any public key, fingerprint or passphrase. Call only when the task needs it.',
     parameters: { secretId: s('SSH-key secret UUID from inkbox_credentials_list.', true) },
-    approval: (a) => `Read SSH-key credential ${a.secretId as string}`,
+    approval: (a) => `Read SSH-key credential ${secretIdOf(a)}`,
   },
   {
     name: 'inkbox_totp_code',
     description:
       'Generate the current TOTP code for a login credential that has TOTP configured. Returns the code and seconds remaining, never the seed or password.',
     parameters: { secretId: s('Login secret UUID from inkbox_credentials_list.', true) },
-    approval: (a) => `Generate a TOTP code for credential ${a.secretId as string}`,
+    approval: (a) => `Generate a TOTP code for credential ${secretIdOf(a)}`,
   },
 ]
 
@@ -429,31 +429,52 @@ const VAULT_LOCKED =
   `Vault is locked. Set ${VAULT_KEY_REF} to the Vault unlock key: when hosted by Inkbox, save it as a Secret in the identity's Env vars tab; ` +
   'otherwise export it where the Harness is launched (or add it to the Harness .env) and restart. Never send the key in chat.'
 
-/** Rechecks the identity's grant and unlocks with this plugin's key on every read. */
-async function unlockFor(
-  client: Inkbox,
-  identity: AgentIdentity,
-  runtime: InkboxRuntime,
-  secretId: string,
-): Promise<UnlockedVault> {
-  // The SDK places the ID in request paths unencoded.
-  if (!UUID.test(secretId)) throw new Error('secretId must be a UUID from inkbox_credentials_list')
-  const key = await runtime.resolveVaultKey()
-  if (!key) throw new Error(VAULT_LOCKED)
+/** The SDK places the ID in request paths unencoded. */
+function secretIdOf(args: Args): string {
+  const id = args.secretId
+  if (typeof id !== 'string' || !UUID.test(id))
+    throw new Error('secretId must be a UUID from inkbox_credentials_list')
+  return id
+}
+
+async function assertShared(client: Inkbox, identity: AgentIdentity, secretId: string): Promise<void> {
   const rules = await client.vault.listAccessRules(secretId)
   if (!rules.some((rule) => rule.identityId === identity.id))
     throw new Error('This credential is not shared with the configured identity.')
-  return client.vault.unlock(key, { identityId: identity.id })
+}
+
+/** Every read rechecks the identity's grant and unlocks fresh with this plugin's key. */
+async function withSecret<T>(
+  client: Inkbox,
+  identity: AgentIdentity,
+  runtime: InkboxRuntime,
+  args: Args,
+  read: (vault: UnlockedVault, secretId: string) => Promise<T>,
+): Promise<T> {
+  const secretId = secretIdOf(args)
+  const key = await runtime.resolveVaultKey()
+  if (!key) throw new Error(VAULT_LOCKED)
+  await assertShared(client, identity, secretId)
+  // An identity-filtered unlock costs one request per secret; reads go by ID instead.
+  const vault = await client.vault.unlock(key)
+  try {
+    const value = await read(vault, secretId)
+    await assertShared(client, identity, secretId)
+    return value
+  } finally {
+    // unlock() also caches every decrypted secret on the shared client.
+    client.vault._unlocked = null
+  }
 }
 
 async function readCredential(
   client: Inkbox,
   identity: AgentIdentity,
   runtime: InkboxRuntime,
-  secretId: string,
+  args: Args,
   expected: 'login' | 'api_key' | 'ssh_key',
 ): Promise<Record<string, unknown>> {
-  const secret = await (await unlockFor(client, identity, runtime, secretId)).getSecret(secretId)
+  const secret = await withSecret(client, identity, runtime, args, (vault, id) => vault.getSecret(id))
   if (secret.secretType !== expected) throw new Error(`The requested credential is not a ${expected} secret.`)
   const payload = { ...secret.payload } as Record<string, unknown>
   if (expected === 'login') {
@@ -737,15 +758,13 @@ async function execute(
         .filter((secret) => secret.access.some((rule) => rule.identityId === identity.id))
         .map(({ id, name, secretType, description }) => ({ id, name, secretType, description }))
     case 'inkbox_credentials_get_login':
-      return readCredential(client, identity, runtime, args.secretId as string, 'login')
+      return readCredential(client, identity, runtime, args, 'login')
     case 'inkbox_credentials_get_api_key':
-      return readCredential(client, identity, runtime, args.secretId as string, 'api_key')
+      return readCredential(client, identity, runtime, args, 'api_key')
     case 'inkbox_credentials_get_ssh_key':
-      return readCredential(client, identity, runtime, args.secretId as string, 'ssh_key')
-    case 'inkbox_totp_code': {
-      const vault = await unlockFor(client, identity, runtime, args.secretId as string)
-      return vault.getTotpCode(args.secretId as string)
-    }
+      return readCredential(client, identity, runtime, args, 'ssh_key')
+    case 'inkbox_totp_code':
+      return withSecret(client, identity, runtime, args, (vault, id) => vault.getTotpCode(id))
     default:
       throw new Error(`Unknown Inkbox tool: ${name}`)
   }

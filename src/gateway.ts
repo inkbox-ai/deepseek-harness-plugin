@@ -14,7 +14,7 @@ import {
   type InkboxWebSocket,
   type TunnelListener,
 } from '@inkbox/sdk/tunnels/connect'
-import { AgentManager } from './agent-manager.js'
+import { AgentManager, TurnCancelledError } from './agent-manager.js'
 import { renderChannelEvent, resolveChannelInstruction } from './channel-instructions.js'
 import type { ResolvedConfig } from './config.js'
 import { toIMessagePlainText } from './imessage.js'
@@ -1013,7 +1013,8 @@ export class Gateway {
         ).trim()
       } catch (error) {
         if (!active.abort.signal.aborted) {
-          await this.failOpenA2ATasks(a2aTasks)
+          // A cancelled or shutdown-interrupted turn is not a failed task.
+          if (!this.closing && !(error instanceof TurnCancelledError)) await this.failOpenA2ATasks(a2aTasks)
           throw error
         }
         response = ''

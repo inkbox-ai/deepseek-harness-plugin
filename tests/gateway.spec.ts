@@ -7,6 +7,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { type AgentIdentity, type Inkbox, InkboxAPIError } from '@inkbox/sdk'
 import type { TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { TurnCancelledError } from '../src/agent-manager.js'
 import type { ResolvedConfig } from '../src/config.js'
 import {
   A2A_RUN_FAILED_REASON,
@@ -806,6 +807,31 @@ describe('gateway lifecycle and delivery', () => {
         expect(identity.a2aReply).not.toHaveBeenCalled()
       },
     )
+
+    it('leaves an open task alone when its turn is cancelled', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      const run = vi
+        .spyOn(gateway.agents, 'run')
+        .mockRejectedValue(new TurnCancelledError('Agent turn aborted'))
+      await gateway.handleRequest(a2a('event-a2a-cancel'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      await gateway.close()
+      expect(identity.a2aReply).not.toHaveBeenCalled()
+    })
+
+    it('leaves an open task alone when the run fails during shutdown', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      let fail!: (error: Error) => void
+      const run = vi
+        .spyOn(gateway.agents, 'run')
+        .mockImplementation(() => new Promise((_, reject) => (fail = reject)))
+      await gateway.handleRequest(a2a('event-a2a-shutdown'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      const closed = gateway.close()
+      fail(new Error('Gateway stopped'))
+      await closed
+      expect(identity.a2aReply).not.toHaveBeenCalled()
+    })
 
     it('does not touch the task after a successful run', async () => {
       const { gateway, identity } = await a2aHarness('working')
