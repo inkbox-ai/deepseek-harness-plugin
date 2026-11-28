@@ -10,14 +10,14 @@ describe('communication capability catalog', () => {
     expect(PLUGIN_VERSION).toBe(manifest.version)
   })
 
-  it('registers exactly the 33 social-tier tools', () => {
+  it('registers exactly the 38 native tools', () => {
     expect(TOOL_CATALOG.map((tool) => tool.name)).toEqual([...TOOL_NAMES])
-    expect(new Set(TOOL_NAMES).size).toBe(33)
+    expect(new Set(TOOL_NAMES).size).toBe(38)
   })
 
-  it('excludes power-assistant-only tool groups', () => {
+  it('leaves catalog-served tool groups to the remote Inkbox tools', () => {
     const names = TOOL_CATALOG.map((tool) => tool.name).join(' ')
-    expect(names).not.toMatch(/note|vault|credential|contact_rule|list_email|get_email|list_call|get_call/)
+    expect(names).not.toMatch(/note|contact_rule|list_email|get_email|list_call|get_call/)
   })
 
   it('packages exactly 13 model-invocable skills', () => {
@@ -32,6 +32,18 @@ describe('communication capability catalog', () => {
       .map((skill) => `${skill.description}\n${skill.content}`)
       .join('\n')
     expect(content).not.toMatch(/Hermes|Claude Code|OpenCode|OpenClaw|Codex plugin/i)
+  })
+
+  it('guides Vault unlock for hosted and self-hosted agents and notes through remote tools', () => {
+    const skill = (name: string) =>
+      loadPackagedSkills().find((candidate) => candidate.name === name)?.content ?? ''
+    const credentials = skill('inkbox-credential-use')
+    for (const name of TOOL_NAMES.filter((tool) => /credential|totp/.test(tool)))
+      expect(credentials).toContain(name)
+    expect(credentials).toMatch(/INKBOX_DEEPSEEK_VAULT_KEY/)
+    expect(credentials).toMatch(/Hosted by Inkbox:.*Env vars tab/)
+    expect(credentials).toMatch(/Self-hosted:.*export it/)
+    expect(skill('inkbox-notes-memory')).toMatch(/inkbox_remote_tools[\s\S]*inkbox_remote_call/)
   })
 
   it.each([

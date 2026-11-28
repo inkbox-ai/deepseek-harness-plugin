@@ -1,54 +1,63 @@
 ---
 name: inkbox-credential-use
-description: Use when the user asks the agent to "log into X", "get the API key for Y", "fetch the SSH key for Z", or "give me the TOTP code for service A". DeepSeek Harness does not expose Inkbox vault tools; explain the limitation and do not invent credential access.
+description: Use when the user asks the agent to "log into X", "get the API key for Y", "fetch the SSH key for Z", or "give me the TOTP code for service A". Covers the Inkbox Vault credential tools. Always list first, then read one credential; never enumerate plaintext.
 user-invocable: false
 ---
 
 # Inkbox credential use
 
-This DeepSeek Harness integration does not register credential vault tools, so it cannot list, fetch, or generate credentials or TOTP codes through Inkbox.
+When an action needs a password, API key, SSH key, or TOTP code, retrieve it from the Inkbox Vault with these tools.
 
-## DeepSeek Harness tool availability
+## Tools
 
-- There is no `inkbox_credentials_list`, `inkbox_credentials_get_login`, `inkbox_credentials_get_api_key`, `inkbox_credentials_get_ssh_key`, or `inkbox_totp_code` tool in DeepSeek Harness.
-- Do not claim that you checked the vault or retrieved a credential.
-- If the user needs vault access, direct them to Inkbox Console or a host/plugin tier that exposes the Inkbox vault tools.
+- `inkbox_credentials_list`: metadata only (id, name, secretType, description) for credentials shared with this identity. Works while the Vault is locked.
+- `inkbox_credentials_get_login`: plaintext login (username, password, optional URL) plus `has_totp`; the TOTP seed is never returned.
+- `inkbox_credentials_get_api_key`: plaintext API key.
+- `inkbox_credentials_get_ssh_key`: plaintext SSH private key and any public key, fingerprint, or passphrase.
+- `inkbox_totp_code`: current TOTP code and seconds remaining for a login that has TOTP configured.
+
+The plaintext tools ask for approval unless the profile trusts Inkbox tools.
 
 ## Prerequisites
 
-- The user must provide credentials through an approved host mechanism outside this DeepSeek Harness Inkbox plugin.
-- Do not ask the user to paste secrets into chat unless they explicitly choose that path and the current host policy allows it.
+- The Vault is initialized and the credential is shared with this identity (set up in Inkbox Console).
+- The Vault unlock key is available as `INKBOX_DEEPSEEK_VAULT_KEY`:
+  - **Hosted by Inkbox:** save it as a Secret named `INKBOX_DEEPSEEK_VAULT_KEY` in the identity's Env vars tab. Exporting it in a terminal does not reach a hosted agent.
+  - **Self-hosted:** export it in the shell that launches the Harness (`inkbox-deepseek run`), or add it to the Harness `.env` for the managed service, then restart.
+
+If the key is missing, a plaintext read returns "Vault is locked." Tell the user which path applies and retry after they confirm. Never ask for the key in chat or as a tool argument.
 
 ## Workflow
 
-1. **State the limitation.** Say that this DeepSeek Harness installation does not expose Inkbox vault tools.
-2. **Offer a safe path.** Ask the user to configure the needed credential through the host's supported secret mechanism or Inkbox Console.
-3. **Avoid plaintext echo.** If credentials arrive through another tool, use them for the requested action and do not repeat plaintext unless the user explicitly asked to see it.
+1. **List first.** Call `inkbox_credentials_list` (optionally with `type`) and pick the `id` by `name`. Never guess UUIDs.
+2. **Confirm when stakes are high.** For production or financial accounts, check the credential's name and description with the user before reading plaintext.
+3. **Read the matching type.** Login → `inkbox_credentials_get_login`; API key → `inkbox_credentials_get_api_key`; SSH key → `inkbox_credentials_get_ssh_key`. Use the fields for the requested action.
+4. **TOTP.** Call `inkbox_totp_code` with the login's UUID. If fewer than about 5 seconds remain, request a new code before using it.
 
 ## Hygiene
 
-- **Don't fake vault access.** No Inkbox vault tool is available in DeepSeek Harness.
-- **Don't paste plaintext into chat.** When another approved credential source exists, use it without repeating secrets.
-- **Don't store secrets in session memory.** Treat credentials as transient.
+- **Don't list-then-dump.** Read only the credential the task needs.
+- **Don't paste plaintext into chat** unless the user explicitly asked to see it.
+- **Don't store secrets in session memory.** Each read rechecks access and fetches the current value.
 
 ## Errors
 
 | Error | Meaning |
 |---|---|
-| Missing credential tool | This DeepSeek Harness plugin tier does not expose Inkbox vault tools. |
-| User asks for a secret by name | Ask them to configure it through the host's supported secret path or Inkbox Console. |
+| `Vault is locked...` | `INKBOX_DEEPSEEK_VAULT_KEY` is not configured; see Prerequisites. |
+| `not shared with the configured identity` | Wrong credential, or access has not been granted in Inkbox Console. |
+| `not a <type> secret` | The typed getter does not match `secretType`; re-list and use the matching tool. |
+| `secretId must be a UUID` | Pass the `id` from `inkbox_credentials_list`. |
 
 ## What this skill does NOT cover
 
-- Creating, updating, or deleting secrets — there's no plugin tool for this in agent-scoped mode.
-- Granting access to secrets — admin-only via the Inkbox Console.
-- TOTP setup — initial TOTP config also happens in the Console.
+- Creating, updating, or deleting secrets.
+- Granting access to secrets; that is done in Inkbox Console.
+- TOTP setup, which also happens in Inkbox Console.
 
 ## When you need more — raw Inkbox docs
-
-If a payload shape, secret type, vault behavior, or TOTP detail isn't covered here, go to the source:
 
 - **https://inkbox.ai/llms.txt** — LLM-friendly index of every Inkbox doc page.
 - **https://inkbox.ai/docs/all.md** — the full Inkbox documentation concatenated as one markdown file.
 
-Especially useful when checking the exact fields on `LoginPayload`, `APIKeyPayload`, `SSHKeyPayload`, `KeyPairPayload`, `OtherPayload`, or `TOTPCode` rather than guessing.
+Especially useful when checking the exact fields on `LoginPayload`, `APIKeyPayload`, `SSHKeyPayload`, or `TOTPCode` rather than guessing.

@@ -7,8 +7,10 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { type AgentIdentity, type Inkbox, InkboxAPIError } from '@inkbox/sdk'
 import type { TunnelListener } from '@inkbox/sdk/tunnels/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { TurnCancelledError } from '../src/agent-manager.js'
 import type { ResolvedConfig } from '../src/config.js'
 import {
+  A2A_RUN_FAILED_REASON,
   Gateway,
   IMESSAGE_TYPING_MAX_MS,
   IMESSAGE_TYPING_REFRESH_MS,
@@ -219,6 +221,23 @@ function sms(id: string, body = 'Hello from SMS'): Request {
           text: body,
         },
         contacts: [{ id: 'contact-1', address: '+15550000001' }],
+      },
+    }),
+  })
+}
+
+function a2a(id: string, eventType = 'a2a.task.created'): Request {
+  return new Request('https://agent.example.test/webhook', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-signature': 'signed' },
+    body: JSON.stringify({
+      id,
+      event_type: eventType,
+      data: {
+        task_id: 'task-1',
+        context_id: 'context-1',
+        caller: { handle: 'peer' },
+        parts: [{ text: 'work' }],
       },
     }),
   })
@@ -753,6 +772,87 @@ describe('gateway lifecycle and delivery', () => {
     expect(identity.sendEmail).not.toHaveBeenCalled()
     expect(isSilentResponse('Nothing requires follow-up.\n[SILENT]')).toBe(true)
     await gateway.close()
+  })
+
+  describe('inbound A2A run failure', () => {
+    async function a2aHarness(state: string) {
+      const setup = await harness()
+      const identity = setup.identity as Harness['identity'] & Record<string, ReturnType<typeof vi.fn>>
+      identity.a2aTask = vi.fn(async () => ({ id: 'task-1', state }))
+      identity.a2aReply = vi.fn(async () => ({ id: 'task-1', state: 'failed' }))
+      return { ...setup, identity }
+    }
+
+    it('fails an open task with a generic reason when the run fails', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      const run = vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('model secret detail'))
+      expect((await gateway.handleRequest(a2a('event-a2a-1'))).status).toBe(202)
+      await vi.waitFor(() => expect(identity.a2aReply).toHaveBeenCalledOnce())
+      expect(identity.a2aReply).toHaveBeenCalledWith('task-1', {
+        intent: 'fail',
+        text: A2A_RUN_FAILED_REASON,
+      })
+      expect(run.mock.calls[0]?.[2]).toMatchObject({ failOnError: true })
+      await gateway.close()
+    })
+
+    it.each(['completed', 'failed', 'canceled', 'input_required'])(
+      'leaves a %s task unchanged when the run fails',
+      async (state) => {
+        const { gateway, identity } = await a2aHarness(state)
+        vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('turn failed'))
+        await gateway.handleRequest(a2a(`event-a2a-${state}`))
+        await vi.waitFor(() => expect(identity.a2aTask).toHaveBeenCalledOnce())
+        await gateway.close()
+        expect(identity.a2aReply).not.toHaveBeenCalled()
+      },
+    )
+
+    it('leaves an open task alone when its turn is cancelled', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      const run = vi
+        .spyOn(gateway.agents, 'run')
+        .mockRejectedValue(new TurnCancelledError('Agent turn aborted'))
+      await gateway.handleRequest(a2a('event-a2a-cancel'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      await gateway.close()
+      expect(identity.a2aReply).not.toHaveBeenCalled()
+    })
+
+    it('leaves an open task alone when the run fails during shutdown', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      let fail!: (error: Error) => void
+      const run = vi
+        .spyOn(gateway.agents, 'run')
+        .mockImplementation(() => new Promise((_, reject) => (fail = reject)))
+      await gateway.handleRequest(a2a('event-a2a-shutdown'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      const closed = gateway.close()
+      fail(new Error('Gateway stopped'))
+      await closed
+      expect(identity.a2aReply).not.toHaveBeenCalled()
+    })
+
+    it('does not touch the task after a successful run', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      vi.spyOn(gateway.agents, 'run').mockResolvedValue('[SILENT]')
+      await gateway.handleRequest(a2a('event-a2a-ok'))
+      await vi.waitFor(() => expect(gateway.state.snapshot().replied['event-a2a-ok']).toBeTypeOf('number'))
+      expect(identity.a2aTask).not.toHaveBeenCalled()
+      expect(identity.a2aReply).not.toHaveBeenCalled()
+      await gateway.close()
+    })
+
+    it('never fails a sent task whose update run fails', async () => {
+      const { gateway, identity } = await a2aHarness('working')
+      const run = vi.spyOn(gateway.agents, 'run').mockRejectedValue(new Error('turn failed'))
+      await gateway.handleRequest(a2a('event-a2a-sent', 'a2a.sent_task.updated'))
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      await gateway.close()
+      expect(run.mock.calls[0]?.[2]).not.toHaveProperty('failOnError')
+      expect(identity.a2aTask).not.toHaveBeenCalled()
+      expect(identity.a2aReply).not.toHaveBeenCalled()
+    })
   })
 
   it('persists a failed delivery and retries without rerunning the agent', async () => {

@@ -1,6 +1,6 @@
 ---
 name: inkbox-contact-rules
-description: Use when the user wants to block, allow, delete, or list Inkbox contact-rule filters for the agent's mailbox or phone number. DeepSeek Harness does not expose contact-rule edit tools; guide the user to Inkbox Console or explain the limitation.
+description: Use when the user wants to block, allow, delete, or list Inkbox contact-rule filters for the agent's mailbox or phone number. Use the remote Inkbox tool catalog for any contact-rule tools it offers; otherwise guide the user to Inkbox Console.
 user-invocable: false
 ---
 
@@ -11,8 +11,8 @@ Use this skill when discussing who can reach the agent's Inkbox mailbox or phone
 ## DeepSeek Harness tool availability
 
 - DeepSeek Harness relies on Inkbox server-side mailbox and phone contact rules for admission.
-- This DeepSeek Harness plugin does not register `inkbox_list_mail_contact_rules`, `inkbox_create_mail_contact_rule`, `inkbox_update_mail_contact_rule`, `inkbox_delete_mail_contact_rule`, `inkbox_list_phone_contact_rules`, `inkbox_create_phone_contact_rule`, `inkbox_update_phone_contact_rule`, or `inkbox_delete_phone_contact_rule`.
-- If the user asks to change allow/block rules, tell them the DeepSeek Harness plugin cannot edit those rules directly and direct them to Inkbox Console.
+- Contact-rule tools are not registered natively. Claimed identities can use any contact-rule tools in the current Inkbox tool catalog (`inkbox_remote_tools` to discover and read a schema, `inkbox_remote_call` to run it).
+- If the catalog has no tool for the requested change, tell the user it cannot be made from here and direct them to Inkbox Console.
 - If the user provides a specific rule they want, summarize the exact setting they should create in Console.
 
 ## Workflow

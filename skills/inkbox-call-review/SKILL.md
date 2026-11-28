@@ -1,6 +1,6 @@
 ---
 name: inkbox-call-review
-description: Use when the user asks about Inkbox calls, call transcripts, missed calls, or follow-up work. DeepSeek Harness can use current live/post-call context, but does not expose historical call-read tools.
+description: Use when the user asks about Inkbox calls, call transcripts, missed calls, or follow-up work. DeepSeek Harness uses current live/post-call context; historical call reads come from the remote Inkbox tool catalog.
 user-invocable: false
 ---
 
@@ -13,7 +13,7 @@ Use this skill when the user asks about Inkbox phone calls, transcripts, or post
 - DeepSeek Harness exposes `inkbox_place_call` for outbound calls.
 - Hosted-agent and OpenAI Realtime calls provide transcript and post-call context to DeepSeek Harness during
   call wrap-up.
-- DeepSeek Harness does not register historical call-read tools such as `inkbox_list_calls` or `inkbox_list_call_transcripts`.
+- Historical call-read tools are not registered natively; claimed identities reach them through the current Inkbox tool catalog (`inkbox_remote_tools` to discover and read a schema, `inkbox_remote_call` to run it).
 
 ## Workflow
 
@@ -25,7 +25,7 @@ Use this skill when the user asks about Inkbox phone calls, transcripts, or post
    remote party, use the remote phone number supplied in the current call
    context. It is authoritative for that call; contact memories must not
    replace it.
-2. **Past call requests.** If the user asks to inspect old calls, missed calls, or transcripts, explain that this DeepSeek Harness installation does not expose historical call-read tools.
+2. **Past call requests.** For old calls, missed calls, or transcripts, use the matching remote catalog tool. If remote tools are unavailable or the catalog has no matching tool, say so and point to Inkbox Console.
 3. **Prepare follow-ups from supplied context.** If the user gives the transcript or call summary in the conversation, use that text and the available Inkbox send tools for follow-up.
 4. **Complete SMS commitments with the SMS tool.** For a still-needed SMS
    requested during the call, use `inkbox_send_sms` with `to` equal to the exact
@@ -41,5 +41,5 @@ Use this skill when the user asks about Inkbox phone calls, transcripts, or post
 
 ## Caveats
 
-- Historical call review is not available through this plugin. Use Inkbox Console when older call records are needed.
+- Without remote tools, historical call review is not available here. Use Inkbox Console for older call records.
 - Contact-rule-blocked calls may be rejected before DeepSeek Harness sees an event.

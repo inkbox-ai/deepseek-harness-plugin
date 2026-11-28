@@ -19,7 +19,7 @@ Use this skill when an Inkbox tool fails, the user asks why Inkbox is not workin
 | `sender_sms_pending` | The Inkbox phone number is still propagating to carriers. Retry later and verify `smsStatus`. |
 | `recipient_not_opted_in` | Ask the recipient to text `START` to the agent's Inkbox number, then retry. |
 | `recipient_opted_out` | The recipient texted `STOP`; they must text `START` again before SMS can be sent. |
-| `Vault is locked` | This plugin does not expose vault tools. Configure required credentials through the Harness credential store or Inkbox Console. |
+| `Vault is locked` | `INKBOX_DEEPSEEK_VAULT_KEY` is missing. Hosted by Inkbox: save it as a Secret in the identity's Env vars tab. Self-hosted: export it where the Harness is launched (or add it to the Harness `.env`) and restart. Never paste it in chat. |
 
 ## Identity checks
 

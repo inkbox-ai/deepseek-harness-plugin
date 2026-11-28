@@ -111,6 +111,7 @@ and routes inbound email, SMS, iMessage, calls, and A2A events into persistent D
 
 Claimed identities discover the current Inkbox MCP catalog at the start of each native turn.
 Use `inkbox_remote_tools` to read full schemas and `inkbox_remote_call` to execute a discovered tool.
+Notes, mailbox reads and forwarding, call history, and contact rules are reached this way.
 Catalog changes do not require a plugin update. Native approval still applies to interactive turns;
 verified incoming communication uses its own delivery context.
 
@@ -216,11 +217,13 @@ npx --yes --package=github:inkbox-ai/deepseek-harness-plugin#main inkbox-deepsee
 
 ## Capabilities
 
-- **33 native tools:** identity, contacts, email sending, SMS/MMS history and sending, iMessage history,
-  sending and reactions, voice calls, and A2A task lifecycle operations, plus six Slack tools when Slack is
-  enabled.
+- **38 native tools:** identity, contacts, email sending, SMS/MMS history and sending, iMessage history,
+  sending and reactions, voice calls, A2A task lifecycle operations, and Vault credentials, plus six Slack
+  tools when Slack is enabled.
 - **13 model-invocable skills:** channel response policy, contact resolution, calls, outreach, identity
-  access, troubleshooting, credential and note limitations, and authenticated webhook guidance.
+  access, troubleshooting, credentials, notes, and authenticated webhook guidance.
+- **A2A tasks:** if an inbound task's run fails before the agent completes, fails, or asks the caller, the
+  task is failed with a short generic reason instead of being left in progress.
 - **Always-on gateway:** signed webhook verification, durable pre-wake deduplication, contact-scoped sessions,
   cross-channel contact convergence, isolated group sessions, mid-turn steering, same-channel replies, and
   same-channel approval or question prompts.
@@ -325,6 +328,25 @@ Credentials are references, not plaintext settings:
 - `INKBOX_WEBHOOK_SIGNING_KEY` (created or recovered by the setup wizard)
 - `INKBOX_REALTIME_API_KEY` (required only for OpenAI Realtime call handling; `OPENAI_API_KEY` is detected by setup)
 - `INKBOX_WEBHOOK_SECRET_GITHUB` (optional)
+- `INKBOX_DEEPSEEK_VAULT_KEY` (optional; see [Vault credentials](#vault-credentials))
+
+## Vault credentials
+
+`inkbox_credentials_list` lists the credentials shared with this identity (metadata only) and works without an
+unlock key. `inkbox_credentials_get_login`, `inkbox_credentials_get_api_key`, `inkbox_credentials_get_ssh_key`,
+and `inkbox_totp_code` decrypt one credential and need the Vault unlock key in `INKBOX_DEEPSEEK_VAULT_KEY`:
+
+- **Hosted by Inkbox:** save the key as a Secret named `INKBOX_DEEPSEEK_VAULT_KEY` in the identity's Env vars
+  tab. A shell export does not reach a hosted agent.
+- **Self-hosted:** export it in the shell that runs `inkbox-deepseek run`, or add it to the Harness `.env`
+  (for example `~/.dsh/.env`) so the managed service sees it, then restart.
+
+Each read rechecks that the credential is shared with the configured identity and unlocks with the current key.
+Login results report `has_totp` and never include the TOTP seed. Plaintext reads use the same approval setting
+as other Inkbox tools. Never send the key in chat.
+
+Use only the plugin-specific variable. The SDK-wide `INKBOX_VAULT_KEY` and a `vault_key` in `~/.inkbox/config`
+make the SDK try to unlock whenever a client is created; remove them from the gateway environment.
 
 ## Development Commands
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.8
+
+- Add Vault credential tools: `inkbox_credentials_list` (metadata only, works while locked), `inkbox_credentials_get_login`, `inkbox_credentials_get_api_key`, `inkbox_credentials_get_ssh_key` and `inkbox_totp_code`. Plaintext reads reject a malformed secret ID before anything else, ask for approval unless Inkbox tools are trusted, check that the credential is shared with the configured identity before and after decrypting it, and unlock with `INKBOX_DEEPSEEK_VAULT_KEY` on every read without keeping decrypted credentials cached. Login results report `has_totp` and never include the TOTP seed. When hosted by Inkbox, save the key as a Secret in the identity's Env vars tab; when self-hosted, export it where the Harness is launched or add it to the Harness `.env`.
+- When an inbound A2A task's run fails or ends in an error before the agent settles the task, fail the task with a short generic reason. Tasks that are already completed, failed, canceled or waiting on the caller are left unchanged, as are tasks whose turn was cancelled or stopped by a shutdown or restart, and successful turns behave as before.
+- Skills for notes, email, calls, contact rules and note access now point claimed identities at the remote Inkbox tool catalog instead of saying those capabilities are unavailable.
+
 ## 0.2.7
 
 - Add Slack messaging, off by default. Setup enables it and connects a workspace, saving `slackEnabled` (`--enable-slack`; `--skip-slack` writes nothing, so an absent setting stays absent). Without a profile setting, `INKBOX_SLACK_ENABLED` enables it. Doctor checks the effective setting and a connected workspace, and status reports the Slack connection.

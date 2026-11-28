@@ -79,3 +79,17 @@ describe('configured outbound call routing', () => {
     expect(await readdir(join(stateDir, 'call-contexts'))).toEqual([])
   })
 })
+
+describe('Vault unlock key', () => {
+  it('resolves only the plugin-specific credential reference', async () => {
+    const resolve = vi.fn(async (ref: string) =>
+      ref === 'INKBOX_DEEPSEEK_VAULT_KEY' ? { value: 'vault-key', source: 'env' } : undefined,
+    )
+    const runtime = new InkboxRuntime(
+      { credentials: { resolve } } as unknown as Context,
+      {} as ResolvedConfig,
+    )
+    await expect(runtime.resolveVaultKey()).resolves.toBe('vault-key')
+    expect(resolve).toHaveBeenCalledWith('INKBOX_DEEPSEEK_VAULT_KEY')
+  })
+})

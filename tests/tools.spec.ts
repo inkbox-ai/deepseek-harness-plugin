@@ -53,8 +53,8 @@ const exec = {
 describe('Harness tool registration and execution', () => {
   it('registers all tools with canonical output renderers', () => {
     const { definitions } = harness()
-    expect(definitions).toHaveLength(33)
-    expect(new Set(definitions.map((definition) => definition.name)).size).toBe(33)
+    expect(definitions).toHaveLength(38)
+    expect(new Set(definitions.map((definition) => definition.name)).size).toBe(38)
     expect(definitions.every((definition) => definition.output?.schema?.type === 'string')).toBe(true)
   })
 
@@ -122,6 +122,126 @@ describe('Harness tool registration and execution', () => {
   })
 })
 
+describe('Vault credential tools', () => {
+  const SECRET = '6f9619ff-8b86-4d01-b42d-00cf4fc964ff'
+  const OTHER = '7a9619ff-8b86-4d01-b42d-00cf4fc964ff'
+
+  function vaultHarness(vaultKey: string | undefined, autoApproveInkboxTools = true) {
+    const definitions: ToolDefinition[] = []
+    const request = vi.fn(async () => 'allowed-once')
+    const ctx = {
+      tools: { register: (definition: ToolDefinition) => definitions.push(definition) },
+      approval: { request },
+    } as unknown as Context
+    const shared = [{ identityId: 'identity-1' }]
+    const unlocked = {
+      getSecret: vi.fn(async (id: string) =>
+        id === SECRET
+          ? {
+              id,
+              secretType: 'login',
+              payload: { username: 'agent', password: 'pw', totp: { secret: 'seed' } },
+            }
+          : { id, secretType: 'api_key', payload: { apiKey: 'key' } },
+      ),
+      getTotpCode: vi.fn(async () => ({ code: '123456', secondsRemaining: 20 })),
+    }
+    const vault = {
+      listSecrets: vi.fn(async () => [
+        { id: SECRET, name: 'Mail', secretType: 'login', description: null, access: shared },
+        { id: OTHER, name: 'Hidden', secretType: 'api_key', description: null, access: [] },
+      ]),
+      listAccessRules: vi.fn(async (id: string) => (id === SECRET ? shared : [])),
+      unlock: vi.fn(async () => {
+        vault._unlocked = unlocked
+        return unlocked
+      }),
+      _unlocked: null as unknown,
+    }
+    const runtime = {
+      config: { autoApproveInkboxTools, slackEnabled: false },
+      getClient: vi.fn(async () => ({ vault })),
+      getIdentity: vi.fn(async () => ({ id: 'identity-1' })),
+      resolveVaultKey: vi.fn(async () => vaultKey),
+    } as unknown as InkboxRuntime
+    registerTools(ctx, runtime)
+    const run = (name: string, args: Record<string, unknown>) =>
+      findTool(definitions, name).execute(args, exec)
+    return { run, request, vault, unlocked }
+  }
+
+  it('lists only metadata shared with this identity without unlocking', async () => {
+    const { run, vault } = vaultHarness(undefined)
+    expect(JSON.parse(String(await run('inkbox_credentials_list', { type: 'login' })))).toEqual([
+      { id: SECRET, name: 'Mail', secretType: 'login', description: null },
+    ])
+    expect(vault.listSecrets).toHaveBeenCalledWith({ secretType: 'login' })
+    expect(vault.unlock).not.toHaveBeenCalled()
+  })
+
+  it('explains both unlock-key paths when the Vault is locked', async () => {
+    const { run, vault } = vaultHarness(undefined)
+    await expect(run('inkbox_credentials_get_login', { secretId: SECRET })).rejects.toThrow(
+      /INKBOX_DEEPSEEK_VAULT_KEY.*Env vars tab.*export it/,
+    )
+    expect(vault.unlock).not.toHaveBeenCalled()
+  })
+
+  it('unlocks with the plugin key and omits the TOTP seed from a login', async () => {
+    const { run, vault } = vaultHarness('vault-key')
+    const login = JSON.parse(String(await run('inkbox_credentials_get_login', { secretId: SECRET })))
+    expect(login).toEqual({ username: 'agent', password: 'pw', has_totp: true })
+    expect(vault.listAccessRules).toHaveBeenCalledTimes(2)
+    expect(vault.unlock).toHaveBeenCalledWith('vault-key')
+    expect(vault._unlocked).toBeNull()
+  })
+
+  it('withholds a credential whose sharing is revoked during the read', async () => {
+    const { run, vault, unlocked } = vaultHarness('vault-key')
+    vault.listAccessRules.mockResolvedValueOnce([{ identityId: 'identity-1' }]).mockResolvedValueOnce([])
+    await expect(run('inkbox_credentials_get_login', { secretId: SECRET })).rejects.toThrow(/not shared/)
+    expect(unlocked.getSecret).toHaveBeenCalledWith(SECRET)
+    expect(vault._unlocked).toBeNull()
+  })
+
+  it('returns a current TOTP code', async () => {
+    const { run, unlocked } = vaultHarness('vault-key')
+    expect(JSON.parse(String(await run('inkbox_totp_code', { secretId: SECRET })))).toEqual({
+      code: '123456',
+      secondsRemaining: 20,
+    })
+    expect(unlocked.getTotpCode).toHaveBeenCalledWith(SECRET)
+  })
+
+  it('refuses unshared, mistyped and malformed secret IDs', async () => {
+    const { run, vault } = vaultHarness('vault-key')
+    await expect(run('inkbox_credentials_get_api_key', { secretId: OTHER })).rejects.toThrow(/not shared/)
+    expect(vault.unlock).not.toHaveBeenCalled()
+    await expect(run('inkbox_credentials_get_ssh_key', { secretId: SECRET })).rejects.toThrow(
+      /not a ssh_key secret/,
+    )
+    vault.listAccessRules.mockClear()
+    await expect(run('inkbox_credentials_get_login', { secretId: '../keys' })).rejects.toThrow(/UUID/)
+    expect(vault.listAccessRules).not.toHaveBeenCalled()
+  })
+
+  it('rejects a malformed secret ID before asking for approval', async () => {
+    const { run, request } = vaultHarness('vault-key', false)
+    await expect(run('inkbox_totp_code', { secretId: 'see the attached key' })).rejects.toThrow(/UUID/)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('asks for approval before a plaintext read unless Inkbox tools are trusted', async () => {
+    const { run, request } = vaultHarness('vault-key', false)
+    await run('inkbox_credentials_list', {})
+    expect(request).not.toHaveBeenCalled()
+    await run('inkbox_credentials_get_login', { secretId: SECRET })
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: 'inkbox_credentials_get_login' }),
+    )
+  })
+})
+
 describe('Slack tools', () => {
   function slackHarness(slackEnabled: boolean) {
     const definitions: ToolDefinition[] = []
@@ -152,7 +272,7 @@ describe('Slack tools', () => {
     expect(slackHarness(false).definitions.some((tool) => tool.name.startsWith('inkbox_slack_'))).toBe(false)
     const names = slackHarness(true).definitions.map((tool) => tool.name)
     expect(names.filter((name) => name.startsWith('inkbox_slack_'))).toEqual([...SLACK_TOOL_NAMES])
-    expect(names).toHaveLength(33 + SLACK_TOOL_NAMES.length)
+    expect(names).toHaveLength(38 + SLACK_TOOL_NAMES.length)
   })
 
   it('reads Slack history on an owned connection without approval', async () => {

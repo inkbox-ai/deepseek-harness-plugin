@@ -16,9 +16,9 @@ DeepSeek Harness receives contact context on inbound email, SMS, iMessage, and c
 - Use `inkbox_create_contact` when the user asks you to save a new person or contact card.
 - Use `inkbox_update_contact` when the user asks you to change an existing contact; look up the contact first if you do not already have its UUID.
 - Use `inkbox_delete_contact` only after the target contact is explicit and confirmed.
-- There is no vCard export/import, contact access, or contact rule tool in DeepSeek Harness.
+- vCard export/import, contact access, and contact-rule tools are not registered natively; claimed identities can check `inkbox_remote_tools` for them.
 - If an inbound message includes a resolved contact marker, treat that marker as the source of truth for the current sender.
-- If the user asks for broad contact administration, direct them to Inkbox Console or to a host/plugin that exposes the Inkbox power-assistant admin tools.
+- If the user asks for broad contact administration, direct them to Inkbox Console.
 
 ## Workflow
 
